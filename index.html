@@ -22,8 +22,29 @@
 
     <div class="dashboard-layout">
         <aside class="sidebar">
+            <div class="calendar-controls">
+                <div class="control-group">
+                    <label for="calendar-select">Calendar</label>
+                    <select id="calendar-select" class="glass-select">
+                        <option value="201e89a61ac47a7109df0877b72f13305e2f4402fc3d9637664e4e7172bb91b1@group.calendar.google.com">Team Calendar</option>
+                        <option value="custom">+ Add Custom Calendar</option>
+                    </select>
+                </div>
+                <div id="custom-calendar-group" class="control-group custom-calendar-group hidden">
+                    <label for="custom-calendar-input">Calendar ID / Email</label>
+                    <input type="text" id="custom-calendar-input" class="glass-input" placeholder="e.g. user@gmail.com">
+                </div>
+                <div class="control-group">
+                    <label for="calendar-view-select">View</label>
+                    <select id="calendar-view-select" class="glass-select">
+                        <option value="AGENDA">Agenda</option>
+                        <option value="WEEK">Week</option>
+                        <option value="MONTH">Month</option>
+                    </select>
+                </div>
+            </div>
             <div class="calendar-container">
-                <iframe
+                <iframe id="calendar-iframe"
                     src="https://calendar.google.com/calendar/embed?src=201e89a61ac47a7109df0877b72f13305e2f4402fc3d9637664e4e7172bb91b1%40group.calendar.google.com&ctz=Europe%2FLondon&mode=AGENDA"
                     style="border: 0" width="100%" height="100%" frameborder="0" scrolling="no"></iframe>
             </div>

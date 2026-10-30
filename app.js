@@ -84,9 +84,94 @@ const resetTimeBtn = document.getElementById('reset-time');
 const debugMenuBtn = document.getElementById('debug-menu-btn');
 const debugControls = document.getElementById('debug-controls');
 
+const calendarSelect = document.getElementById('calendar-select');
+const customCalendarGroup = document.getElementById('custom-calendar-group');
+const customCalendarInput = document.getElementById('custom-calendar-input');
+const calendarViewSelect = document.getElementById('calendar-view-select');
+const calendarIframe = document.getElementById('calendar-iframe');
+
+const DEFAULT_CALENDAR = '201e89a61ac47a7109df0877b72f13305e2f4402fc3d9637664e4e7172bb91b1@group.calendar.google.com';
+const STORAGE_KEY_CALENDAR_ID = 'dashboard_calendar_id';
+const STORAGE_KEY_CALENDAR_MODE = 'dashboard_calendar_mode';
+
 let debugTimeOffset = null;
 let currentTheme = null;
 let bookmarksRendered = false;
+
+// Calendar Management
+function initCalendarControls() {
+    const savedCalId = localStorage.getItem(STORAGE_KEY_CALENDAR_ID) || DEFAULT_CALENDAR;
+    const savedMode = localStorage.getItem(STORAGE_KEY_CALENDAR_MODE) || 'AGENDA';
+
+    calendarViewSelect.value = savedMode;
+
+    // Check if saved ID is in preset dropdown options
+    let optionExists = false;
+    for (let i = 0; i < calendarSelect.options.length; i++) {
+        if (calendarSelect.options[i].value === savedCalId) {
+            optionExists = true;
+            break;
+        }
+    }
+
+    if (optionExists) {
+        calendarSelect.value = savedCalId;
+        customCalendarGroup.classList.add('hidden');
+    } else {
+        calendarSelect.value = 'custom';
+        customCalendarInput.value = savedCalId;
+        customCalendarGroup.classList.remove('hidden');
+    }
+
+    updateCalendarIframe();
+}
+
+function getSelectedCalendarId() {
+    if (calendarSelect.value === 'custom') {
+        return customCalendarInput.value.trim() || DEFAULT_CALENDAR;
+    }
+    return calendarSelect.value;
+}
+
+function updateCalendarIframe() {
+    const calId = getSelectedCalendarId();
+    const mode = calendarViewSelect.value || 'AGENDA';
+    const ctz = encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone || 'Europe/London');
+    const encodedCalId = encodeURIComponent(calId);
+
+    const newSrc = `https://calendar.google.com/calendar/embed?src=${encodedCalId}&ctz=${ctz}&mode=${mode}`;
+
+    if (calendarIframe.src !== newSrc) {
+        calendarIframe.src = newSrc;
+    }
+
+    localStorage.setItem(STORAGE_KEY_CALENDAR_ID, calId);
+    localStorage.setItem(STORAGE_KEY_CALENDAR_MODE, mode);
+}
+
+calendarSelect.addEventListener('change', () => {
+    if (calendarSelect.value === 'custom') {
+        customCalendarGroup.classList.remove('hidden');
+        customCalendarInput.focus();
+    } else {
+        customCalendarGroup.classList.add('hidden');
+        updateCalendarIframe();
+    }
+});
+
+customCalendarInput.addEventListener('change', () => {
+    updateCalendarIframe();
+});
+
+customCalendarInput.addEventListener('blur', () => {
+    updateCalendarIframe();
+});
+
+calendarViewSelect.addEventListener('change', () => {
+    updateCalendarIframe();
+});
+
+initCalendarControls();
 
 // Debug Menu Toggle
 debugMenuBtn.addEventListener('click', (e) => {
