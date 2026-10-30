@@ -85,12 +85,21 @@ const debugMenuBtn = document.getElementById('debug-menu-btn');
 const debugControls = document.getElementById('debug-controls');
 
 const calendarSelect = document.getElementById('calendar-select');
-const customCalendarGroup = document.getElementById('custom-calendar-group');
-const customCalendarInput = document.getElementById('custom-calendar-input');
 const calendarViewSelect = document.getElementById('calendar-view-select');
 const calendarIframe = document.getElementById('calendar-iframe');
+const manageCalendarsBtn = document.getElementById('manage-calendars-btn');
+const calendarManagerModal = document.getElementById('calendar-manager-modal');
+const closeManagerBtn = document.getElementById('close-manager-btn');
+const addCalendarForm = document.getElementById('add-calendar-form');
+const calNameInput = document.getElementById('cal-name-input');
+const calIdInput = document.getElementById('cal-id-input');
+const savedCalendarsList = document.getElementById('saved-calendars-list');
 
-const DEFAULT_CALENDAR = '201e89a61ac47a7109df0877b72f13305e2f4402fc3d9637664e4e7172bb91b1@group.calendar.google.com';
+const DEFAULT_CALENDARS = [
+    { id: '201e89a61ac47a7109df0877b72f13305e2f4402fc3d9637664e4e7172bb91b1@group.calendar.google.com', name: 'Team Calendar' }
+];
+
+const STORAGE_KEY_CALENDARS_LIST = 'dashboard_calendars_list';
 const STORAGE_KEY_CALENDAR_ID = 'dashboard_calendar_id';
 const STORAGE_KEY_CALENDAR_MODE = 'dashboard_calendar_mode';
 
@@ -98,43 +107,98 @@ let debugTimeOffset = null;
 let currentTheme = null;
 let bookmarksRendered = false;
 
-// Calendar Management
-function initCalendarControls() {
-    const savedCalId = localStorage.getItem(STORAGE_KEY_CALENDAR_ID) || DEFAULT_CALENDAR;
-    const savedMode = localStorage.getItem(STORAGE_KEY_CALENDAR_MODE) || 'AGENDA';
-
-    calendarViewSelect.value = savedMode;
-
-    // Check if saved ID is in preset dropdown options
-    let optionExists = false;
-    for (let i = 0; i < calendarSelect.options.length; i++) {
-        if (calendarSelect.options[i].value === savedCalId) {
-            optionExists = true;
-            break;
+// Load stored user calendars or fallback to defaults
+function getStoredCalendars() {
+    const json = localStorage.getItem(STORAGE_KEY_CALENDAR_LIST_KEY_FALLBACK());
+    if (json) {
+        try {
+            const parsed = JSON.parse(json);
+            if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        } catch (e) {
+            console.error('Failed to parse saved calendars:', e);
         }
     }
+    return DEFAULT_CALENDARS;
+}
 
-    if (optionExists) {
-        calendarSelect.value = savedCalId;
-        customCalendarGroup.classList.add('hidden');
-    } else {
-        calendarSelect.value = 'custom';
-        customCalendarInput.value = savedCalId;
-        customCalendarGroup.classList.remove('hidden');
+function STORAGE_KEY_CALENDAR_LIST_KEY_FALLBACK() {
+    return STORAGE_KEY_CALENDARS_LIST;
+}
+
+function saveCalendars(calendars) {
+    localStorage.setItem(STORAGE_KEY_CALENDARS_LIST, JSON.stringify(calendars));
+}
+
+function renderCalendarSelectOptions() {
+    const calendars = getStoredCalendars();
+    const currentSelectedId = localStorage.getItem(STORAGE_KEY_CALENDAR_ID) || calendars[0].id;
+
+    calendarSelect.innerHTML = calendars.map(cal =>
+        `<option value="${cal.id}" ${cal.id === currentSelectedId ? 'selected' : ''}>${cal.name}</option>`
+    ).join('');
+
+    // If current selected calendar ID is not in the list, default to first option
+    if (!calendars.some(c => c.id === currentSelectedId) && calendars.length > 0) {
+        localStorage.setItem(STORAGE_KEY_CALENDAR_ID, calendars[0].id);
+        calendarSelect.value = calendars[0].id;
+    }
+}
+
+function renderSavedCalendarsList() {
+    const calendars = getStoredCalendars();
+    const currentSelectedId = localStorage.getItem(STORAGE_KEY_CALENDAR_ID);
+
+    savedCalendarsList.innerHTML = calendars.map((cal, index) => `
+        <li class="calendar-item">
+            <div class="calendar-item-info">
+                <span class="calendar-item-name">${cal.name}</span>
+                <span class="calendar-item-id">${cal.id}</span>
+            </div>
+            <div class="calendar-item-actions">
+                ${calendars.length > 1 ? `
+                    <button type="button" class="delete-cal-btn" data-index="${index}" title="Remove Calendar">&times;</button>
+                ` : ''}
+            </div>
+        </li>
+    `).join('');
+
+    // Delete buttons event listeners
+    savedCalendarsList.querySelectorAll('.delete-cal-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            const idx = parseInt(e.currentTarget.getAttribute('data-index'), 10);
+            deleteCalendar(idx);
+        });
+    });
+}
+
+function deleteCalendar(index) {
+    let calendars = getStoredCalendars();
+    if (calendars.length <= 1) return; // Prevent deleting the last calendar
+
+    const deleted = calendars.splice(index, 1)[0];
+    saveCalendars(calendars);
+
+    // If deleted calendar was currently active, reset to first available
+    const activeId = localStorage.getItem(STORAGE_KEY_CALENDAR_ID);
+    if (activeId === deleted.id && calendars.length > 0) {
+        localStorage.setItem(STORAGE_KEY_CALENDAR_ID, calendars[0].id);
     }
 
+    renderCalendarSelectOptions();
+    renderSavedCalendarsList();
     updateCalendarIframe();
 }
 
-function getSelectedCalendarId() {
-    if (calendarSelect.value === 'custom') {
-        return customCalendarInput.value.trim() || DEFAULT_CALENDAR;
-    }
-    return calendarSelect.value;
+function initCalendarControls() {
+    const savedMode = localStorage.getItem(STORAGE_KEY_CALENDAR_MODE) || 'AGENDA';
+    calendarViewSelect.value = savedMode;
+
+    renderCalendarSelectOptions();
+    updateCalendarIframe();
 }
 
 function updateCalendarIframe() {
-    const calId = getSelectedCalendarId();
+    const calId = calendarSelect.value || getStoredCalendars()[0].id;
     const mode = calendarViewSelect.value || 'AGENDA';
     const ctz = encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone || 'Europe/London');
     const encodedCalId = encodeURIComponent(calId);
@@ -150,25 +214,52 @@ function updateCalendarIframe() {
 }
 
 calendarSelect.addEventListener('change', () => {
-    if (calendarSelect.value === 'custom') {
-        customCalendarGroup.classList.remove('hidden');
-        customCalendarInput.focus();
-    } else {
-        customCalendarGroup.classList.add('hidden');
-        updateCalendarIframe();
-    }
-});
-
-customCalendarInput.addEventListener('change', () => {
-    updateCalendarIframe();
-});
-
-customCalendarInput.addEventListener('blur', () => {
     updateCalendarIframe();
 });
 
 calendarViewSelect.addEventListener('change', () => {
     updateCalendarIframe();
+});
+
+manageCalendarsBtn.addEventListener('click', () => {
+    renderSavedCalendarsList();
+    calendarManagerModal.classList.remove('hidden');
+});
+
+closeManagerBtn.addEventListener('click', () => {
+    calendarManagerModal.classList.add('hidden');
+});
+
+calendarManagerModal.addEventListener('click', (e) => {
+    if (e.target === calendarManagerModal) {
+        calendarManagerModal.classList.add('hidden');
+    }
+});
+
+addCalendarForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const name = calNameInput.value.trim();
+    const id = calIdInput.value.trim();
+
+    if (!name || !id) return;
+
+    const calendars = getStoredCalendars();
+    // Avoid duplicate IDs
+    if (!calendars.some(c => c.id === id)) {
+        calendars.push({ id, name });
+        saveCalendars(calendars);
+    }
+
+    localStorage.setItem(STORAGE_KEY_CALENDAR_ID, id);
+
+    calNameInput.value = '';
+    calIdInput.value = '';
+
+    renderCalendarSelectOptions();
+    renderSavedCalendarsList();
+    updateCalendarIframe();
+
+    calendarManagerModal.classList.add('hidden');
 });
 
 initCalendarControls();

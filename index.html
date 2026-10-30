@@ -24,15 +24,13 @@
         <aside class="sidebar">
             <div class="calendar-controls">
                 <div class="control-group">
-                    <label for="calendar-select">Calendar</label>
+                    <div class="control-header">
+                        <label for="calendar-select">Calendar</label>
+                        <button id="manage-calendars-btn" class="text-btn" type="button">Manage</button>
+                    </div>
                     <select id="calendar-select" class="glass-select">
-                        <option value="201e89a61ac47a7109df0877b72f13305e2f4402fc3d9637664e4e7172bb91b1@group.calendar.google.com">Team Calendar</option>
-                        <option value="custom">+ Add Custom Calendar</option>
+                        <!-- Populated dynamically -->
                     </select>
-                </div>
-                <div id="custom-calendar-group" class="control-group custom-calendar-group hidden">
-                    <label for="custom-calendar-input">Calendar ID / Email</label>
-                    <input type="text" id="custom-calendar-input" class="glass-input" placeholder="e.g. user@gmail.com">
                 </div>
                 <div class="control-group">
                     <label for="calendar-view-select">View</label>
@@ -43,6 +41,7 @@
                     </select>
                 </div>
             </div>
+
             <div class="calendar-container">
                 <iframe id="calendar-iframe"
                     src="https://calendar.google.com/calendar/embed?src=201e89a61ac47a7109df0877b72f13305e2f4402fc3d9637664e4e7172bb91b1%40group.calendar.google.com&ctz=Europe%2FLondon&mode=AGENDA"
@@ -62,6 +61,29 @@
                 </div>
             </div>
         </main>
+    </div>
+
+    <!-- Calendar Manager Modal / Drawer -->
+    <div id="calendar-manager-modal" class="modal-overlay hidden">
+        <div class="modal-content glass-modal">
+            <div class="modal-header">
+                <h3>Manage Calendars</h3>
+                <button id="close-manager-btn" class="close-btn" aria-label="Close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <form id="add-calendar-form" class="add-calendar-form">
+                    <input type="text" id="cal-name-input" class="glass-input" placeholder="Calendar Name (e.g. Work, Personal)" required>
+                    <input type="text" id="cal-id-input" class="glass-input" placeholder="Calendar ID or Email (or 'primary')" required>
+                    <button type="submit" class="glass-btn primary-btn">+ Add Calendar</button>
+                </form>
+                <div class="calendar-list-container">
+                    <h4>Your Saved Calendars</h4>
+                    <ul id="saved-calendars-list" class="saved-calendars-list">
+                        <!-- Populated dynamically -->
+                    </ul>
+                </div>
+            </div>
+        </div>
     </div>
 
     <div class="debug-wrapper">
