@@ -48,6 +48,14 @@ const bookmarks = {
                 { title: 'Portal', desc: 'Survey Air portal', icon: '🔑', url: 'https://clients.surveyair.co.uk/login/' },
                 { title: 'Website', desc: 'Survey Air website', icon: '🌐', url: 'https://surveyair.co.uk/' }
             ]
+        },
+        {
+            category: 'Homelab',
+            items: [
+                { title: 'Proxmox', desc: 'Host UI', icon: '🖥️', url: 'https://pve.tail73491d.ts.net/' },
+                { title: 'T3 Code', desc: 'Agent console', icon: '🤖', url: 'https://pve.tail73491d.ts.net:8443/' },
+                { title: 'Tailscale', desc: 'Machines & ACLs', icon: '🔗', url: 'https://login.tailscale.com/admin/machines' }
+            ]
         }
     ],
     personal: [
