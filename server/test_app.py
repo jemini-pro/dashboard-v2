@@ -3,6 +3,7 @@
 Run from the repo root:
     python3 -m unittest discover -s server -p 'test_*.py' -v
 """
+import hmac
 import json
 import re
 import sys
@@ -99,8 +100,10 @@ class ApiTestCase(unittest.TestCase):
     def write_bookmarks(self, store):
         (self.data / "bookmarks.json").write_text(json.dumps(store))
 
-    def post(self, body, path="/api/hit"):
+    def post(self, body, path="/api/hit", headers=None):
         req = urllib.request.Request(self.base + path, data=body, method="POST")
+        for key, value in (headers or {}).items():
+            req.add_header(key, value)
         try:
             with urllib.request.urlopen(req, timeout=5) as resp:
                 return resp.status, resp.read()
@@ -297,6 +300,51 @@ def function_body(source, name):
             if depth == 0:
                 return source[start:offset + 1]
     raise AssertionError("unbalanced function body for " + name)
+
+
+class PushTokenTest(ApiTestCase):
+    """The agent heartbeat token gates writes, so its compare must not leak."""
+
+    TOKEN = "correct-horse-battery-staple"
+
+    def setUp(self):
+        super().setUp()
+        self._old_token, self._old_agents_file = app.TOKEN, app.AGENTS_FILE
+        app.TOKEN = self.TOKEN
+        app.AGENTS_FILE = self.data / "agents.json"
+
+    def tearDown(self):
+        app.TOKEN, app.AGENTS_FILE = self._old_token, self._old_agents_file
+        super().tearDown()
+
+    def push(self, token=None, name="pve"):
+        headers = {} if token is None else {"X-Dash-Token": token}
+        return self.post(
+            json.dumps({"kind": "linux", "cpu_pct": 1.5}).encode(),
+            path="/api/push/" + name,
+            headers=headers,
+        )
+
+    def test_correct_token_is_accepted_and_the_agent_is_stored(self):
+        status, body = self.push(self.TOKEN)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["stored"], "pve")
+        stored = json.loads((self.data / "agents.json").read_text())
+        self.assertEqual(stored["pve"]["cpu_pct"], 1.5)
+
+    def test_wrong_token_is_rejected_and_nothing_is_stored(self):
+        status, body = self.push("wrong")
+        self.assertEqual(status, 401)
+        self.assertIn("bad token", body.decode())
+        self.assertFalse((self.data / "agents.json").exists())
+
+    def test_missing_token_is_rejected(self):
+        self.assertEqual(self.push()[0], 401)
+
+    def test_token_compare_goes_through_hmac_compare_digest(self):
+        with mock.patch("app.hmac.compare_digest", wraps=hmac.compare_digest) as spy:
+            self.assertEqual(self.push(self.TOKEN)[0], 200)
+        self.assertTrue(spy.called, "push token is compared with a plain ==")
 
 
 class FrontEndSourceTest(unittest.TestCase):

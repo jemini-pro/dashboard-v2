@@ -15,6 +15,7 @@ Endpoints
     GET  /api/health        liveness
 """
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -885,7 +886,9 @@ class Handler(BaseHTTPRequestHandler):
         if not path.startswith("/api/push/"):
             return self._send(404, "not found", "text/plain; charset=utf-8")
         sent = self.headers.get("X-Dash-Token", "")
-        if TOKEN and sent != TOKEN:
+        # Constant-time compare: a plain != leaks how many leading bytes matched,
+        # which lets a caller recover the token a byte at a time.
+        if TOKEN and not hmac.compare_digest(sent.encode(), TOKEN.encode()):
             return self._json({"error": "bad token"}, 401)
         name = path.rsplit("/", 1)[-1][:40] or "unknown"
         try:
