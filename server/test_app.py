@@ -211,6 +211,25 @@ class HitEndpointTest(ApiTestCase):
         self.assertEqual(item["title"], "Mail")
         self.assertEqual(item["score"], 1.0)
 
+    def test_bookmarks_preserve_a_pinned_flag_on_items(self):
+        """The Launchpad is data-driven: /api/bookmarks passes `pinned` through."""
+        self.write_bookmarks({"work": [{
+            "category": "Pinned",
+            "items": [
+                {"title": "Gmail", "desc": "Email", "icon": "M",
+                 "url": "https://mail.example.com", "pinned": True},
+                {"title": "Docs", "desc": "Docs", "icon": "D",
+                 "url": "https://docs.example.com"},
+            ],
+        }]})
+
+        _, data = self.get_json("/api/bookmarks")
+
+        items = {item["title"]: item for item in data["work"][0]["items"]}
+        self.assertIs(items["Gmail"]["pinned"], True)
+        self.assertNotIn("pinned", items["Docs"])
+        self.assertIn("score", items["Gmail"])
+
     def test_missing_bookmark_store_degrades_gracefully(self):
         (self.data / "bookmarks.json").unlink()
 
@@ -279,21 +298,30 @@ class FrontEndSourceTest(unittest.TestCase):
         self.css = (APP_JS.parent / "style.css").read_text()
 
 
-class MostUsedStripTest(FrontEndSourceTest):
-    """Source-level assertions over the strip helpers and the markup they render.
+class MostUsedCardTest(FrontEndSourceTest):
+    """Ticket #44: the Jump back in card is driven by server-stamped scores.
 
-    Manual check in a browser: serve the dashboard, click one link, reload, and
-    confirm the strip appears above Network.
+    There is no JS runtime here, so these assert the seams the card exposes:
+    selection, normalisation, row markup, the empty state and beacon
+    delegation. Manual check: click a link, reload, and confirm it rises in
+    the card beside the Launchpad.
     """
 
-    def test_strip_sits_directly_above_the_network_panel_and_starts_hidden(self):
-        strip = self.html.index('id="most-used"')
-        panel = self.html.index('class="network-panel"')
-        self.assertLess(strip, panel)
+    def _usage_card(self):
+        start = self.html.index('class="card usage-card"')
+        end = self.html.index('class="card launchpad-card"', start)
+        return self.html[start:end]
 
-        tag_start = self.html.rindex("<", 0, strip)
-        tag_end = self.html.index(">", strip)
-        self.assertIn(" hidden", self.html[tag_start:tag_end])
+    def test_card_sits_beside_launchpad_without_tab_chrome_and_keeps_an_empty_list(self):
+        card = self._usage_card()
+
+        self.assertIn("Jump back in", card)
+        self.assertIn('id="most-used"', card)
+        self.assertIn('class="usage-list"', card)
+        self.assertNotIn("hidden", card)
+        self.assertNotIn('role="tab', card)
+        self.assertNotIn("data-usage-tab", card)
+        self.assertNotIn("Recent", card)
 
     def test_selection_keeps_scores_above_half_sorted_desc_capped_at_six(self):
         self.assertRegex(self.js, r"MOST_USED_MIN_SCORE\s*=\s*0\.5\b")
@@ -305,89 +333,829 @@ class MostUsedStripTest(FrontEndSourceTest):
         self.assertRegex(body, r"sort\(\s*\(a,\s*b\)\s*=>\s*b\.score\s*-\s*a\.score\s*\)")
         self.assertRegex(body, r"slice\(\s*0,\s*MOST_USED_LIMIT\s*\)")
 
-    def test_strip_is_populated_from_the_injected_payload_or_the_api_fallback(self):
-        load = function_body(self.js, "loadBookmarks")
+    def test_score_bar_is_normalised_against_the_highest_visible_score(self):
+        render = function_body(self.js, "renderMostUsed")
+        row = function_body(self.js, "usageRow")
+        percent = function_body(self.js, "usageBarPercent")
+
+        self.assertIn("entries[0].score", render)
+        self.assertIn("usageRow(entry, maxScore)", render)
+        self.assertIn("usageBarPercent(entry.score, maxScore)", row)
+        self.assertIn("(score / maxScore) * 100", percent)
+        self.assertIn("Math.round", percent)
+        self.assertIn("Math.max(0,", percent)
+        self.assertIn("Math.min(100,", percent)
+
+    def test_rows_show_monogram_title_description_and_bar_without_the_raw_score(self):
+        row = function_body(self.js, "usageRow")
+
+        self.assertIn("const item = entry.item", row)
+        self.assertIn("monogram(item)", row)
+        self.assertIn('class="usage-row"', row)
+        self.assertIn("escapeHtml(item.title)", row)
+        self.assertIn("escapeHtml(item.desc || '')", row)
+        self.assertIn('target="_blank"', row)
+        self.assertIn('class="usage-bar"', row)
+        self.assertIn("width:", row)
+        self.assertNotIn("${entry.score}", row)
+        self.assertNotIn("usage-score", row)
+        self.assertNotIn("usage-count", row)
+
+    def test_empty_state_keeps_the_card_and_shows_no_usage_yet(self):
         render = function_body(self.js, "renderMostUsed")
         update = function_body(self.js, "updateDashboard")
         injected = function_body(self.js, "injectedBookmarks")
 
-        self.assertIn("renderMostUsed(data.work)", load)
-        self.assertIn("hidden = true", render)
+        self.assertIn("No usage yet", render)
         self.assertIn("hidden = false", render)
+        self.assertNotIn("hidden = true", render)
 
-        # The server injects the scored store into index.html, so the first
-        # paint can populate the strip without a second request.
-        self.assertIn("renderMostUsed(inline.work)", update)
-        self.assertIn("renderBookmarks(inline.work)", update)
+        # Server-injected first paint uses the scored store; with no injection
+        # (static-only hosting) the fetch fallback takes over.
+        self.assertIn("injectedBookmarks()", update)
+        self.assertIn("renderMostUsed(bookmarkStore)", update)
         self.assertIn("loadBookmarks()", update)
         self.assertIn("bookmarks-data", injected)
         self.assertIn("JSON.parse", injected)
 
-        # The shared renderer stays single-purpose; the strip is populated by
-        # its caller, never as a side effect of rendering the categories.
-        self.assertNotIn("renderMostUsed", function_body(self.js, "renderBookmarks"))
+    def test_first_paint_and_a_failed_fetch_both_show_no_usage_yet(self):
+        # The injected store is scored; when /api/bookmarks is unreachable the
+        # card keeps its quiet empty state instead of a blank panel.
+        update = function_body(self.js, "updateDashboard")
+        load = function_body(self.js, "loadBookmarks")
 
-    def test_category_contents_and_order_are_never_sorted(self):
-        body = function_body(self.js, "renderBookmarks")
-        section = function_body(self.js, "categorySection")
+        self.assertIn("renderMostUsed(bookmarkStore)", update)
+        self.assertIn("renderMostUsed(bookmarkStore)", load)
 
-        self.assertNotIn(".sort(", body)
-        self.assertNotIn(".sort(", section)
+        # Scoreless data can never populate rows: selection requires a score
+        # above the threshold.
+        select = function_body(self.js, "selectMostUsed")
+        self.assertIn("score > MOST_USED_MIN_SCORE", select)
+
+    def test_only_the_scored_api_payload_populates_the_card(self):
+        load = function_body(self.js, "loadBookmarks")
+
+        self.assertIn("renderMostUsed(data.work)", load)
+
+    def test_jump_back_in_never_reorders_the_tools_lists(self):
+        # Score-driven ordering belongs to the card alone; All tools keeps the
+        # store order.
+        for name in ("renderAllTools", "filterToolCategories", "renderMostUsed"):
+            with self.subTest(function=name):
+                self.assertIn(name, self.js)
+        self.assertNotIn(".sort(", function_body(self.js, "renderAllTools"))
+        self.assertNotIn(".sort(", function_body(self.js, "filterToolCategories"))
+
+    def test_old_most_used_strip_is_gone(self):
+        self.assertNotIn('class="most-used', self.html)
+        self.assertNotIn(".most-used", self.css)
+        self.assertNotIn("categorySection('Most used'", self.js)
+
+    def test_usage_rows_have_their_own_compact_styles(self):
+        self.assertRegex(self.css, r"\.usage-list\s*\{[^}]*list-style:\s*none")
+        self.assertRegex(self.css, r"\.usage-row\s*\{[^}]*display:\s*grid")
+        self.assertRegex(self.css, r"\.usage-row\s*\{[^}]*grid-template-columns:")
+        self.assertRegex(self.css, r"\.usage-bar\s*\{[^}]*height:\s*3px")
         self.assertRegex(
-            body,
-            r"categories\.map\(\s*cat\s*=>\s*categorySection\(cat\.category,\s*cat\.items\)",
-        )
-        self.assertRegex(section, r"items\.map\(item\s*=>\s*bookmarkCard\(item\)\)")
-
-    def test_bookmarks_and_strip_share_one_category_section_renderer(self):
-        self.assertIn(
-            "categorySection(cat.category, cat.items)",
-            function_body(self.js, "renderBookmarks"),
-        )
-        self.assertIn(
-            "categorySection('Most used', items)",
-            function_body(self.js, "renderMostUsed"),
-        )
-        section = function_body(self.js, "categorySection")
-        self.assertIn('class="category-section"', section)
-        self.assertIn('class="category-title"', section)
-        self.assertIn('class="items-grid"', section)
-
-    def test_strip_tiles_reuse_bookmark_card_markup_and_open_like_tiles(self):
-        render = function_body(self.js, "renderMostUsed")
-        section = function_body(self.js, "categorySection")
-        card = function_body(self.js, "bookmarkCard")
-
-        self.assertIn("categorySection('Most used', items)", render)
-        self.assertIn("bookmarkCard(", section)
-        self.assertIn('class="bookmark-card"', card)
-        self.assertIn('target="_blank"', card)
-
-    def test_strip_is_hidden_by_style_and_survives_the_mobile_breakpoint(self):
-        self.assertIn(".most-used[hidden]", self.css)
-        self.assertNotRegex(
             self.css,
-            r"\.most-used\s*\{[^}]*display\s*:\s*(block|flex|grid)",
+            r"\.usage-bar > span\s*\{[^}]*background:\s*var\(--accent-color\)",
         )
+
+
+class LaunchpadSourceTest(FrontEndSourceTest):
+    """Ticket #43: pinned Launchpad selection, tiles and beacon delegation."""
+
+    def test_pinned_items_keep_store_order_and_cap_at_eight(self):
+        self.assertRegex(self.js, r"PINNED_LIMIT\s*=\s*8\b")
+        body = function_body(self.js, "selectLaunchpad")
+
+        self.assertIn("pinned === true", body)
+        self.assertIn("slice(0, PINNED_LIMIT)", body)
+        # The count follows the store; never assume the embedded 24-link copy.
+        self.assertNotIn("24", body)
+
+    def test_no_pinned_items_fall_back_to_the_named_titles(self):
+        fallback = re.search(r"PINNED_FALLBACK_TITLES\s*=\s*\[(.*?)\]", self.js, re.S)
+        self.assertIsNotNone(fallback, "PINNED_FALLBACK_TITLES not found")
+        titles = re.findall(r"'([^']+)'", fallback.group(1))
+        self.assertEqual(titles, [
+            "Gmail", "Google Calendar", "Google Sheets", "GitHub",
+            "Slack", "T3 Code", "Proxmox", "AWS",
+        ])
+
+        body = function_body(self.js, "selectLaunchpad")
+        # Fallback applies only when nothing opted in, walks the listed order
+        # and skips titles the store does not carry.
+        self.assertIn("if (!pinned.length)", body)
+        self.assertIn("PINNED_FALLBACK_TITLES", body)
+        self.assertIn(".map(", body)
+        self.assertIn(".find(", body)
+        self.assertIn("item.title === title", body)
+        self.assertIn("slice(0, PINNED_LIMIT)", body)
+
+    def test_pinned_items_keep_store_order_while_fallback_uses_the_listed_order(self):
+        body = function_body(self.js, "selectLaunchpad")
+
+        # The pinned path filters the flattened store and never sorts it.
+        self.assertIn("items.filter(item => item && item.pinned === true)", body)
+        self.assertNotIn(".sort(", body)
+        # The fallback path derives its order from PINNED_FALLBACK_TITLES, not
+        # from the store order the matched items happen to sit in.
+        fallback = body[body.index("if (!pinned.length)"):]
+        self.assertIn("PINNED_FALLBACK_TITLES", fallback)
+        self.assertIn(".map(", fallback)
+        self.assertIn(".find(", fallback)
+
+    def test_tiles_use_monogram_and_a_two_line_label_and_open_a_new_tab(self):
+        render = function_body(self.js, "renderLaunchpad")
+        tile = function_body(self.js, "launchpadTile")
+
+        self.assertIn("selectLaunchpad(categories)", render)
+        self.assertIn(".map(launchpadTile)", render)
+        self.assertIn('class="launchpad-tile"', tile)
+        self.assertIn("monogram(item)", tile)
+        self.assertIn('class="launchpad-tile-label"', tile)
+        self.assertIn('target="_blank"', tile)
+        self.assertIn('rel="noreferrer"', tile)
+
+        self.assertRegex(
+            self.css,
+            r"\.launchpad-tile-label\s*\{[^}]*-webkit-line-clamp:\s*2",
+        )
+
+    def test_tile_count_follows_the_store_not_the_embedded_copy(self):
+        render = function_body(self.js, "renderLaunchpad")
+        select = function_body(self.js, "selectLaunchpad")
+
+        self.assertIn("items.map(launchpadTile)", render)
+        self.assertNotIn("24", render + select)
+        self.assertNotIn("bookmarks.work", render + select)
+
+        # The embedded copy paints the fallback first; the API response then
+        # re-renders from whatever the store actually pins.
+        self.assertIn(
+            "renderLaunchpad(bookmarkStore)", function_body(self.js, "updateDashboard")
+        )
+        load = function_body(self.js, "loadBookmarks")
+        self.assertIn("bookmarkStore = data.work", load)
+        self.assertIn("renderLaunchpad(bookmarkStore)", load)
+
+    def test_click_and_auxclick_delegate_to_sendbeacon_without_fetch(self):
+        body = function_body(self.js, "recordHit")
+
+        self.assertIn(".launchpad-tile", body)
+        self.assertIn(
+            "navigator.sendBeacon('/api/hit', JSON.stringify({ url }))", body
+        )
+        self.assertIn("event.type === 'auxclick' && event.button !== 1", body)
+        self.assertNotIn("fetch('/api/hit'", self.js)
 
 
 class FrontEndWiringTest(FrontEndSourceTest):
     """No JS runtime here, so guard the exact wiring the browser needs."""
 
-    def test_bookmark_clicks_use_sendbeacon_for_click_and_auxclick(self):
-        self.assertIn("navigator.sendBeacon('/api/hit', JSON.stringify({ url }))", self.source)
-        self.assertRegex(self.source, r"addEventListener\('click'")
-        self.assertRegex(self.source, r"addEventListener\('auxclick'")
+    def test_one_delegated_handler_records_every_link_kind(self):
+        body = function_body(self.js, "recordHit")
+
+        for selector in (".usage-row", ".tool-link", ".launchpad-tile"):
+            with self.subTest(selector=selector):
+                self.assertIn(selector, body)
+        self.assertIn("closest(", body)
+        self.assertIn("getAttribute('href')", body)
+        self.assertIn("navigator.sendBeacon('/api/hit', JSON.stringify({ url }))", body)
+        self.assertIn("event.type === 'auxclick' && event.button !== 1", body)
+
+        # A single document-level listener pair records one hit per click no
+        # matter which container rendered the link.
+        self.assertEqual(self.js.count("addEventListener('click', recordHit)"), 1)
+        self.assertEqual(self.js.count("addEventListener('auxclick', recordHit)"), 1)
+        self.assertIn("document.addEventListener('click', recordHit)", self.js)
+        self.assertIn("document.addEventListener('auxclick', recordHit)", self.js)
+
+        # The old per-container handlers are gone, so the same click can never
+        # be recorded twice.
+        for dead in ("recordBookmarkHit", "recordToolHit", "recordLaunchpadHit"):
+            with self.subTest(handler=dead):
+                self.assertNotIn(dead, self.js)
 
     def test_hits_do_not_use_cookies_or_fetch(self):
         self.assertNotIn("document.cookie", self.source)
         self.assertNotIn("fetch('/api/hit'", self.source)
         self.assertNotIn('fetch("/api/hit"', self.source)
 
-    def test_strip_has_its_own_click_and_auxclick_listeners(self):
-        self.assertIn(
-            "mostUsedEl.addEventListener('click', recordBookmarkHit)", self.source
+
+class WorkbenchShellTest(FrontEndSourceTest):
+    """Ticket #41: the Workbench shell, toolbar and body layout.
+
+    The page shell is static markup plus CSS; these assertions pin the ordering
+    and the two-column grid the other Workbench tickets fill in.
+    """
+
+    def test_toolbar_sits_above_a_two_column_body(self):
+        toolbar = self.html.index('class="toolbar')
+        body = self.html.index('class="body-grid"')
+        main = self.html.index('class="main-column"')
+        rail = self.html.index('class="rail"')
+
+        self.assertLess(toolbar, body)
+        self.assertLess(main, rail)
+
+    def test_main_column_stacks_usage_and_launchpad_above_all_tools(self):
+        top_row = self.html.index('class="top-row"')
+        usage = self.html.index('id="most-used"')
+        launchpad = self.html.index('id="launchpad-grid"')
+        all_tools = self.html.index('id="bookmarks-grid"')
+
+        self.assertLess(top_row, usage)
+        self.assertLess(usage, all_tools)
+        self.assertLess(launchpad, all_tools)
+
+    def test_network_tops_the_rail(self):
+        rail = self.html.index('class="rail"')
+        network = self.html.index('class="network-panel')
+
+        self.assertLess(rail, network)
+        self.assertLess(network, self.html.index("</aside>"))
+
+    def test_network_panel_reuses_the_card_surface_instead_of_repeating_it(self):
+        self.assertIn('class="network-panel card"', self.html)
+
+        panel = re.search(r"\.network-panel\s*\{(.*?)\}", self.css, re.S)
+        self.assertIsNotNone(panel, ".network-panel rule not found")
+        body = panel.group(1)
+        for duplicated in ("background:", "border:", "border-radius:",
+                           "box-shadow:", "backdrop-filter:"):
+            with self.subTest(property=duplicated):
+                self.assertNotIn(duplicated, body)
+        self.assertRegex(body, r"padding:")  # Network keeps its own padding
+
+    def test_body_grid_uses_the_specified_columns_and_gap(self):
+        self.assertRegex(
+            self.css,
+            r"\.body-grid\s*\{[^}]*grid-template-columns:\s*"
+            r"minmax\(0,\s*1fr\)\s+clamp\(320px,\s*25vw,\s*390px\)",
         )
-        self.assertIn(
-            "mostUsedEl.addEventListener('auxclick', recordBookmarkHit)", self.source
+        self.assertRegex(self.css, r"\.body-grid\s*\{[^}]*gap:\s*16px")
+
+    def test_main_starts_with_a_1_35fr_by_0_9fr_row(self):
+        self.assertRegex(self.css, r"\.top-row\s*\{[^}]*1\.35fr[^}]*0\.9fr")
+
+    def test_page_never_scrolls_only_inner_regions_do(self):
+        self.assertRegex(self.css, r"body\s*\{[^}]*overflow:\s*hidden")
+        self.assertRegex(self.css, r"\.body-grid\s*\{[^}]*min-height:\s*0")
+
+    def test_agenda_calendar_embed_and_greeting_are_gone(self):
+        self.assertNotIn("calendar.google.com/embed", self.html)
+        self.assertNotIn("<iframe", self.html)
+        self.assertNotIn("Agenda", self.html)
+        self.assertNotIn("greeting", self.html)
+        self.assertNotIn("greeting", self.js)
+        self.assertNotIn("Time to Focus", self.js)
+        self.assertNotIn("Time to Relax", self.js)
+
+
+class SearchWiringTest(FrontEndSourceTest):
+    """Ticket #41: search placeholder, slash focus, Escape clear/blur."""
+
+    def test_search_field_has_placeholder_and_accessible_label(self):
+        self.assertIn('placeholder="Search all tools…"', self.html)
+        self.assertRegex(
+            self.html, r'<input[^>]*id="search"[^>]*aria-label="Search all tools"'
         )
+
+    def test_slash_focuses_the_field_unless_already_typing(self):
+        self.assertIn("e.key !== '/'", self.js)
+        self.assertIn("searchInput.focus()", self.js)
+
+        guard = function_body(self.js, "isTypingTarget")
+        self.assertIn("INPUT", guard)
+        self.assertIn("TEXTAREA", guard)
+        self.assertIn("isContentEditable", guard)
+
+        # The global shortcut must consult the guard before focusing.
+        handler = self.js[self.js.index("e.key !== '/'"):]
+        self.assertIn("isTypingTarget", handler[:400])
+
+    def test_escape_clears_and_blurs_the_search(self):
+        self.assertIn("e.key !== 'Escape'", self.js)
+        self.assertIn("searchInput.value = ''", self.js)
+        self.assertIn("searchInput.blur()", self.js)
+
+    def test_arrow_keys_are_never_intercepted(self):
+        self.assertNotIn("Arrow", self.js)
+
+
+class ThemeAndDebugTest(FrontEndSourceTest):
+    """Ticket #41: theme keeps flipping at 09:00-17:00 and debug time wins."""
+
+    def test_work_hours_drive_the_theme(self):
+        self.assertRegex(self.js, r"WORK_START_HOUR\s*=\s*9\b")
+        self.assertRegex(self.js, r"WORK_END_HOUR\s*=\s*17\b")
+
+        body = function_body(self.js, "updateDashboard")
+        self.assertIn("getCurrentTime()", body)
+        self.assertIn("WORK_START_HOUR", body)
+        self.assertIn("data-theme", body)
+        self.assertIn("setAttribute", body)
+
+    def test_debug_time_overrides_the_clock_and_theme(self):
+        body = function_body(self.js, "getCurrentTime")
+        self.assertIn("debugTimeOffset", body)
+        self.assertIn(
+            "debugTimeOffset = debugDate.getTime() - now.getTime()", self.js
+        )
+        self.assertIn("debugTimeOffset = null", self.js)
+
+    def test_clock_and_date_live_in_the_toolbar(self):
+        self.assertIn('id="clock"', self.html)
+        self.assertIn('id="date"', self.html)
+        self.assertRegex(self.css, r"\.clock\s*\{[^}]*font-size:\s*1\.55rem")
+
+
+class MonogramIconTest(FrontEndSourceTest):
+    """Ticket #41: monograms only, no emoji, no third-party icon requests."""
+
+    def test_monogram_helper_renders_the_first_letter_only(self):
+        body = function_body(self.js, "monogram")
+
+        self.assertIn('class="monogram"', body)
+        self.assertIn("charAt(0).toUpperCase()", body)
+        self.assertNotIn("http", body)
+        self.assertNotIn("<img", body)
+
+    def test_rows_use_the_monogram_helper_not_emoji(self):
+        # Every surviving link renderer goes through the monogram helper.
+        for name in ("usageRow", "launchpadTile"):
+            with self.subTest(function=name):
+                body = function_body(self.js, name)
+                self.assertIn("monogram(item)", body)
+                self.assertNotIn("item.icon", body)
+
+        # The embedded bookmark copy is gone: the server injects the scored
+        # store, so there is no in-page icon field to render.
+        self.assertNotIn("const bookmarks = {", self.js)
+        self.assertNotIn("s2/favicons", self.js)
+        for emoji in ("📧", "📅", "📊", "🐙", "🤖", "☁️"):
+            self.assertNotIn(emoji, self.js)
+
+
+class HealthIndicatorTest(FrontEndSourceTest):
+    """Ticket #41: dot plus n/m online; amber partial, green only all online."""
+
+    def test_health_shows_online_counts_and_only_goes_green_when_all_are_online(self):
+        body = function_body(self.js, "renderHealth")
+
+        self.assertIn("online + '/' + total + ' online'", body)
+        self.assertIn("online === total", body)
+        self.assertIn("'warn'", body)
+        self.assertIn("'online'", body)
+
+    def test_health_dot_amber_when_partial_and_green_when_all_online(self):
+        self.assertRegex(self.css, r"\.health-dot\.online\s*\{[^}]*#48bb78")
+        self.assertRegex(self.css, r"\.health-dot\.warn\s*\{[^}]*#ed8936")
+
+    def test_stats_poll_updates_health_without_hiding_the_panel(self):
+        body = function_body(self.js, "refreshDevices")
+
+        self.assertIn("renderHealth(", body)
+        self.assertNotIn("display = 'none'", body)
+
+
+class AllToolsTest(FrontEndSourceTest):
+    """Ticket #42: numbered, searchable category lists.
+
+    No JS runtime is available here, so the behaviour is pinned at the function
+    boundaries the browser calls: filtering, row markup, counter/empty text and
+    the delegated beacon. Manual check: serve the dashboard, search for part of
+    a description and confirm only matching rows survive with "x of N tools".
+    """
+
+    def test_rows_show_a_two_digit_index_title_description_and_hover_arrow(self):
+        row = function_body(self.js, "toolRow")
+
+        self.assertIn("padStart(2, '0')", row)
+        self.assertIn('class="tool-num"', row)
+        self.assertIn('class="tool-link-title"', row)
+        self.assertIn('class="tool-link-desc"', row)
+        self.assertIn('class="tool-link-arrow"', row)
+        self.assertIn("↗", row)
+        self.assertIn("escapeHtml(item.url)", row)
+        self.assertIn("escapeHtml(item.title)", row)
+        self.assertIn("escapeHtml(item.desc || '')", row)
+        self.assertIn('target="_blank"', row)
+        self.assertIn('rel="noreferrer"', row)
+
+    def test_filter_matches_title_description_and_category_case_insensitively(self):
+        body = function_body(self.js, "filterToolCategories")
+
+        self.assertIn(".toLowerCase()", body)
+        self.assertIn("item.title", body)
+        self.assertIn("item.desc", body)
+        self.assertIn("cat.category", body)
+        self.assertIn(".includes(needle)", body)
+        self.assertIn(".trim()", body)
+
+    def test_filter_keeps_store_order_and_drops_categories_without_matches(self):
+        body = function_body(self.js, "filterToolCategories")
+
+        self.assertIn(".map(", body)
+        self.assertIn(".filter(cat => cat.items.length)", body)
+        self.assertNotIn(".sort(", body)
+
+        render = function_body(self.js, "renderAllTools")
+        self.assertIn("filterToolCategories(", render)
+        self.assertIn(".map(cat => toolCategorySection(cat))", render)
+        self.assertNotIn(".sort(", render)
+
+    def test_category_titles_and_numbering_stay_within_each_category(self):
+        section = function_body(self.js, "toolCategorySection")
+
+        self.assertIn('class="tool-category"', section)
+        self.assertIn('class="tool-category-title"', section)
+        self.assertIn("escapeHtml(cat.category)", section)
+        self.assertIn("cat.items.map((item, i) => toolRow(item, i))", section)
+        self.assertNotIn(".sort(", section)
+
+    def test_filtering_shows_x_of_n_tools_and_names_the_query_when_empty(self):
+        render = function_body(self.js, "renderAllTools")
+        count = function_body(self.js, "resultCountText")
+        empty = function_body(self.js, "allToolsEmptyText")
+
+        self.assertIn("resultCountText(", render)
+        self.assertIn("allToolsEmptyText(", render)
+        self.assertIn("resultCountEl.textContent", render)
+        self.assertIn("filtered.length", render)
+
+        self.assertIn("shown + ' of ' + total + ' tools'", count)
+        self.assertIn("'No tools match “'", empty)
+        self.assertIn("'”.'", empty)
+
+    def test_counter_is_empty_when_not_filtering(self):
+        # The spec only asks for "x of N tools" while a query is active; with
+        # no query the card head stays quiet instead of showing a full count.
+        count = function_body(self.js, "resultCountText")
+
+        self.assertIn(": ''", count)
+        self.assertNotIn("' tools · '", count)
+        self.assertNotIn("groups", count)
+
+    def test_result_count_lives_in_the_all_tools_card_head(self):
+        card = self.html[self.html.index('class="card all-tools-card"'):]
+        self.assertIn('id="result-count"', card[:card.index("</section>")])
+        self.assertIn('id="bookmarks-grid"', card[:card.index("</section>")])
+
+    def test_dead_bookmark_render_path_is_removed(self):
+        # There is one All tools renderer; the old card-grid path had no
+        # runtime callers and must not linger as dead code.
+        for name in ("renderBookmarks", "categorySection", "bookmarkCard"):
+            with self.subTest(function=name):
+                self.assertNotIn("function " + name + "(", self.js)
+                self.assertNotIn(name + "(", self.js)
+
+        for selector in (".category-section", ".items-grid", ".bookmark-card",
+                         ".bookmark-icon-text", ".bookmark-details",
+                         ".bookmark-title", ".bookmark-desc", ".category-title"):
+            with self.subTest(selector=selector):
+                self.assertNotIn(selector, self.css)
+
+        # The All tools container and its column rules stay.
+        self.assertIn('id="bookmarks-grid"', self.html)
+        self.assertRegex(self.css, r"\.bookmarks-grid\s*\{[^}]*columns:\s*3\b")
+
+    def test_search_filter_comment_does_not_claim_another_ticket_owns_it(self):
+        self.assertNotIn("#42 owns the All tools filtering", self.js)
+        self.assertNotIn("leaves the full list visible until then", self.js)
+
+    def test_three_balanced_columns_then_two_then_one(self):
+        self.assertRegex(self.css, r"\.bookmarks-grid\s*\{[^}]*columns:\s*3\b")
+        self.assertRegex(
+            self.css,
+            re.compile(
+                r"@media\s*\(max-width:\s*900px\)\s*\{.*?"
+                r"\.bookmarks-grid\s*\{[^}]*columns:\s*2\b",
+                re.S,
+            ),
+        )
+        self.assertRegex(
+            self.css,
+            re.compile(
+                r"@media\s*\(max-width:\s*600px\)\s*\{.*?"
+                r"\.bookmarks-grid\s*\{[^}]*columns:\s*1\b",
+                re.S,
+            ),
+        )
+        self.assertRegex(self.css, r"\.tool-category\s*\{[^}]*break-inside:\s*avoid")
+
+    def test_all_tools_clicks_use_the_delegated_beacon_for_click_and_auxclick(self):
+        handler = function_body(self.js, "recordHit")
+
+        self.assertIn(".tool-link", handler)
+        self.assertIn("event.button !== 1", handler)
+        self.assertIn("getAttribute('href')", handler)
+        self.assertIn(
+            "navigator.sendBeacon('/api/hit', JSON.stringify({ url }))", handler
+        )
+        self.assertIn("document.addEventListener('click', recordHit)", self.js)
+        self.assertIn("document.addEventListener('auxclick', recordHit)", self.js)
+        self.assertNotIn("fetch('/api/hit'", handler)
+
+
+class WorkbenchResponsiveTest(FrontEndSourceTest):
+    """Ticket #46: acceptance breakpoints, one-screen fit and cleanup.
+
+    The shell is static CSS; there is no layout engine here. These pin the
+    media-query contract, while the browser pass measured 1280x800,
+    1440x900 and 390x844 against the real app.
+    """
+
+    def media_block(self, condition):
+        marker = "@media " + condition
+        start = self.css.index(marker)
+        depth = 0
+        for offset, char in enumerate(self.css[start:], start):
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return self.css[start:offset + 1]
+        raise AssertionError("unbalanced media block for " + condition)
+
+    def test_below_1181_the_body_is_one_column_and_sized_to_its_content(self):
+        block = self.media_block("(max-width: 1180px)")
+
+        self.assertRegex(
+            block,
+            r"\.body-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)",
+        )
+        # The grid becomes the scroll container, so its rows must size to the
+        # content. Stretching them squeezes All tools to zero height and lets
+        # the rail overlap the main column at phone widths.
+        self.assertRegex(block, r"\.body-grid\s*\{[^}]*grid-auto-rows:\s*max-content")
+        # Agenda is dropped, so Network sits below the whole main column in a
+        # single column rather than occupying half of a two-column rail.
+        self.assertRegex(
+            block,
+            r"\.rail\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)",
+        )
+
+    def test_tablets_stack_the_launchpad_and_use_two_list_columns(self):
+        block = self.media_block("(max-width: 900px)")
+
+        self.assertRegex(block, r"\.top-row\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)")
+        self.assertRegex(block, r"\.bookmarks-grid\s*\{[^}]*columns:\s*2\b")
+
+    def test_phones_use_one_list_column_and_four_launchpad_tiles_per_row(self):
+        block = self.media_block("(max-width: 600px)")
+
+        self.assertRegex(block, r"\.bookmarks-grid\s*\{[^}]*columns:\s*1\b")
+        # auto-fit + a quarter-width minimum (minus the three 8px gaps) fits
+        # exactly four tiles per row at any phone width, while collapsing empty
+        # tracks when fewer than four tools are pinned.
+        self.assertRegex(
+            block,
+            r"\.launchpad-grid\s*\{[^}]*repeat\(auto-fit,\s*"
+            r"minmax\(calc\(25%\s*-\s*6px\),\s*1fr\)\)",
+        )
+
+    def test_short_viewports_tighten_the_shell_cards_and_device_rows(self):
+        block = self.media_block("(max-height: 850px)")
+
+        self.assertRegex(block, r"\.workbench\s*\{[^}]*padding:\s*14px")
+        self.assertRegex(block, r"\.card\s*\{[^}]*padding:\s*12px 14px")
+        self.assertRegex(block, r"\.network-panel\s*\{[^}]*padding:\s*12px 14px")
+        self.assertRegex(block, r"\.device-row\s*\{[^}]*padding:\s*3px 0")
+        self.assertRegex(block, r"\.usage-list\s*\{[^}]*max-height:\s*150px")
+
+    def test_no_prototype_directory_or_variant_switcher_remains(self):
+        root = APP_JS.parent
+        self.assertFalse((root / "prototype").exists(), "prototype/ is still present")
+
+        for name in ("app.js", "index.html", "style.css"):
+            text = (root / name).read_text()
+            with self.subTest(file=name):
+                self.assertNotIn("?variant", text)
+                self.assertNotIn("variant=", text)
+                self.assertNotIn("proto-bar", text)
+
+
+class NetworkCardTest(FrontEndSourceTest):
+    """Ticket #45: kind averages, compact device rows and in-place polling.
+
+    Same stdlib constraint as the rest of this file: assert against the helper
+    that owns each rule rather than executing browser-only JavaScript.
+    """
+
+    def test_summary_reads_online_count_and_average_cpu(self):
+        body = function_body(self.js, "networkSummary")
+
+        self.assertIn("online + '/' + total + ' online", body)
+        self.assertIn("' avg CPU'", body)
+        self.assertIn("avgText(", body)
+
+    def test_summary_always_renders_avg_cpu_even_without_a_sample(self):
+        # No numeric sample must read "— avg CPU", never silently drop the
+        # metric from the summary.
+        body = function_body(self.js, "networkSummary")
+
+        self.assertIn("+ ' avg CPU'", body)
+        self.assertNotIn("cpu === null ?", body)
+        self.assertIn("'—'", function_body(self.js, "avgText"))
+
+    def test_summary_average_uses_only_online_numeric_cpu_samples(self):
+        body = function_body(self.js, "averageSample")
+
+        self.assertIn("d.online", body)
+        self.assertIn("isNumericSample(d[field])", body)
+        self.assertIn("samples.length", body)
+
+        numeric = function_body(self.js, "isNumericSample")
+        self.assertIn("typeof value === 'number'", numeric)
+        self.assertIn("Number.isFinite", numeric)
+
+    def test_averages_clamp_samples_like_the_metric_bars(self):
+        # The local cgroup CPU reading can exceed 100% on a multi-core host.
+        # Averages must clamp each sample just as the device bars do, or a
+        # kind chip can read "125% cpu".
+        body = function_body(self.js, "averageSample")
+
+        self.assertIn("clampPct(d[field])", body)
+        self.assertIn(
+            "Math.max(0, Math.min(100, value))",
+            function_body(self.js, "clampPct"),
+        )
+
+    def test_kind_chips_show_count_and_online_numeric_averages(self):
+        body = function_body(self.js, "kindChips")
+        meta = function_body(self.js, "chipMeta")
+
+        self.assertIn("groupDevicesByKind(devices)", body)
+        self.assertIn("group.length", body)
+        # One helper owns the "cpu · ram" string for both the full render and
+        # the in-place poll patch.
+        self.assertIn("chipMeta(group)", body)
+        self.assertIn("averageSample(", meta)
+        self.assertIn("' cpu · '", meta)
+        self.assertIn("' ram'", meta)
+        self.assertIn("patchNetwork", self.js)
+        self.assertIn(
+            "chipMeta(group)", function_body(self.js, "patchNetwork")
+        )
+        # A missing sample renders an em dash rather than 0%.
+        self.assertIn("'—'", function_body(self.js, "avgText"))
+
+    def test_unknown_kinds_get_a_readable_label(self):
+        body = function_body(self.js, "kindLabel")
+
+        self.assertIn("KIND_LABELS[kind]", body)
+        self.assertIn("replace(/[-_]+/g, ' ')", body)
+        self.assertIn("toUpperCase", body)
+        self.assertIn("'Other'", body)
+
+    def test_kind_labels_and_order_share_one_definition(self):
+        # Adding a kind must edit one list, not two parallel constants that can
+        # drift apart.
+        self.assertRegex(self.js, r"KIND_DEFS\s*=\s*\[")
+        defs = re.search(r"KIND_DEFS\s*=\s*\[(.*?)\];", self.js, re.S)
+        self.assertIsNotNone(defs, "KIND_DEFS not found")
+        self.assertIn("label:", defs.group(1))
+        self.assertIn("key:", defs.group(1))
+
+        self.assertRegex(self.js, r"KIND_LABELS\s*=\s*Object\.fromEntries\(")
+        self.assertRegex(self.js, r"KIND_ORDER\s*=\s*KIND_DEFS\.map\(")
+
+    def test_device_key_helper_is_used_for_rows_and_poll_identity(self):
+        key = function_body(self.js, "deviceKey")
+        self.assertIn("d.id || d.name", key)
+        self.assertIn("deviceKey(d)", function_body(self.js, "deviceRow"))
+        self.assertIn("deviceKey(d)", function_body(self.js, "networkKey"))
+
+    def test_metric_warning_threshold_is_eighty_percent_amber(self):
+        self.assertRegex(self.js, r"METRIC_WARN_PCT\s*=\s*80\b")
+
+        cell = function_body(self.js, "metricCell")
+        self.assertIn("value >= METRIC_WARN_PCT", cell)
+        self.assertIn('data-metric="', cell)
+        self.assertIn('class="metric-fill"', cell)
+
+        self.assertRegex(self.css, r"\.metric\.is-warn \.metric-value\s*\{[^}]*#ed8936")
+        self.assertRegex(self.css, r"\.metric\.is-warn \.metric-fill\s*\{[^}]*#ed8936")
+        self.assertRegex(self.css, r"\.metric-bar\s*\{[^}]*height:\s*3px")
+
+    def test_device_rows_show_status_dot_name_sub_and_three_metrics(self):
+        body = function_body(self.js, "deviceRow")
+
+        self.assertIn('class="device-dot', body)
+        self.assertIn("escapeHtml(d.name)", body)
+        self.assertIn("deviceSub(d)", body)
+
+        # One metric definition drives both the full row render and the poll
+        # patch, so a new metric is added in one place.
+        self.assertRegex(self.js, r"DEVICE_METRICS\s*=\s*\[")
+        metrics = re.search(r"DEVICE_METRICS\s*=\s*\[(.*?)\];", self.js, re.S)
+        self.assertIsNotNone(metrics, "DEVICE_METRICS not found")
+        self.assertIn("'CPU'", metrics.group(1))
+        self.assertIn("'RAM'", metrics.group(1))
+        self.assertIn("'DSK'", metrics.group(1))
+        self.assertIn("DEVICE_METRICS", body)
+        self.assertIn("DEVICE_METRICS", function_body(self.js, "patchNetwork"))
+
+    def test_offline_and_online_rows_state_status_in_text_as_well_as_the_dot(self):
+        sub = function_body(self.js, "deviceSub")
+
+        # Colour alone is not an accessible status: the row text carries it too.
+        self.assertIn("' · offline'", sub)
+        self.assertIn("' · online'", sub)
+        # The dot remains alongside the text.
+        self.assertIn("device-dot", function_body(self.js, "deviceRow"))
+
+    def test_offline_rows_show_last_seen_and_online_rows_show_uptime(self):
+        body = function_body(self.js, "deviceSub")
+
+        self.assertIn("!d.online", body)
+        self.assertIn("d.last_seen", body)
+        self.assertIn("fmtAgo(", body)
+        self.assertIn("d.uptime_s", body)
+        self.assertIn("fmtUptime(", body)
+
+    def test_device_error_is_rendered_inline(self):
+        body = function_body(self.js, "deviceRow")
+
+        self.assertIn('class="device-error"', body)
+        self.assertIn("escapeHtml(d.error || '')", body)
+        self.assertRegex(self.css, r"\.device-error\s*\{[^}]*#e53e3e")
+
+    def test_failed_poll_keeps_last_good_data_and_shows_a_stale_indicator(self):
+        body = function_body(self.js, "refreshDevices")
+
+        self.assertIn("setNetworkStale(true)", body)
+        self.assertIn("renderHealth(networkDevices", body)
+        # A failed poll must not clear the last good reading or the panel.
+        self.assertNotIn("networkDevices = []", body)
+        self.assertNotIn("renderNetwork([])", body)
+        self.assertNotIn("innerHTML = ''", body)
+
+        stale = function_body(self.js, "setNetworkStale")
+        self.assertIn("networkStaleEl.hidden", stale)
+        self.assertIn("classList.toggle('is-stale'", stale)
+
+        self.assertIn('id="network-stale"', self.html)
+        self.assertRegex(self.css, r"\.network-stale\s*\{")
+        self.assertRegex(self.css, r"\.device-grid\.is-stale\s*\{")
+
+    def test_poll_patches_metrics_in_place_without_rebuilding_the_rows(self):
+        patch = function_body(self.js, "patchNetwork")
+        self.assertNotIn("innerHTML", patch)
+        self.assertIn(".device-row", patch)
+        self.assertIn("querySelector", patch)
+        self.assertIn("textContent", patch)
+
+        metric = function_body(self.js, "patchMetric")
+        self.assertNotIn("innerHTML", metric)
+        self.assertIn("style.width", metric)
+        self.assertIn("classList.toggle('is-warn'", metric)
+
+        apply = function_body(self.js, "applyNetworkDevices")
+        self.assertIn("networkKey(devices)", apply)
+        self.assertIn("renderNetwork(", apply)
+        self.assertIn("patchNetwork(", apply)
+
+        # Polling uses setTimeout with backoff, and pauses while the tab is
+        # hidden, rather than a fixed interval that keeps waking a background
+        # tab.
+        schedule = function_body(self.js, "scheduleRefresh")
+        self.assertIn("setTimeout(", schedule)
+        self.assertIn("document.hidden", schedule)
+        self.assertIn("10000", schedule)
+        self.assertIn("Math.min(60000", schedule)
+        self.assertIn("visibilitychange", self.js)
+        self.assertNotIn("setInterval(refreshDevices", self.js)
+
+    def test_updated_label_uses_a_locale_independent_24_hour_clock(self):
+        body = function_body(self.js, "updatedLabel")
+
+        self.assertIn("'updated '", body)
+        # getHours/getMinutes are 24-hour regardless of the browser locale; a
+        # 12-hour locale would still print HH:MM. toLocaleTimeString would not.
+        self.assertIn("getHours()", body)
+        self.assertIn("getMinutes()", body)
+        self.assertIn("padStart(2, '0')", body)
+        self.assertNotIn("toLocaleTimeString", body)
+        self.assertNotIn("hour12", body)
+
+    def test_devices_are_ordered_by_kind_only_and_keep_server_order_within_one(self):
+        body = function_body(self.js, "sortNetworkDevices")
+
+        self.assertIn("kindRank(", body)
+        # Re-ordering inside a kind invents an order the server did not send.
+        self.assertNotIn("localeCompare", body)
+        self.assertNotIn("a.name", body)
+        self.assertNotIn("b.name", body)
+
+    def test_kind_chips_and_compact_rows_fit_the_rail_without_page_scroll(self):
+        self.assertRegex(
+            self.css, r"\.kind-chips\s*\{[^}]*grid-template-columns:\s*1fr 1fr"
+        )
+        self.assertRegex(self.css, r"\.device-row\s*\{[^}]*padding:\s*5px 0")
+        self.assertRegex(self.css, r"\.device-row\s*\{[^}]*repeat\(3,\s*46px\)")
+        self.assertNotRegex(self.css, r"\.device-grid\s*\{[^}]*max-height")

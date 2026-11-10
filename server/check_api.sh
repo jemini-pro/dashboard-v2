@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Black-box acceptance check for click history and decayed bookmark scores.
-# Spec #16, ticket #37.
+# Black-box acceptance check for click history, decayed bookmark scores and
+# Workbench deployment documentation. Spec #16 ticket #37; spec #40 ticket #46.
 #
 # Dependencies: bash, curl, coreutils, and python3 (stdlib only -- the server is
 # stdlib Python as well). No docker, node or pip. Starts the real server on a
@@ -160,8 +160,8 @@ PY
 }
 
 write_bookmarks() {
-    # The seed is the same 31-link fixture the app used to embed; keeping it in
-    # a tracked JSON file lets the front end stop carrying a duplicate copy.
+    # The seed is the tracked bookmark fixture the server injects; the front
+    # end no longer carries an embedded copy of these links.
     cp "$SERVER_DIR/bookmarks.seed.json" "$BOOKMARKS"
     python3 - "$BOOKMARKS" <<'PY'
 import json, sys
@@ -196,6 +196,24 @@ with open(path, "w") as f:
 PY
 }
 
+pin_item() { # pin_item <url> - add "pinned": true to a fixture item
+    python3 - "$BOOKMARKS" "$1" <<'PY'
+import json, sys
+path, url = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    store = json.load(f)
+for category_list in store.values():
+    if not isinstance(category_list, list):
+        continue
+    for category in category_list:
+        for item in category.get("items", []):
+            if item.get("url") == url:
+                item["pinned"] = True
+with open(path, "w") as f:
+    json.dump(store, f)
+PY
+}
+
 rename_mail() {
     python3 - "$BOOKMARKS" "$W_MAIL" <<'PY'
 import json, sys
@@ -217,7 +235,14 @@ write_bookmarks
 start_server
 ok "server started on an ephemeral port with a throwaway DASH_DATA_DIR"
 
-# 1. POST /api/hit -> 204, no body, timestamp stored.
+# 1. The Launchpad is data-driven: a pinned flag passes through unchanged.
+pin_item "$W_MAIL"
+get_bookmarks
+[[ "$(json_item_field "$TMP/bookmarks.json" "$W_MAIL" pinned)" == "True" ]] \
+    || fail "a pinned flag did not survive /api/bookmarks"
+ok "/api/bookmarks passes a pinned flag through unchanged"
+
+# 2. POST /api/hit -> 204, no body, timestamp stored.
 code="$(post_hit "$W_MAIL")"
 [[ "$code" == "204" ]] || fail "POST /api/hit returned $code, expected 204"
 [[ ! -s "$TMP/hit.body" ]] || fail "POST /api/hit returned a body"
@@ -226,7 +251,7 @@ code="$(post_hit "$W_MAIL")"
     || fail "one hit was not stored for $W_MAIL"
 ok "POST /api/hit returns 204 with no body and writes hits.json"
 
-# 2. Score appears in /api/bookmarks and rises with repeated clicks.
+# 3. Score appears in /api/bookmarks and rises with repeated clicks.
 get_bookmarks
 score_one="$(json_item_field "$TMP/bookmarks.json" "$W_MAIL" score)" \
     || fail "score missing for $W_MAIL"
@@ -239,7 +264,7 @@ assert_close "$score_three" 3.0 0.01 || fail "three clicks scored $score_three, 
 assert_gt "$score_three" "$score_one" || fail "score did not rise: $score_one -> $score_three"
 ok "score appears in /api/bookmarks and rises on repeated clicks (1.0 -> 3.0)"
 
-# 3. Decay ordering and the documented half life.
+# 4. Decay ordering and the documented half life.
 seed_hits
 get_bookmarks
 s7="$(json_item_field "$TMP/bookmarks.json" "$W_CAL" score)"
@@ -252,7 +277,7 @@ assert_gt "$s60" 0 || fail "60-day hit scored zero, expected non-zero"
 assert_close "$s14" 0.37 0.005 || fail "14-day half life scored $s14, expected 0.37"
 ok "older hits decay: 7d=$s7 > 28d=$s28 > 60d=$s60; 14d=$s14"
 
-# 4. 90-day trimming happens on write.
+# 5. 90-day trimming happens on write.
 [[ "$(hits_len "$W_FORMS")" == "2" ]] \
     || fail "seed hits for $W_FORMS were not written"
 post_hit "$W_FORMS" >/dev/null
@@ -268,14 +293,14 @@ assert max(now - ts for ts in stamps) <= 90 * 86400 + 5, stamps
 PY
 ok "hits older than 90 days are trimmed when a new hit is written"
 
-# 5. Unknown URL is accepted (a link may since have been deleted).
+# 6. Unknown URL is accepted (a link may since have been deleted).
 code="$(post_hit https://deleted.example.com)"
 [[ "$code" == "204" ]] || fail "unknown URL returned $code, expected 204"
 [[ "$(hits_len https://deleted.example.com)" == "1" ]] \
     || fail "unknown URL hit was not stored"
 ok "unknown URL is accepted with 204 and stored"
 
-# 6. Renaming a title keeps the score (history is keyed by URL).
+# 7. Renaming a title keeps the score (history is keyed by URL).
 score_before="$(json_item_field "$TMP/bookmarks.json" "$W_MAIL" score)"
 rename_mail
 get_bookmarks
@@ -286,18 +311,18 @@ assert_close "$score_after" "$score_before" 0.001 \
     || fail "rename changed the score: $score_before -> $score_after"
 ok "renaming a title keeps its score ($score_before -> $score_after)"
 
-# 7. Payload size for the representative 31 links from app.js stays under ~10 KB.
+# 8. Payload size for the 31 representative links in the seed stays under ~10 KB.
 items="$(json_item_count "$TMP/bookmarks.json")"
 [[ "$items" == "31" ]] \
-    || fail "expected 31 representative links derived from app.js, found $items"
+    || fail "expected 31 representative links in the seed, found $items"
 title="$(json_item_field "$TMP/bookmarks.json" "$W_DRIVE" title)"
 [[ "$title" == "Shared Drive" ]] \
-    || fail "fixture is not derived from app.js (expected 'Shared Drive', got '$title')"
+    || fail "fixture is not the tracked seed (expected 'Shared Drive', got '$title')"
 size="$(wc -c < "$TMP/bookmarks.json")"
 [[ "$size" -lt 10240 ]] || fail "/api/bookmarks is $size bytes, over the ~10 KB budget"
 ok "/api/bookmarks is $size bytes for $items links (under 10240)"
 
-# 8. Process restart: the same DASH_DATA_DIR keeps the history. This is the
+# 9. Process restart: the same DASH_DATA_DIR keeps the history. This is the
 # no-docker equivalent of recreating the `dash` container with its bind mount.
 score_before="$(json_item_field "$TMP/bookmarks.json" "$W_MAIL" score)"
 stamps_before="$(hits_len "$W_MAIL")"
@@ -313,7 +338,7 @@ assert_close "$score_restart" "$score_before" 0.001 \
     || fail "hit count changed across restart: $stamps_before -> $stamps_restart"
 ok "hits survived a full server restart (score $score_before -> $score_restart)"
 
-# 9. Static guarantees: no cookie is set and the feature makes no third-party
+# 10. Static guarantees: no cookie is set and the feature makes no third-party
 # request. Deliberately scoped to the click-history/strip code so unrelated
 # front-end code does not produce false positives.
 grep -q "Set-Cookie" "$APP" && fail "server sets a cookie"
@@ -323,21 +348,21 @@ grep -qE 'calendar\.google\.com|fonts\.googleapis\.com|fonts\.gstatic\.com' \
     && fail "front end still references the calendar iframe or Google Fonts"
 grep -Fq "navigator.sendBeacon('/api/hit'" "$REPO/app.js" \
     || fail "click handler does not beacon to the same-origin /api/hit"
-grep -Fq "mostUsedEl.addEventListener('click', recordBookmarkHit)" "$REPO/app.js" \
-    || fail "Most used strip is missing its click listener"
-grep -Fq "mostUsedEl.addEventListener('auxclick', recordBookmarkHit)" "$REPO/app.js" \
-    || fail "Most used strip is missing its auxclick listener"
+grep -Fq "document.addEventListener('click', recordHit)" "$REPO/app.js" \
+    || fail "link clicks are not delegated to one beacon handler"
+grep -Fq "document.addEventListener('auxclick', recordHit)" "$REPO/app.js" \
+    || fail "middle-clicks are not delegated to one beacon handler"
 awk '/# ---------- click history ----------/{f=1; next} /# ---------- http ----------/{f=0} f' "$APP" \
     | grep -Eq 'https?://|urlopen|urllib' \
     && fail "click-history code makes an outbound request"
-# The shared card/section renderers and the strip selection must stay same-origin
-# too: no hard-coded external URL, no fetch/XHR, no cookie access.
+# The shared hit handler and the strip selection must stay same-origin too: no
+# hard-coded external URL, no fetch/XHR, no cookie access.
 awk '
-    /^function (recordBookmarkHit|bookmarkCard|categorySection|selectMostUsed|renderMostUsed)\(/ {f=1}
+    /^function (recordHit|selectMostUsed|renderMostUsed)\(/ {f=1}
     f {print}
     f && /^}/ {f=0}
 ' "$REPO/app.js" > "$TMP/strip-functions.js"
-for fn in recordBookmarkHit bookmarkCard categorySection selectMostUsed renderMostUsed; do
+for fn in recordHit selectMostUsed renderMostUsed; do
     grep -q "^function $fn(" "$TMP/strip-functions.js" \
         || fail "static check could not find function $fn in app.js"
 done
@@ -345,7 +370,7 @@ grep -Eq 'https?://|fetch\(|XMLHttpRequest|document\.cookie' "$TMP/strip-functio
     && fail "card/strip code makes an external request or touches cookies"
 ok "feature sets no cookie and makes no third-party request"
 
-# 10. Repo/deploy coherence: compose defaults describe the live /opt/stack
+# 11. Repo/deploy coherence: compose defaults describe the live /opt/stack
 # layout but can be pointed at the repo, and the durable host path is documented.
 grep -Fq '${DASH_DIR:-./dash}:/app' "$COMPOSE" \
     || fail "compose does not make the dash directory overridable"
@@ -362,5 +387,21 @@ grep -Fq '/opt/stack/dash/data/hits.json' "$README" \
 grep -Fq 'server/check_api.sh' "$README" \
     || fail "README does not document this check"
 ok "compose paths are overridable, defaults match /opt/stack, and README documents both"
+
+# 12. README documents how an owner pins a Launchpad tool.
+grep -Fq '"pinned": true' "$README" \
+    || fail "README does not document the pinned bookmark flag"
+ok "README documents the pinned: true bookmark flag"
+
+# 13. README documents the Workbench UI, its breakpoints and the checks.
+grep -Fq '## Workbench UI' "$README" \
+    || fail "README does not document the Workbench UI"
+grep -Fq '1280×800' "$README" \
+    || fail "README does not document the one-screen viewport checks"
+grep -Fq '1180px' "$README" \
+    || fail "README does not document the responsive breakpoints"
+grep -Fq 'python3 -m unittest discover -s server' "$README" \
+    || fail "README does not document the stdlib test command"
+ok "README documents the Workbench UI, breakpoints and checks"
 
 echo "all $COUNT checks passed"

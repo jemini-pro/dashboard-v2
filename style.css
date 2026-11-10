@@ -22,6 +22,11 @@
     --accent-color: #3182ce;
     --font-family: 'Space Grotesk', sans-serif;
 
+    --radius: 22px;
+    --gap: 16px;
+    --muted: color-mix(in srgb, var(--text-color) 58%, transparent);
+    --faint: color-mix(in srgb, var(--text-color) 38%, transparent);
+
     /* Blob Colors Work */
     --blob-1-color: rgba(66, 153, 225, 0.3); /* blue */
     --blob-2-color: rgba(159, 122, 234, 0.2); /* purple */
@@ -59,7 +64,6 @@
    element when the 09:00/17:00 theme flips. */
 a,
 button,
-.bookmark-card,
 .debug-menu-btn,
 .debug-controls,
 .metric-fill {
@@ -74,8 +78,9 @@ body {
     background-size: var(--bg-size);
     color: var(--text-color);
     height: 100vh;
+    height: 100dvh;
     overflow: hidden;
-    /* Prevent body scroll, let containers scroll */
+    /* The page never scrolls; card and list regions own their own overflow. */
     position: relative;
 }
 
@@ -102,152 +107,714 @@ body {
     display: none;
 }
 
-.dashboard-layout {
-    display: flex;
+@media (prefers-reduced-motion: reduce) {
+    *,
+    .blob {
+        animation: none !important;
+        transition: none !important;
+    }
+}
+
+/* ---------- Workbench shell ---------- */
+
+.workbench {
+    position: relative;
+    z-index: 1;
     height: 100vh;
-    width: 100%;
+    height: 100dvh;
+    padding: 20px;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    gap: var(--gap);
+    overflow: hidden;
 }
 
-.main-content {
-    flex: 1;
+.card {
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: var(--radius);
+    box-shadow: var(--card-shadow);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    padding: 14px 16px;
+}
+
+/* Toolbar: date · clock · search · health. No greeting, no agenda. */
+.toolbar {
+    display: grid;
+    grid-template-columns: auto minmax(280px, 560px) auto;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+    padding: 11px 16px;
+    border-radius: 18px;
+}
+
+.toolbar-id {
     display: flex;
-    justify-content: center;
-    align-items: flex-start;
-    /* Fixed: changed from center to flex-start to prevent top cutoff */
-    padding: 2rem;
-    overflow-y: auto;
+    align-items: baseline;
+    gap: 12px;
 }
 
-.app-container {
-    width: 100%;
-    max-width: 800px;
-    text-align: center;
-}
-
-header {
-    margin-bottom: 3rem;
-}
-
-h1 {
-    font-weight: 300;
-    font-size: 2rem;
-    margin-bottom: 0.5rem;
-    opacity: 0.8;
+.toolbar-date {
+    font-size: 0.7rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    white-space: nowrap;
 }
 
 .clock {
-    font-size: 6rem;
+    font-size: 1.55rem;
     font-weight: 600;
-    letter-spacing: -2px;
-    line-height: 1;
-    margin-bottom: 2rem;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.045em;
+    line-height: 0.92;
 }
 
-.bookmarks-grid {
+.search-field {
+    position: relative;
+    display: flex;
+    align-items: center;
+}
+
+.search-icon {
+    position: absolute;
+    left: 12px;
+    width: 16px;
+    height: 16px;
+    color: var(--faint);
+    pointer-events: none;
+}
+
+.search-field input {
+    width: 100%;
+    padding: 10px 42px 10px 36px;
+    border-radius: 12px;
+    border: 1px solid var(--card-border);
+    background: var(--icon-bg);
+    color: var(--text-color);
+    font: inherit;
+    font-size: 0.8rem;
+    outline: none;
+}
+
+.search-field input::placeholder {
+    color: var(--faint);
+}
+
+.search-field input:focus-visible,
+.search-field input:focus {
+    border-color: var(--accent-color);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-color) 18%, transparent);
+}
+
+.search-field kbd {
+    position: absolute;
+    right: 10px;
+    padding: 1px 6px;
+    border-radius: 5px;
+    border: 1px solid var(--card-border);
+    font-family: inherit;
+    font-size: 0.65rem;
+    color: var(--muted);
+    background: var(--card-bg);
+}
+
+.health {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 0.7rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.health-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex: none;
+    background: #a0aec0;
+}
+
+.health-dot.online {
+    background: #48bb78;
+    box-shadow: 0 0 8px rgba(72, 187, 120, 0.65);
+}
+
+.health-dot.warn {
+    background: #ed8936;
+    box-shadow: 0 0 8px rgba(237, 137, 54, 0.55);
+}
+
+.health-dot.unknown {
+    background: #a0aec0;
+    opacity: 0.7;
+}
+
+/* Body: main column + network rail. */
+.body-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) clamp(320px, 25vw, 390px);
+    gap: 16px;
+    min-height: 0;
+}
+
+.main-column {
     display: flex;
     flex-direction: column;
-    gap: 3rem;
-    width: 100%;
+    gap: var(--gap);
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
 }
 
-/* ---------- Most used strip ---------- */
-
-.most-used {
-    text-align: left;
-    margin-bottom: 2.5rem;
-}
-
-/* The strip renders no heading and no box until scored history exists. */
-.most-used[hidden] {
-    display: none;
-}
-
-.category-section {
-    width: 100%;
-    text-align: left;
-}
-
-.category-title {
-    font-size: 1.25rem;
-    font-weight: 600;
-    margin-bottom: 1.5rem;
-    color: var(--text-color);
-    opacity: 0.9;
-    padding-left: 0.5rem;
-    border-left: 4px solid var(--accent-color);
-}
-
-.items-grid {
+.top-row {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-    gap: 1.5rem;
+    grid-template-columns: minmax(0, 1.35fr) minmax(0, 0.9fr);
+    gap: var(--gap);
+    align-items: stretch;
+    min-width: 0;
 }
 
-.bookmark-card {
-    background-color: var(--card-bg);
-    border: 1px solid var(--card-border);
-    padding: 1.5rem;
-    border-radius: 16px;
-    text-decoration: none;
-    color: var(--text-color);
+.usage-card,
+.launchpad-card {
+    min-width: 0;
+}
+
+.launchpad-card {
     display: flex;
-    flex-direction: row;
-    /* changed to row for icon + text */
+    flex-direction: column;
+}
+
+.card-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 10px;
+}
+
+.card-title {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.card-heading {
+    font-size: 0.95rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+}
+
+.card-sub {
+    font-size: 0.72rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.card-empty {
+    font-size: 0.75rem;
+    color: var(--muted);
+    padding: 12px 2px;
+}
+
+/* "Jump back in" card: scored usage rows, kept visible when empty. */
+.usage-list {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    max-height: 190px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+}
+
+.usage-row {
+    display: grid;
+    grid-template-columns: 28px minmax(0, 1fr) 44px;
     align-items: center;
-    justify-content: flex-start;
-    box-shadow: var(--card-shadow);
-    height: auto;
-    /* let content define height */
-    min-height: 100px;
-    gap: 1.5rem;
+    gap: 10px;
+    padding: 6px 5px;
+    border-radius: 9px;
+    color: var(--text-color);
+    text-decoration: none;
+    min-width: 0;
 }
 
-.bookmark-card:hover {
-    transform: translateY(-5px);
-    background-color: var(--card-hover);
-    border-color: var(--accent-color);
-    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.08);
+.usage-row:hover {
+    background: var(--card-hover);
 }
 
-[data-theme="personal"] .bookmark-card:hover {
-    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.35);
-}
-
-.bookmark-icon-text {
-    font-size: 1.75rem;
-    font-weight: 700;
-    color: var(--accent-color);
-    background: var(--icon-bg);
-    width: 60px;
-    height: 60px;
+.usage-icon {
+    width: 28px;
+    height: 28px;
     display: flex;
     align-items: center;
     justify-content: center;
-    border-radius: 12px;
-    flex-shrink: 0;
+    border-radius: 9px;
+    background: var(--icon-bg);
 }
 
-.bookmark-details {
+.usage-main {
     display: flex;
     flex-direction: column;
-    align-items: flex-start;
-    text-align: left;
+    min-width: 0;
 }
 
-.bookmark-title {
+.usage-title {
+    font-size: 0.8rem;
+    font-weight: 500;
+    line-height: 1.25;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.usage-desc {
+    font-size: 0.63rem;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.usage-bar {
+    display: block;
+    width: 44px;
+    height: 3px;
+    border-radius: 999px;
+    background: var(--icon-bg);
+    overflow: hidden;
+}
+
+.usage-bar > span {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--accent-color);
+}
+
+.usage-empty {
+    font-size: 0.72rem;
+    color: var(--muted);
+    padding: 10px 5px;
+}
+
+.monogram {
+    font-size: 0.82rem;
     font-weight: 600;
-    font-size: 1.1rem;
-    margin-bottom: 0.25rem;
+    color: var(--accent-color);
+    opacity: 0.8;
 }
 
-.bookmark-desc {
-    font-size: 0.85rem;
+/* Launchpad region (#43): pinned tool tiles. */
+.launchpad-grid {
+    flex: 1;
+    min-height: 40px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(74px, 1fr));
+    gap: 8px;
+    align-content: center;
+}
+
+.launchpad-tile {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    padding: 9px 6px 8px;
+    border-radius: 12px;
+    border: 1px solid var(--card-border);
+    background: var(--icon-bg);
+    color: var(--text-color);
+    text-decoration: none;
+    text-align: center;
+    min-width: 0;
+}
+
+.launchpad-tile:hover {
+    transform: translateY(-2px);
+    border-color: var(--accent-color);
+    background: var(--card-hover);
+}
+
+.launchpad-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    width: 30px;
+    height: 30px;
+    border-radius: 9px;
+    background: var(--icon-bg);
+}
+
+.launchpad-tile .monogram {
+    font-size: 0.78rem;
+}
+
+.launchpad-tile-label {
+    max-width: 100%;
+    font-size: 0.6rem;
+    font-weight: 500;
+    line-height: 1.2;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+/* All tools region. The list scrolls inside the card, never the page. */
+.all-tools-card {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+.bookmarks-grid {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    columns: 3;
+    column-gap: 20px;
+    padding-right: 2px;
+    scrollbar-width: thin;
+}
+
+/* Numbered rows: 01 · title / description · hover arrow. */
+.tool-category {
+    break-inside: avoid;
+    margin-bottom: 12px;
+}
+
+.tool-category-title {
+    padding-bottom: 4px;
+    margin-bottom: 3px;
+    border-bottom: 1px solid var(--sidebar-border);
+    font-size: 0.55rem;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+}
+
+.tool-list {
+    list-style: none;
+}
+
+.tool-link {
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
+    padding: 3px;
+    border-radius: 7px;
+    color: var(--text-color);
+    text-decoration: none;
+}
+
+.tool-link:hover {
+    background: var(--icon-bg);
+}
+
+.tool-num {
+    width: 15px;
+    flex: none;
+    font-size: 0.53rem;
+    color: var(--faint);
+    font-variant-numeric: tabular-nums;
+}
+
+.tool-link-main {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.tool-link-title {
+    font-size: 0.77rem;
+    font-weight: 500;
+    line-height: 1.25;
+}
+
+.tool-link-desc {
+    font-size: 0.6rem;
+    color: var(--faint);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.tool-link-arrow {
+    margin-left: auto;
+    font-size: 0.64rem;
+    color: var(--accent-color);
+    opacity: 0;
+}
+
+.tool-link:hover .tool-link-arrow,
+.tool-link:focus-visible .tool-link-arrow {
+    opacity: 1;
+}
+
+.tool-empty {
+    font-size: 0.75rem;
+    color: var(--muted);
+    padding: 10px 2px;
+}
+
+/* ---------- Network rail ---------- */
+
+.rail {
+    display: flex;
+    flex-direction: column;
+    gap: var(--gap);
+    min-height: 0;
+    overflow-y: auto;
+    padding-right: 2px;
+    scrollbar-width: thin;
+}
+
+.network-panel {
+    /* Surface comes from .card; the rail panel only tightens its padding. */
+    padding: 14px 16px 10px;
+    flex: none;
+}
+
+.network-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 8px;
+}
+
+.network-summary {
+    font-size: 0.68rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.network-status {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex: none;
+}
+
+.network-updated {
+    font-size: 0.62rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+/* A failed poll keeps the last good numbers and marks them stale. */
+.network-stale {
+    font-size: 0.55rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #ed8936;
+}
+
+.network-stale[hidden] {
+    display: none;
+}
+
+.kind-chips {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 7px;
+    margin: 10px 0 8px;
+}
+
+.kind-chip {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 1px 8px;
+    padding: 7px 9px;
+    border-radius: 10px;
+    background: var(--icon-bg);
+}
+
+.kind-name {
+    font-size: 0.55rem;
+    font-weight: 600;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.kind-count {
+    font-size: 0.68rem;
+    font-weight: 600;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+.kind-meta {
+    grid-column: 1 / -1;
+    font-size: 0.55rem;
+    color: var(--faint);
+    font-variant-numeric: tabular-nums;
+}
+
+.device-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0;
+}
+
+.device-grid.is-stale {
+    opacity: 0.78;
+}
+
+.device-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) repeat(3, 46px);
+    align-items: center;
+    gap: 8px;
+    padding: 5px 0;
+}
+
+.device-row + .device-row {
+    border-top: 1px solid var(--sidebar-border);
+}
+
+/* Offline rows dim but keep their numbers and last-seen time readable. */
+.device-row.offline {
+    opacity: 0.48;
+}
+
+.device-id {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+}
+
+.device-text {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+}
+
+.device-name {
+    font-size: 0.76rem;
+    font-weight: 600;
+    line-height: 1.2;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.device-sub {
+    font-size: 0.52rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--faint);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.device-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #a0aec0;
     opacity: 0.7;
-    font-weight: 400;
-    line-height: 1.4;
+    flex: none;
 }
 
-/* Debug Controls */
+.device-dot.online {
+    background: #48bb78;
+    opacity: 1;
+    box-shadow: 0 0 8px rgba(72, 187, 120, 0.65);
+}
+
+.device-dot.offline {
+    background: #a0aec0;
+    box-shadow: none;
+}
+
+.device-error {
+    font-size: 0.56rem;
+    color: #e53e3e;
+    line-height: 1.25;
+    word-break: break-word;
+}
+
+.device-error[hidden] {
+    display: none;
+}
+
+.metric {
+    display: grid;
+    justify-items: end;
+    gap: 2px;
+}
+
+.metric-label {
+    font-size: 0.53rem;
+    letter-spacing: 0.08em;
+    color: var(--faint);
+}
+
+.metric-value {
+    font-size: 0.68rem;
+    font-variant-numeric: tabular-nums;
+}
+
+.metric-bar {
+    width: 100%;
+    height: 3px;
+    border-radius: 999px;
+    background: var(--icon-bg);
+    overflow: hidden;
+}
+
+.metric-fill {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--accent-color);
+    transition: width 0.5s ease;
+}
+
+.metric.is-warn .metric-value {
+    color: #ed8936;
+}
+
+.metric.is-warn .metric-fill {
+    background: #ed8936;
+}
+
+.device-empty {
+    font-size: 0.75rem;
+    color: var(--muted);
+    padding: 8px 2px;
+}
+
+/* Visible focus rings for keyboard users. */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: 2px;
+}
+
+/* ---------- Debug Controls ---------- */
+
 .debug-wrapper {
     position: fixed;
     bottom: 1.5rem;
@@ -270,7 +837,6 @@ h1 {
     justify-content: center;
     cursor: pointer;
     box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    transition: all 0.2s ease;
 }
 
 .debug-menu-btn:hover,
@@ -290,14 +856,12 @@ h1 {
     flex-direction: column;
     gap: 0.75rem;
     align-items: flex-start;
-    
-    /* Popout positioning */
+
     position: absolute;
     bottom: 50px;
     right: 0;
     width: 200px;
-    
-    /* Transition */
+
     opacity: 0;
     visibility: hidden;
     transform: translateY(10px);
@@ -342,204 +906,107 @@ h1 {
     opacity: 0.9;
 }
 
-/* Mobile & Responsive Adjustments */
-@media (max-width: 768px) {
-    body {
-        height: auto;
-        min-height: 100vh;
+/* ---------- Responsive ---------- */
+
+@media (max-height: 850px) {
+    .workbench {
+        padding: 14px;
+        gap: 14px;
+    }
+
+    .body-grid,
+    .top-row {
+        gap: 14px;
+    }
+
+    .card {
+        padding: 12px 14px;
+    }
+
+    /* The rail panel keeps its tighter bottom padding. */
+    .network-panel {
+        padding: 12px 14px 8px;
+    }
+
+    .card-head {
+        margin-bottom: 8px;
+    }
+
+    .usage-list {
+        max-height: 150px;
+    }
+
+    /* 1280×800 must fit every device row without page scroll. */
+    .device-row {
+        padding: 3px 0;
+    }
+
+    .kind-chip {
+        padding: 6px 8px;
+    }
+}
+
+@media (max-width: 1180px) {
+    .body-grid {
+        grid-template-columns: minmax(0, 1fr);
+        /* The grid owns the scroll now: size rows to their content, or the
+           fixed-height track squeezes All tools to zero and the rail overlaps
+           the main column. */
+        grid-auto-rows: max-content;
         overflow-y: auto;
     }
 
-    .dashboard-layout {
-        flex-direction: column;
-        height: auto;
-        min-height: 100vh;
+    .main-column {
+        overflow: visible;
     }
 
-    .main-content {
-        padding: 1.5rem 1rem;
-        overflow-y: visible;
-    }
-
-    header {
-        margin-bottom: 1.5rem;
-    }
-
-    h1 {
-        font-size: 1.5rem;
-    }
-
-    .clock {
-        font-size: 3.75rem;
-    }
-
-    .mode-badge {
-        margin-bottom: 1.5rem;
+    /* Agenda is gone, so the rail is one column with Network below main. */
+    .rail {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        align-items: start;
+        overflow: visible;
     }
 
     .bookmarks-grid {
-        gap: 2rem;
+        overflow: visible;
     }
+}
 
-    .most-used {
-        margin-bottom: 1.5rem;
-    }
-
-    .items-grid {
+@media (max-width: 900px) {
+    .toolbar {
         grid-template-columns: 1fr;
-        gap: 1rem;
+        gap: 10px;
     }
 
-    .bookmark-card {
-        padding: 1rem;
-        min-height: auto;
-        gap: 1rem;
+    .top-row {
+        grid-template-columns: minmax(0, 1fr);
     }
 
-    .bookmark-icon-text {
-        width: 48px;
-        height: 48px;
-        font-size: 1.35rem;
+    .rail {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .bookmarks-grid {
+        columns: 2;
     }
 }
 
-/* ---------- Network panel ---------- */
+@media (max-width: 600px) {
+    .workbench {
+        padding: 12px;
+    }
 
-.network-panel {
-    margin-bottom: 1.5rem;
-}
+    .bookmarks-grid {
+        columns: 1;
+    }
 
-.network-header {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    margin-bottom: 0.7rem;
-}
-
-.network-updated {
-    font-size: 0.72rem;
-    opacity: 0.55;
-    font-variant-numeric: tabular-nums;
-}
-
-.network-updated.stale {
-    color: #dd6b20;
-    opacity: 0.95;
-}
-
-.device-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
-    gap: 0.8rem;
-}
-
-.device-card {
-    background: var(--card-bg);
-    border: 1px solid var(--card-border);
-    border-radius: 16px;
-    box-shadow: var(--card-shadow);
-    padding: 0.8rem 0.9rem;
-}
-
-.device-card.offline {
-    opacity: 0.5;
-}
-
-.device-head {
-    display: flex;
-    align-items: center;
-    gap: 0.45rem;
-    margin-bottom: 0.6rem;
-}
-
-.device-dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: #48bb78;
-    box-shadow: 0 0 8px rgba(72, 187, 120, 0.7);
-    flex: none;
-}
-
-.device-dot.offline {
-    background: #a0aec0;
-    box-shadow: none;
-}
-
-.device-name {
-    font-weight: 600;
-    font-size: 0.92rem;
-    letter-spacing: -0.01em;
-}
-
-.device-kind {
-    margin-left: auto;
-    font-size: 0.62rem;
-    opacity: 0.5;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-}
-
-.metric-row {
-    display: grid;
-    grid-template-columns: 2rem 3.1rem 1fr;
-    align-items: center;
-    gap: 0.3rem;
-    margin-bottom: 0.3rem;
-}
-
-.metric-row .metric-label {
-    font-size: 0.66rem;
-    opacity: 0.55;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-}
-
-.metric-value {
-    font-size: 0.72rem;
-    font-variant-numeric: tabular-nums;
-}
-
-.metric-bar {
-    height: 4px;
-    border-radius: 999px;
-    background: var(--icon-bg);
-    overflow: hidden;
-}
-
-.metric-fill {
-    height: 100%;
-    border-radius: 999px;
-    background: var(--accent-color);
-    transition: width 0.5s ease;
-}
-
-.metric-extra {
-    grid-column: 1 / -1;
-    font-size: 0.62rem;
-    opacity: 0.45;
-    margin: -0.1rem 0 0.15rem;
-    font-variant-numeric: tabular-nums;
-}
-
-.device-foot {
-    font-size: 0.66rem;
-    opacity: 0.5;
-    margin-top: 0.3rem;
-    font-variant-numeric: tabular-nums;
-}
-
-.device-error {
-    font-size: 0.64rem;
-    color: #e53e3e;
-    margin-bottom: 0.35rem;
-    word-break: break-word;
-}
-
-.device-empty {
-    font-size: 0.8rem;
-    opacity: 0.55;
-    grid-column: 1 / -1;
+    /* Four tiles per row at any phone width: a quarter-width minimum minus the
+       three 8px gaps fits exactly four tracks; auto-fit drops empty ones when
+       fewer tools are pinned. */
+    .launchpad-grid {
+        grid-template-columns: repeat(auto-fit, minmax(calc(25% - 6px), 1fr));
+    }
 }
 
 @media (prefers-reduced-motion: reduce) {

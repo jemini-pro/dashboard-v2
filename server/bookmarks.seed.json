@@ -7,19 +7,22 @@
           "title": "Gmail",
           "desc": "Email",
           "icon": "\ud83d\udce7",
-          "url": "https://mail.google.com"
+          "url": "https://mail.google.com",
+          "pinned": true
         },
         {
           "title": "Google Calendar",
           "desc": "Meetings & scheduling",
           "icon": "\ud83d\udcc5",
-          "url": "https://calendar.google.com"
+          "url": "https://calendar.google.com",
+          "pinned": true
         },
         {
           "title": "Google Sheets",
           "desc": "Spreadsheets & data",
           "icon": "\ud83d\udcca",
-          "url": "https://docs.google.com/spreadsheets"
+          "url": "https://docs.google.com/spreadsheets",
+          "pinned": true
         },
         {
           "title": "Google Docs",
@@ -72,7 +75,8 @@
           "title": "GitHub",
           "desc": "Code repository",
           "icon": "\ud83d\udc19",
-          "url": "https://github.com/jemini-pro"
+          "url": "https://github.com/jemini-pro",
+          "pinned": true
         },
         {
           "title": "Jules",
@@ -95,13 +99,15 @@
           "title": "AWS",
           "desc": "Cloud platform & login",
           "icon": "\u2601\ufe0f",
-          "url": "https://d-9c67692c29.awsapps.com/start/"
+          "url": "https://d-9c67692c29.awsapps.com/start/",
+          "pinned": true
         },
         {
           "title": "Slack",
           "desc": "Team communication",
           "icon": "\ud83d\udcac",
-          "url": "https://slack.com"
+          "url": "https://slack.com",
+          "pinned": true
         },
         {
           "title": "NIRA",
@@ -158,13 +164,15 @@
           "title": "Proxmox",
           "desc": "Host UI",
           "icon": "\ud83d\udda5\ufe0f",
-          "url": "https://pve.tail73491d.ts.net/"
+          "url": "https://pve.tail73491d.ts.net/",
+          "pinned": true
         },
         {
           "title": "T3 Code",
           "desc": "Agent console",
           "icon": "\ud83e\udd16",
-          "url": "https://pve.tail73491d.ts.net:8443/"
+          "url": "https://pve.tail73491d.ts.net:8443/",
+          "pinned": true
         },
         {
           "title": "Tailscale",
