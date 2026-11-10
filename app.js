@@ -95,6 +95,7 @@ const searchInput = document.getElementById('search');
 const healthDotEl = document.getElementById('health-dot');
 const healthTextEl = document.getElementById('health-text');
 const bookmarksGridEl = document.getElementById('bookmarks-grid');
+const resultCountEl = document.getElementById('result-count');
 const mostUsedEl = document.getElementById('most-used');
 const launchpadGridEl = document.getElementById('launchpad-grid');
 const deviceGridEl = document.getElementById('device-grid');
@@ -208,10 +209,81 @@ function categorySection(title, items) {
     `;
 }
 
-// All tools render hook. #42 replaces this with numbered, searchable rows; the
-// shell keeps the shared card renderer so the embedded copy still paints.
+// ---------- All tools ----------
+// Every category and item from the store, in store order. The toolbar search
+// filters title, description and category name; categories only ever disappear
+// when they have no matches, so the surviving order is the store order.
+
+function filterToolCategories(categories, query) {
+    const needle = String(query || '').trim().toLowerCase();
+    if (!needle) return categories || [];
+    return (categories || []).map(cat => ({
+        category: cat.category,
+        items: (cat.items || []).filter(item => {
+            const haystack = item.title + ' ' + (item.desc || '') + ' ' + cat.category;
+            return haystack.toLowerCase().includes(needle);
+        })
+    })).filter(cat => cat.items.length);
+}
+
+function countToolItems(categories) {
+    return (categories || []).reduce((n, cat) => n + (cat.items || []).length, 0);
+}
+
+// Numbers are scoped to each category and to the rows shown, so a filtered
+// category reads 01, 02… without inheriting gaps from hidden items.
+function toolRow(item, index) {
+    return `
+        <li>
+            <a class="tool-link" href="${escapeHtml(item.url)}" target="_blank" rel="noreferrer">
+                <span class="tool-num">${String(index + 1).padStart(2, '0')}</span>
+                <span class="tool-link-main">
+                    <span class="tool-link-title">${escapeHtml(item.title)}</span>
+                    <span class="tool-link-desc">${escapeHtml(item.desc || '')}</span>
+                </span>
+                <span class="tool-link-arrow" aria-hidden="true">↗</span>
+            </a>
+        </li>
+    `;
+}
+
+function toolCategorySection(cat) {
+    return `
+        <section class="tool-category">
+            <h3 class="tool-category-title">${escapeHtml(cat.category)}</h3>
+            <ul class="tool-list">
+                ${cat.items.map((item, i) => toolRow(item, i)).join('')}
+            </ul>
+        </section>
+    `;
+}
+
+function allToolsEmptyText(query) {
+    const needle = String(query || '').trim();
+    return needle ? 'No tools match “' + needle + '”.' : 'No bookmarks loaded.';
+}
+
+// While filtering, report how many of the store's tools survived. With no
+// query, the same slot shows the full count and group count.
+function resultCountText(shown, total, groups, query) {
+    return String(query || '').trim()
+        ? shown + ' of ' + total + ' tools'
+        : total + ' tools · ' + groups + ' groups';
+}
+
 function renderAllTools(categories) {
-    renderBookmarks(categories);
+    const all = categories || [];
+    const filtered = filterToolCategories(all, searchQuery);
+    const shown = countToolItems(filtered);
+    const total = countToolItems(all);
+
+    if (resultCountEl) {
+        resultCountEl.textContent = resultCountText(shown, total, all.length, searchQuery);
+    }
+
+    bookmarksGridEl.innerHTML = filtered.length
+        ? filtered.map(cat => toolCategorySection(cat)).join('')
+        : '<div class="tool-empty">' + escapeHtml(allToolsEmptyText(searchQuery)) + '</div>';
 }
 
 // Launchpad render hook. #43 fills this with the pinned tool tiles.
@@ -272,8 +344,22 @@ function recordBookmarkHit(event) {
     navigator.sendBeacon('/api/hit', JSON.stringify({ url }));
 }
 
+// All tools rows use the same beacon path as every other bookmark link. This
+// is delegated from the list container so re-rendering after a search does not
+// need to re-attach per-row listeners.
+function recordToolHit(event) {
+    if (event.type === 'auxclick' && event.button !== 1) return;
+    const link = event.target.closest('.tool-link');
+    if (!link) return;
+    const url = link.getAttribute('href');
+    if (!url) return;
+    navigator.sendBeacon('/api/hit', JSON.stringify({ url }));
+}
+
 bookmarksGridEl.addEventListener('click', recordBookmarkHit);
 bookmarksGridEl.addEventListener('auxclick', recordBookmarkHit);
+bookmarksGridEl.addEventListener('click', recordToolHit);
+bookmarksGridEl.addEventListener('auxclick', recordToolHit);
 mostUsedEl.addEventListener('click', recordBookmarkHit);
 mostUsedEl.addEventListener('auxclick', recordBookmarkHit);
 

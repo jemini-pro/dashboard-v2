@@ -525,3 +525,115 @@ class HealthIndicatorTest(FrontEndSourceTest):
 
         self.assertIn("renderHealth(", body)
         self.assertNotIn("display = 'none'", body)
+
+
+class AllToolsTest(FrontEndSourceTest):
+    """Ticket #42: numbered, searchable category lists.
+
+    No JS runtime is available here, so the behaviour is pinned at the function
+    boundaries the browser calls: filtering, row markup, counter/empty text and
+    the delegated beacon. Manual check: serve the dashboard, search for part of
+    a description and confirm only matching rows survive with "x of N tools".
+    """
+
+    def test_rows_show_a_two_digit_index_title_description_and_hover_arrow(self):
+        row = function_body(self.js, "toolRow")
+
+        self.assertIn("padStart(2, '0')", row)
+        self.assertIn('class="tool-num"', row)
+        self.assertIn('class="tool-link-title"', row)
+        self.assertIn('class="tool-link-desc"', row)
+        self.assertIn('class="tool-link-arrow"', row)
+        self.assertIn("↗", row)
+        self.assertIn("escapeHtml(item.url)", row)
+        self.assertIn("escapeHtml(item.title)", row)
+        self.assertIn("escapeHtml(item.desc || '')", row)
+        self.assertIn('target="_blank"', row)
+        self.assertIn('rel="noreferrer"', row)
+
+    def test_filter_matches_title_description_and_category_case_insensitively(self):
+        body = function_body(self.js, "filterToolCategories")
+
+        self.assertIn(".toLowerCase()", body)
+        self.assertIn("item.title", body)
+        self.assertIn("item.desc", body)
+        self.assertIn("cat.category", body)
+        self.assertIn(".includes(needle)", body)
+        self.assertIn(".trim()", body)
+
+    def test_filter_keeps_store_order_and_drops_categories_without_matches(self):
+        body = function_body(self.js, "filterToolCategories")
+
+        self.assertIn(".map(", body)
+        self.assertIn(".filter(cat => cat.items.length)", body)
+        self.assertNotIn(".sort(", body)
+
+        render = function_body(self.js, "renderAllTools")
+        self.assertIn("filterToolCategories(", render)
+        self.assertIn(".map(cat => toolCategorySection(cat))", render)
+        self.assertNotIn(".sort(", render)
+
+    def test_category_titles_and_numbering_stay_within_each_category(self):
+        section = function_body(self.js, "toolCategorySection")
+
+        self.assertIn('class="tool-category"', section)
+        self.assertIn('class="tool-category-title"', section)
+        self.assertIn("escapeHtml(cat.category)", section)
+        self.assertIn("cat.items.map((item, i) => toolRow(item, i))", section)
+        self.assertNotIn(".sort(", section)
+
+    def test_filtering_shows_x_of_n_tools_and_names_the_query_when_empty(self):
+        render = function_body(self.js, "renderAllTools")
+        count = function_body(self.js, "resultCountText")
+        empty = function_body(self.js, "allToolsEmptyText")
+
+        self.assertIn("resultCountText(", render)
+        self.assertIn("allToolsEmptyText(", render)
+        self.assertIn("resultCountEl.textContent", render)
+        self.assertIn("filtered.length", render)
+
+        self.assertIn("shown + ' of ' + total + ' tools'", count)
+        self.assertIn("'No tools match “'", empty)
+        self.assertIn("'”.'", empty)
+
+    def test_result_count_lives_in_the_all_tools_card_head(self):
+        card = self.html[self.html.index('class="card all-tools-card"'):]
+        self.assertIn('id="result-count"', card[:card.index("</section>")])
+        self.assertIn('id="bookmarks-grid"', card[:card.index("</section>")])
+
+    def test_three_balanced_columns_then_two_then_one(self):
+        self.assertRegex(self.css, r"\.bookmarks-grid\s*\{[^}]*columns:\s*3\b")
+        self.assertRegex(
+            self.css,
+            re.compile(
+                r"@media\s*\(max-width:\s*900px\)\s*\{.*?"
+                r"\.bookmarks-grid\s*\{[^}]*columns:\s*2\b",
+                re.S,
+            ),
+        )
+        self.assertRegex(
+            self.css,
+            re.compile(
+                r"@media\s*\(max-width:\s*600px\)\s*\{.*?"
+                r"\.bookmarks-grid\s*\{[^}]*columns:\s*1\b",
+                re.S,
+            ),
+        )
+        self.assertRegex(self.css, r"\.tool-category\s*\{[^}]*break-inside:\s*avoid")
+
+    def test_all_tools_clicks_use_the_delegated_beacon_for_click_and_auxclick(self):
+        handler = function_body(self.js, "recordToolHit")
+
+        self.assertIn("event.target.closest('.tool-link')", handler)
+        self.assertIn("event.button !== 1", handler)
+        self.assertIn("getAttribute('href')", handler)
+        self.assertIn(
+            "navigator.sendBeacon('/api/hit', JSON.stringify({ url }))", handler
+        )
+        self.assertIn(
+            "bookmarksGridEl.addEventListener('click', recordToolHit)", self.js
+        )
+        self.assertIn(
+            "bookmarksGridEl.addEventListener('auxclick', recordToolHit)", self.js
+        )
+        self.assertNotIn("fetch('/api/hit'", handler)
