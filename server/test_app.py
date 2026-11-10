@@ -191,6 +191,98 @@ class HitEndpointTest(ApiTestCase):
         self.assertEqual(self.score(url), 20.0)
 
 
+def function_body(source, name):
+    """Return the text of a top-level `function <name>(...) { ... }` block.
+
+    This is the seam the browser-only JS offers from a stdlib test: we cannot
+    execute app.js here, so assert against the function that owns the behaviour.
+    """
+    start = source.index("function " + name + "(")
+    depth = 0
+    for offset, char in enumerate(source[start:], start):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start:offset + 1]
+    raise AssertionError("unbalanced function body for " + name)
+
+
+class MostUsedStripTest(unittest.TestCase):
+    """The Most used strip is browser JS; there is no JS runtime in this repo.
+
+    So these are source-level assertions over the small pure helpers plus the
+    markup they render. Manual check in a browser: serve the dashboard, click
+    one link three times, reload, and confirm the strip appears above Network.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def setUp(self):
+        self.js = (self.ROOT / "app.js").read_text()
+        self.html = (self.ROOT / "index.html").read_text()
+        self.css = (self.ROOT / "style.css").read_text()
+
+    def test_strip_sits_directly_above_the_network_panel_and_starts_hidden(self):
+        strip = self.html.index('id="most-used"')
+        panel = self.html.index('class="network-panel"')
+        self.assertLess(strip, panel)
+
+        tag_start = self.html.rindex("<", 0, strip)
+        tag_end = self.html.index(">", strip)
+        self.assertIn(" hidden", self.html[tag_start:tag_end])
+
+    def test_selection_keeps_scores_above_half_sorted_desc_capped_at_six(self):
+        self.assertRegex(self.js, r"MOST_USED_MIN_SCORE\s*=\s*0\.5\b")
+        self.assertRegex(self.js, r"MOST_USED_LIMIT\s*=\s*6\b")
+
+        body = function_body(self.js, "selectMostUsed")
+        self.assertRegex(body, r"score\s*>\s*(MIN_SCORE|minScore|MOST_USED_MIN_SCORE)")
+        self.assertRegex(body, r"sort\(\s*\(a,\s*b\)\s*=>\s*b\.score\s*-\s*a\.score\s*\)")
+        self.assertRegex(body, r"slice\(\s*0,\s*limit\s*\)")
+
+    def test_strip_is_populated_only_after_the_scored_api_payload_arrives(self):
+        load = function_body(self.js, "loadBookmarks")
+        render = function_body(self.js, "renderMostUsed")
+
+        self.assertIn("renderMostUsed(data.work)", load)
+        self.assertIn("hidden = true", render)
+        self.assertIn("hidden = false", render)
+
+        # The scoreless embedded copy is painted by renderBookmarks, and that
+        # path must never populate the strip.
+        self.assertNotIn("renderMostUsed", function_body(self.js, "renderBookmarks"))
+        self.assertNotIn("renderMostUsed", function_body(self.js, "updateDashboard"))
+
+    def test_embedded_first_paint_bookmarks_carry_no_scores(self):
+        embedded = self.js[self.js.index("const bookmarks = {"):self.js.index("const clockEl")]
+
+        self.assertNotIn("score", embedded)
+
+    def test_category_contents_and_order_are_never_sorted(self):
+        body = function_body(self.js, "renderBookmarks")
+
+        self.assertNotIn(".sort(", body)
+        self.assertRegex(body, r"categories\.map\(cat\s*=>")
+        self.assertRegex(body, r"cat\.items\.map\(")
+
+    def test_strip_tiles_reuse_bookmark_card_markup_and_open_like_tiles(self):
+        render = function_body(self.js, "renderMostUsed")
+        card = function_body(self.js, "bookmarkCard")
+
+        self.assertIn("bookmarkCard(", render)
+        self.assertIn('class="bookmark-card"', card)
+        self.assertIn('target="_blank"', card)
+
+    def test_strip_is_hidden_by_style_and_survives_the_mobile_breakpoint(self):
+        self.assertIn(".most-used[hidden]", self.css)
+        self.assertNotRegex(
+            self.css,
+            r"\.most-used\s*\{[^}]*display\s*:\s*(block|flex|grid)",
+        )
+
+
 class FrontEndWiringTest(unittest.TestCase):
     """No JS runtime here, so guard the exact wiring the browser needs."""
 
