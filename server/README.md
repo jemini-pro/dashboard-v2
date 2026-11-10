@@ -33,7 +33,9 @@ a main column (Jump back in, Launchpad, All tools) and a Network rail. There is 
 |---|---|---|
 | `/api/health` | GET | `{ok}` |
 | `/api/bookmarks` | GET | the bookmark store, with a decayed `score` per item |
-| `/api/stats` | GET | devices array, cached 5 s |
+| `/api/stats` | GET | devices array, cached 5 s; each device carries 24 h availability |
+| `/api/metrics/summary` | GET | per-device availability, averages, events, disk trend and a CPU sparkline |
+| `/api/metrics` | GET | one device's bucketed history: `?device=<id>&window=1h\|6h\|24h\|7d\|30d&step=<s>` |
 | `/api/hit` | POST | record a bookmark click (`{"url": "..."}` → `204`, no body) |
 | `/api/push/<name>` | POST | agent heartbeat, needs `X-Dash-Token` |
 
@@ -44,6 +46,57 @@ no longer in the store; missing, non-string and empty/whitespace values get a 4x
 
 The front end is served with `Cache-Control: no-cache` and a weak ETag; static assets
 revalidate with 304s, `/api/stats` is `no-store`, and the versioned font is immutable.
+
+## Metrics history
+
+The dashboard stores a little history so the Network rail and the Metrics page
+can answer "is this normal, and since when?" rather than only "what is it now?".
+
+- **Server-side sampler.** `app.py` starts a daemon thread that calls
+  `sample_all()` immediately and then every `DASH_SAMPLE_SECONDS` (default
+  **60 s**). It samples the local container and every agent in `agents.json`,
+  whether or not a browser is open. Browser polling has no bearing on the
+  store, so a closed dashboard leaves no gap.
+- **SQLite, not another rewritten JSON file.** History lives in
+  `data/metrics.db` (stdlib `sqlite3`, WAL). `bookmarks.json` and `hits.json`
+  are rewritten whole on each write, which is fine for rare clicks but not for
+  a sample every minute. One row per device per bucket; a repeat inside the
+  same bucket updates the row instead of adding one.
+- **What is stored.** `ts, cpu_pct, mem_pct, mem_used, mem_total, disk_pct,
+  uptime_s, online`. Device metadata (`id`, display name, kind, first/last
+  seen) is kept in a second table so renaming an agent does not split its
+  timeline. Values that are not finite numbers are stored as `NULL`.
+- **Retention.** Raw samples are kept for `DASH_HISTORY_DAYS` (default **30**)
+  and pruned at most once an hour. At seven devices that is roughly 10k rows a
+  day, or 20–30 MB for the full window.
+- **Derived, not stored.** Availability, downtime, offline events, restarts
+  (an `uptime_s` drop), CPU/RAM averages and peaks, disk growth (least-squares
+  slope) and days-to-90% are computed when a request asks for them. Offline
+  runs are detected from transitions, so no separate event table is needed.
+- **Agent gaps are explicit.** An agent that stops pushing still has a row in
+  `agents.json`; the sampler records it with `online = 0`. Charts break the line
+  for those points instead of drawing a flat line. A gap in the *server* itself
+  is simply absent data and does not count as device downtime.
+
+The Metrics page (`/metrics.html`) uses the same data:
+
+- range tabs for **1h / 6h / 24h / 7d / 30d**;
+- a three-line chart (CPU, RAM, disk, fixed 0–100% axis) with a legend, a
+  crosshair tooltip, surface-ringed end dots and a table view for exact values;
+- a fleet summary (online count, average availability, peak CPU, disk
+  pressure), a device list with 5-minute CPU sparklines, and an events rail
+  (offline / back online / restarted, newest first).
+
+The dashboard's Network rail links to it and shows a compact `24h <n>%` chip
+on each device row once the first samples exist. The page and its CSS/JS are served from
+`static/` like the other front-end files; `server/deploy.sh` installs all three.
+
+Tuning (optional; add to `dash/.env` and recreate the container):
+
+```bash
+DASH_SAMPLE_SECONDS=60   # sampler cadence, minimum 5
+DASH_HISTORY_DAYS=30     # raw-sample retention
+```
 
 ## Workbench UI
 
@@ -56,7 +109,7 @@ overflow. At the target desktop sizes every core section fits in one screen.
 | Jump back in | most-used rows from the scored API payload, with a normalised bar |
 | Launchpad | pinned tool tiles (monogram + two-line label) |
 | All tools | every category in store order, numbered rows, live search count |
-| Network | `n/m online · x% avg CPU`, kind-average chips, compact device rows |
+| Network | `n/m online · x% avg CPU`, kind-average chips, compact device rows with 24 h availability, and a **Metrics →** link |
 
 - Search filters title, description and category case-insensitively, shows `x of N tools`
   and names the query when nothing matches. `/` focuses the field; `Esc` clears and blurs.
@@ -164,7 +217,7 @@ so copy the static front end there first:
 cd server
 cp .env.example .env            # fill DASH_TOKEN and DASH_AUTH_HASH, or skip Docker and run app.py directly
 mkdir -p static
-cp ../index.html ../app.js ../style.css static/
+cp ../index.html ../app.js ../style.css ../metrics.html ../metrics.js ../metrics.css static/
 cp -r ../fonts static/
 DASH_DIR=. DASH_ENV_FILE=./.env CADDYFILE=./Caddyfile docker compose up -d
 ```
@@ -186,7 +239,7 @@ python3 -m unittest discover -s server -p 'test_*.py' -v
 server/check_api.sh
 ```
 
-For the layout, copy the three front-end files into `server/static/` and open the app:
+For the layout, copy the six front-end files into `server/static/` and open the app:
 
 ```bash
 mkdir -p server/static
@@ -244,9 +297,11 @@ server/check_api.sh
 It asserts: `POST /api/hit` → `204` with no body; the score appears in
 `/api/bookmarks` and rises; older hits decay (`7d > 28d > 60d`, 14-day hit ≈ `0.37`);
 hits older than 90 days are trimmed on write; an unknown URL is accepted; a title rename
-keeps the score; `/api/bookmarks` stays under ~10 KB for the current 31 links; hits
-survive a full process restart; and the click feature sets no cookie and makes no
-third-party request. It also guards the compose/README path documentation below and the
+keeps the score; `/api/bookmarks` stays under ~10 KB for the current 31 links; the
+sampler writes history with no browser open; `/api/metrics` returns bucketed points,
+a step and a derived summary; unknown windows/devices are rejected; hits **and**
+metrics history survive a full process restart; and the click feature sets no cookie
+and makes no third-party request. It also guards the compose/README path documentation below and the
 Workbench UI, breakpoint and check documentation above.
 
 ## Click-history durability
@@ -275,21 +330,28 @@ therefore:
 ```
 host:      /opt/stack/dash/data/hits.json
 container: /app/data/hits.json
+
+host:      /opt/stack/dash/data/metrics.db
+container: /app/data/metrics.db
 ```
 
 Because `data/` is on the host bind mount, `docker compose up -d dash` (recreate),
 `docker compose restart dash`, and even `docker compose down` all preserve it — only
-deleting `/opt/stack/dash/data/hits.json` (or the directory) loses history. The same
-mount already persists `bookmarks.json` and `agents.json`.
+deleting `/opt/stack/dash/data/hits.json` or `/opt/stack/dash/data/metrics.db` (or the
+directory) loses history. SQLite keeps its `-wal` and `-shm` files beside `metrics.db`;
+they must stay on the same writable mount. The same mount persists `bookmarks.json`,
+`agents.json` and `metrics.db`.
 
 Docker is not available in this implementation environment, so durability was verified
-with the equivalent process-restart phase in `server/check_api.sh`: it writes hits to a
-temp `DASH_DATA_DIR`, kills and restarts `python3 app.py` against that same directory,
-and asserts the score and hit count are unchanged. Current evidence:
+with the equivalent process-restart phase in `server/check_api.sh`: it writes hits and
+metric samples to a temp `DASH_DATA_DIR`, kills and restarts `python3 app.py` against
+that same directory, and asserts the score, hit count and earliest sample are unchanged.
+Current evidence:
 
 ```
 ok 03 - POST /api/hit returns 204 with no body and writes hits.json
-ok 10 - hits survived a full server restart (score 3.0 -> 3.0)
+ok 13 - hits survived a full server restart (score 3.0 -> 3.0)
+ok 14 - metrics history survived a full server restart (first sample 1794320920)
 ```
 
 ## Gotchas worth knowing before changing anything
@@ -312,3 +374,9 @@ ok 10 - hits survived a full server restart (score 3.0 -> 3.0)
 - **`server/deploy.sh` never overwrites `dash/data/`.** It seeds `bookmarks.json` only
   when absent and chowns the data directory to uid 1000.
 - **Agents go offline after 150 s** without a push, so they run every 60 s.
+- **Metrics history is sampled by the server, not by the browser.** If you add a new
+  data source, feed it through `sample_all()`/`record_samples()`; do not record from
+  `/api/stats`, or history only exists while a tab is open.
+- **`metrics.db` is a single writer.** `record_samples` holds `_db_lock`; reads use
+  their own connections under WAL. Keep new writes on the same path rather than opening
+  a connection per request and writing concurrently.

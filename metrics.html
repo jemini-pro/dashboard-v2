@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Metrics · Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="metrics.css">
+</head>
+
+<body>
+    <div class="bg-blobs" aria-hidden="true">
+        <div class="blob blob-1"></div>
+        <div class="blob blob-2"></div>
+        <div class="blob blob-3"></div>
+    </div>
+
+    <div class="workbench metrics-workbench">
+        <header class="toolbar card metrics-toolbar">
+            <div class="toolbar-id metrics-id">
+                <a class="metrics-back" href="/">← Dashboard</a>
+                <h1 class="metrics-title">Metrics</h1>
+                <time id="clock" class="clock" datetime="">00:00</time>
+            </div>
+
+            <div id="range-tabs" class="range-tabs" role="tablist" aria-label="Time range">
+                <button type="button" role="tab" data-range="1h" aria-selected="false">1h</button>
+                <button type="button" role="tab" data-range="6h" aria-selected="false">6h</button>
+                <button type="button" role="tab" data-range="24h" aria-selected="true">24h</button>
+                <button type="button" role="tab" data-range="7d" aria-selected="false">7d</button>
+                <button type="button" role="tab" data-range="30d" aria-selected="false">30d</button>
+            </div>
+
+            <div id="health" class="health" role="status" aria-live="polite">
+                <span id="health-dot" class="health-dot unknown" aria-hidden="true"></span>
+                <span id="health-text">Checking…</span>
+            </div>
+        </header>
+
+        <div class="metrics-body">
+            <main class="metrics-main">
+                <section id="stat-grid" class="stat-grid" aria-label="Fleet summary"></section>
+
+                <section class="card chart-card" aria-labelledby="chart-title">
+                    <div class="card-head chart-head">
+                        <div class="card-title">
+                            <h2 id="chart-title" class="card-heading">History</h2>
+                            <span id="chart-sub" class="card-sub">Loading…</span>
+                        </div>
+                        <span id="metrics-stale" class="network-stale" hidden>stale</span>
+                    </div>
+
+                    <ul id="chart-legend" class="chart-legend" aria-label="Series"></ul>
+
+                    <div class="chart-stage">
+                        <div id="chart-yaxis" class="chart-yaxis" aria-hidden="true"></div>
+                        <div id="chart" class="chart" role="group"
+                            aria-label="Metric history; use the table view for exact values."></div>
+                    </div>
+                    <div id="chart-xaxis" class="chart-xaxis" aria-hidden="true"></div>
+
+                    <div id="chart-empty" class="chart-empty">
+                        History starts collecting on the server. The first sample appears within a minute.
+                    </div>
+
+                    <details id="table-view" class="table-view">
+                        <summary>Table view</summary>
+                        <div class="table-scroll">
+                            <table id="chart-table">
+                                <thead>
+                                    <tr>
+                                        <th scope="col">Time</th>
+                                        <th scope="col">CPU</th>
+                                        <th scope="col">RAM</th>
+                                        <th scope="col">Disk</th>
+                                        <th scope="col">Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+                    </details>
+                </section>
+            </main>
+
+            <aside class="rail metrics-rail">
+                <section class="card device-list-card" aria-labelledby="devices-title">
+                    <div class="card-head">
+                        <div class="card-title">
+                            <h2 id="devices-title" class="card-heading">Devices</h2>
+                            <span id="devices-sub" class="card-sub"></span>
+                        </div>
+                    </div>
+                    <div id="device-list" class="device-list">
+                        <div class="card-empty">No devices reporting</div>
+                    </div>
+                </section>
+
+                <section class="card event-card" aria-labelledby="events-title">
+                    <div class="card-head">
+                        <div class="card-title">
+                            <h2 id="events-title" class="card-heading">Events</h2>
+                            <span id="events-sub" class="card-sub"></span>
+                        </div>
+                    </div>
+                    <ol id="events" class="event-list">
+                        <li class="event-empty">No events in this window.</li>
+                    </ol>
+                </section>
+            </aside>
+        </div>
+    </div>
+
+    <div class="debug-wrapper">
+        <button id="debug-menu-btn" class="debug-menu-btn" aria-label="Debug Menu">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="5" r="1"></circle>
+                <circle cx="12" cy="12" r="1"></circle>
+                <circle cx="12" cy="19" r="1"></circle>
+            </svg>
+        </button>
+        <div id="debug-controls" class="debug-controls">
+            <label for="debug-time">Debug Time:</label>
+            <input type="time" id="debug-time">
+            <button id="reset-time">Reset</button>
+        </div>
+    </div>
+    <script src="metrics.js"></script>
+</body>
+
+</html>
