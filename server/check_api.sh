@@ -13,7 +13,6 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_DIR="$REPO/server"
 APP="$SERVER_DIR/app.py"
-APP_JS="$REPO/app.js"
 COMPOSE="$SERVER_DIR/docker-compose.yml"
 README="$SERVER_DIR/README.md"
 TMP="$(mktemp -d)"
@@ -25,7 +24,7 @@ BASE=""
 PID=""
 COUNT=0
 
-# Real embedded bookmarks (app.js) used as representative fixture URLs.
+# Representative URLs from the tracked bookmark seed.
 W_MAIL="https://mail.google.com"
 W_CAL="https://calendar.google.com"
 W_SHEETS="https://docs.google.com/spreadsheets"
@@ -161,26 +160,16 @@ PY
 }
 
 write_bookmarks() {
-    # Derive the fixture from the real embedded bookmark copy in app.js (24 work
-    # + 7 personal) so payload-size and ordering checks cover realistic titles,
-    # descriptions, icons and URLs rather than short "fixture" strings.
-    python3 - "$BOOKMARKS" "$APP_JS" <<'PY'
-import json, re, sys
-out, app_js = sys.argv[1], sys.argv[2]
-with open(app_js, encoding="utf-8") as f:
-    source = f.read()
-start = source.index("const bookmarks = ") + len("const bookmarks = ")
-end = source.index("\n};", start) + 2
-literal = source[start:end]
-# app.js embeds a JS object literal: bare keys and single-quoted strings.
-literal = re.sub(r"([{,]\s*)(\w+)(\s*:)", r'\1"\2"\3', literal)
-literal = literal.replace("'", '"')
-store = json.loads(literal)
+    # The seed is the same 31-link fixture the app used to embed; keeping it in
+    # a tracked JSON file lets the front end stop carrying a duplicate copy.
+    cp "$SERVER_DIR/bookmarks.seed.json" "$BOOKMARKS"
+    python3 - "$BOOKMARKS" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    store = json.load(f)
 items = [item for cats in store.values() for cat in cats for item in cat["items"]]
 if len(items) < 31:
-    raise SystemExit(f"expected at least 31 embedded bookmarks in app.js, parsed {len(items)}")
-with open(out, "w", encoding="utf-8") as f:
-    json.dump(store, f)
+    raise SystemExit(f"expected at least 31 seed bookmarks, parsed {len(items)}")
 PY
 }
 
@@ -325,10 +314,13 @@ assert_close "$score_restart" "$score_before" 0.001 \
 ok "hits survived a full server restart (score $score_before -> $score_restart)"
 
 # 9. Static guarantees: no cookie is set and the feature makes no third-party
-# request. Deliberately scoped to the click-history/strip code so pre-existing
-# Google Fonts / calendar references do not produce false positives.
+# request. Deliberately scoped to the click-history/strip code so unrelated
+# front-end code does not produce false positives.
 grep -q "Set-Cookie" "$APP" && fail "server sets a cookie"
 grep -q "document.cookie" "$REPO/app.js" && fail "front end touches document.cookie"
+grep -qE 'calendar\.google\.com|fonts\.googleapis\.com|fonts\.gstatic\.com' \
+    "$REPO/index.html" "$REPO/app.js" "$REPO/style.css" \
+    && fail "front end still references the calendar iframe or Google Fonts"
 grep -Fq "navigator.sendBeacon('/api/hit'" "$REPO/app.js" \
     || fail "click handler does not beacon to the same-origin /api/hit"
 grep -Fq "mostUsedEl.addEventListener('click', recordBookmarkHit)" "$REPO/app.js" \

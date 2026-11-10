@@ -1,13 +1,21 @@
+@font-face {
+    font-family: 'Space Grotesk';
+    font-style: normal;
+    font-weight: 300 700;
+    font-display: swap;
+    src: url('fonts/space-grotesk-subset.e3c1f083.woff2') format('woff2');
+}
+
 :root {
     /* Work Theme (Default) */
     --bg-color: #f3f5fa;
     --bg-image: radial-gradient(rgba(49, 130, 206, 0.12) 1.5px, transparent 1.5px);
     --bg-size: 28px 28px;
     --text-color: #2d3748;
-    --card-bg: rgba(255, 255, 255, 0.55);
-    --card-border: rgba(255, 255, 255, 0.45);
+    --card-bg: rgba(255, 255, 255, 0.76);
+    --card-border: rgba(255, 255, 255, 0.55);
     --card-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.05), 0 1px 3px 0 rgba(0, 0, 0, 0.02);
-    --card-hover: rgba(255, 255, 255, 0.85);
+    --card-hover: rgba(255, 255, 255, 0.92);
     --sidebar-bg: rgba(255, 255, 255, 0.35);
     --sidebar-border: rgba(49, 130, 206, 0.06);
     --icon-bg: rgba(49, 130, 206, 0.06);
@@ -26,10 +34,10 @@
     --bg-image: radial-gradient(rgba(237, 137, 54, 0.15) 1.5px, transparent 1.5px);
     --bg-size: 28px 28px;
     --text-color: #e2e8f0;
-    --card-bg: rgba(17, 24, 39, 0.5);
-    --card-border: rgba(255, 255, 255, 0.06);
+    --card-bg: rgba(17, 24, 39, 0.8);
+    --card-border: rgba(255, 255, 255, 0.08);
     --card-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
-    --card-hover: rgba(31, 41, 55, 0.7);
+    --card-hover: rgba(31, 41, 55, 0.92);
     --sidebar-bg: rgba(17, 24, 39, 0.3);
     --sidebar-border: rgba(255, 255, 255, 0.03);
     --icon-bg: rgba(237, 137, 54, 0.12);
@@ -45,7 +53,18 @@
     box-sizing: border-box;
     margin: 0;
     padding: 0;
-    transition: background-color 0.5s ease, border-color 0.5s ease, color 0.5s ease, transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+/* Only interactive elements animate; a universal transition repaints every
+   element when the 09:00/17:00 theme flips. */
+a,
+button,
+.bookmark-card,
+.debug-menu-btn,
+.debug-controls,
+.metric-fill {
+    transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease,
+        transform 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease;
 }
 
 body {
@@ -61,6 +80,8 @@ body {
 }
 
 /* Background Blobs Setup */
+/* Static gradients replace three animated, full-viewport blur(140px) blobs:
+   the animated subtree made the filter re-run every frame. */
 .bg-blobs {
     position: absolute;
     top: 0;
@@ -70,96 +91,21 @@ body {
     overflow: hidden;
     z-index: -1;
     pointer-events: none;
-    filter: blur(140px);
+    background:
+        radial-gradient(circle at 18% 28%, var(--blob-1-color) 0%, transparent 55%),
+        radial-gradient(circle at 82% 22%, var(--blob-2-color) 0%, transparent 50%),
+        radial-gradient(circle at 62% 82%, var(--blob-3-color) 0%, transparent 55%);
     opacity: 0.85;
-    transition: opacity 0.5s ease;
 }
 
 .blob {
-    position: absolute;
-    border-radius: 50%;
-    mix-blend-mode: normal;
-    transition: background-color 1s ease;
-}
-
-.blob-1 {
-    width: 450px;
-    height: 450px;
-    background-color: var(--blob-1-color);
-    top: -10%;
-    left: 10%;
-    animation: drift-slow 25s infinite alternate ease-in-out;
-}
-
-.blob-2 {
-    width: 550px;
-    height: 550px;
-    background-color: var(--blob-2-color);
-    bottom: -15%;
-    right: 5%;
-    animation: drift-medium 30s infinite alternate ease-in-out;
-}
-
-.blob-3 {
-    width: 400px;
-    height: 400px;
-    background-color: var(--blob-3-color);
-    top: 30%;
-    right: 40%;
-    animation: drift-fast 20s infinite alternate ease-in-out;
-}
-
-@keyframes drift-slow {
-    0% {
-        transform: translate(0, 0) scale(1) rotate(0deg);
-    }
-    50% {
-        transform: translate(100px, 80px) scale(1.15) rotate(180deg);
-    }
-    100% {
-        transform: translate(-50px, 120px) scale(0.9) rotate(360deg);
-    }
-}
-
-@keyframes drift-medium {
-    0% {
-        transform: translate(0, 0) scale(1.1) rotate(0deg);
-    }
-    50% {
-        transform: translate(-120px, -60px) scale(0.85) rotate(-120deg);
-    }
-    100% {
-        transform: translate(80px, 40px) scale(1.05) rotate(240deg);
-    }
-}
-
-@keyframes drift-fast {
-    0% {
-        transform: translate(0, 0) scale(0.9) rotate(0deg);
-    }
-    50% {
-        transform: translate(70px, -90px) scale(1.1) rotate(150deg);
-    }
-    100% {
-        transform: translate(-60px, 50px) scale(1) rotate(-150deg);
-    }
+    display: none;
 }
 
 .dashboard-layout {
     display: flex;
     height: 100vh;
     width: 100%;
-}
-
-.sidebar {
-    width: 350px;
-    background-color: var(--sidebar-bg);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
-    border-right: 1px solid var(--sidebar-border);
-    padding: 1rem;
-    display: flex;
-    flex-direction: column;
 }
 
 .main-content {
@@ -239,8 +185,6 @@ h1 {
 
 .bookmark-card {
     background-color: var(--card-bg);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
     border: 1px solid var(--card-border);
     padding: 1.5rem;
     border-radius: 16px;
@@ -319,8 +263,6 @@ h1 {
     height: 40px;
     border-radius: 50%;
     background: var(--card-bg);
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
     border: 1px solid var(--card-border);
     color: var(--text-color);
     display: flex;
@@ -340,8 +282,6 @@ h1 {
 
 .debug-controls {
     background: var(--card-bg);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
     border: 1px solid var(--card-border);
     padding: 1rem;
     border-radius: 12px;
@@ -402,22 +342,6 @@ h1 {
     opacity: 0.9;
 }
 
-/* Calendar Container */
-.calendar-container {
-    width: 100%;
-    height: 100%;
-    border-radius: 16px;
-    overflow: hidden;
-    box-shadow: none;
-    /* Removed shadow as it's in a sidebar now */
-}
-
-.calendar-container iframe {
-    width: 100%;
-    height: 100%;
-    display: block;
-}
-
 /* Mobile & Responsive Adjustments */
 @media (max-width: 768px) {
     body {
@@ -430,14 +354,6 @@ h1 {
         flex-direction: column;
         height: auto;
         min-height: 100vh;
-    }
-
-    .sidebar {
-        width: 100%;
-        height: 320px;
-        border-right: none;
-        border-bottom: 1px solid var(--sidebar-border);
-        padding: 0.75rem;
     }
 
     .main-content {
@@ -506,6 +422,11 @@ h1 {
     font-variant-numeric: tabular-nums;
 }
 
+.network-updated.stale {
+    color: #dd6b20;
+    opacity: 0.95;
+}
+
 .device-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
@@ -518,8 +439,6 @@ h1 {
     border-radius: 16px;
     box-shadow: var(--card-shadow);
     padding: 0.8rem 0.9rem;
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
 }
 
 .device-card.offline {
@@ -621,4 +540,14 @@ h1 {
     font-size: 0.8rem;
     opacity: 0.55;
     grid-column: 1 / -1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+    }
 }

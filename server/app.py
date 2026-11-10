@@ -12,14 +12,13 @@ Endpoints
     POST /api/push/<name>   agent heartbeat + metrics (needs X-Dash-Token)
     GET  /api/health        liveness
 """
+import hashlib
 import json
 import math
 import os
 import shutil
-import ssl
 import threading
 import time
-import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -35,11 +34,8 @@ HIT_RETENTION_SECONDS = HIT_RETENTION_DAYS * 86400
 PORT = int(os.environ.get("DASH_PORT", "8000"))
 TOKEN = os.environ.get("DASH_TOKEN", "").strip()
 
-PVE_HOST = os.environ.get("PVE_HOST", "").strip()
-PVE_NODE = os.environ.get("PVE_NODE", "pve").strip()
-PVE_TOKEN = os.environ.get("PVE_TOKEN", "").strip()
-
 _lock = threading.Lock()
+_agents_lock = threading.Lock()
 _hits_lock = threading.Lock()
 _cache = {"at": 0.0, "body": None}
 _prev_cpu = {"usec": None, "at": None}
@@ -148,63 +144,6 @@ def local_device():
     }
 
 
-# ---------- proxmox ----------
-
-def _pve_get(path):
-    url = f"https://{PVE_HOST}:8006/api2/json{path}"
-    req = urllib.request.Request(url, headers={"Authorization": f"PVEAPIToken={PVE_TOKEN}"})
-    ctx = ssl._create_unverified_context()
-    with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
-        return json.load(r)["data"]
-
-
-def proxmox_devices():
-    if not (PVE_HOST and PVE_TOKEN):
-        return []
-    try:
-        node = _pve_get(f"/nodes/{PVE_NODE}/status")
-        dev = {
-            "id": "pve",
-            "name": "pve",
-            "kind": "host",
-            "source": "proxmox",
-            "cpu_pct": round(100.0 * node.get("cpu", 0), 1),
-            "mem_pct": round(100.0 * node["memory"]["used"] / node["memory"]["total"], 1)
-            if node.get("memory", {}).get("total") else None,
-            "mem_used": node.get("memory", {}).get("used"),
-            "mem_total": node.get("memory", {}).get("total"),
-            "disk_pct": round(100.0 * node["rootfs"]["used"] / node["rootfs"]["total"], 1)
-            if node.get("rootfs", {}).get("total") else None,
-            "uptime_s": node.get("uptime"),
-            "online": True,
-            "last_seen": int(time.time()),
-        }
-        out = [dev]
-        for g in _pve_get(f"/nodes/{PVE_NODE}/lxc"):
-            out.append({
-                "id": f"ct{g['vmid']}",
-                "name": g.get("name") or f"ct{g['vmid']}",
-                "kind": "lxc-guest",
-                "source": "proxmox",
-                "cpu_pct": round(100.0 * g.get("cpu", 0), 1),
-                "mem_pct": round(100.0 * g["mem"] / g["maxmem"], 1) if g.get("maxmem") else None,
-                "mem_used": g.get("mem"),
-                "mem_total": g.get("maxmem"),
-                "disk_pct": None,
-                "uptime_s": g.get("uptime"),
-                "online": g.get("status") == "running",
-                "last_seen": int(time.time()),
-            })
-        return out
-    except Exception as exc:  # noqa: BLE001 - surface the reason, never crash the page
-        return [{
-            "id": "pve", "name": "pve", "kind": "host", "source": "proxmox",
-            "cpu_pct": None, "mem_pct": None, "disk_pct": None, "uptime_s": None,
-            "online": False, "last_seen": int(time.time()),
-            "error": f"{type(exc).__name__}: {exc}",
-        }]
-
-
 # ---------- push agents ----------
 
 def load_agents():
@@ -252,7 +191,7 @@ def stats():
     with _lock:
         if _cache["body"] and now - _cache["at"] < 5:
             return _cache["body"]
-    devices = [local_device()] + proxmox_devices() + agent_devices()
+    devices = [local_device()] + agent_devices()
     body = {"generated": int(now), "devices": devices}
     with _lock:
         _cache["at"] = now
@@ -371,27 +310,57 @@ CONTENT_TYPES = {
     ".svg": "image/svg+xml",
     ".png": "image/png",
     ".ico": "image/x-icon",
+    ".woff2": "font/woff2",
 }
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "dash/1.0"
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):  # quieter logs
         print("%s - %s" % (self.address_string(), fmt % args), flush=True)
 
-    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+    def _send(self, code, body, ctype="application/json; charset=utf-8",
+              cache="no-store", etag=None):
         if isinstance(body, str):
             body = body.encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
+        if etag:
+            self.send_header("ETag", etag)
+        self.send_header("Vary", "Accept-Encoding")
         self.end_headers()
         self.wfile.write(body)
 
+    def _not_modified(self, etag, cache):
+        self.send_response(304)
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", cache)
+        self.send_header("Vary", "Accept-Encoding")
+        self.end_headers()
+
     def _json(self, obj, code=200):
         self._send(code, json.dumps(obj))
+
+    def _json_cached(self, obj):
+        body = json.dumps(obj).encode()
+        etag = f'W/"{len(body)}-{hashlib.sha1(body).hexdigest()[:12]}"'
+        if self.headers.get("If-None-Match") == etag:
+            return self._not_modified(etag, "no-cache")
+        return self._send(200, body, cache="no-cache", etag=etag)
+
+    def _render_index(self):
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        try:
+            payload = json.dumps(bookmarks())
+        except Exception:  # noqa: BLE001 - an unreadable store must not break the page
+            payload = '{"work": []}'
+        # Never let a bookmark title close the JSON script element.
+        payload = payload.replace("<", "\\u003c")
+        return html.replace("__BOOKMARKS_JSON__", payload)
 
     def do_GET(self):
         path = self.path.split("?")[0]
@@ -399,24 +368,46 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/stats":
                 return self._json(stats())
             if path == "/api/bookmarks":
-                return self._json(bookmarks())
+                return self._json_cached(bookmarks())
             if path == "/api/health":
-                return self._json({"ok": True, "pve": bool(PVE_HOST and PVE_TOKEN)})
+                return self._json({"ok": True})
         except Exception as exc:  # noqa: BLE001
             return self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
 
-        rel = "index.html" if path in ("", "/") else path.lstrip("/")
+        if path in ("", "/", "/index.html"):
+            try:
+                body = self._render_index().encode()
+            except Exception as exc:  # noqa: BLE001
+                return self._send(500, f"render failed: {exc}", "text/plain; charset=utf-8")
+            etag = f'W/"{len(body)}-{hashlib.sha1(body).hexdigest()[:12]}"'
+            if self.headers.get("If-None-Match") == etag:
+                return self._not_modified(etag, "no-cache")
+            return self._send(200, body, "text/html; charset=utf-8",
+                              cache="no-cache", etag=etag)
+
+        rel = path.lstrip("/")
         target = (STATIC / rel).resolve()
         if not str(target).startswith(str(STATIC)) or not target.is_file():
             return self._send(404, "not found", "text/plain; charset=utf-8")
         ctype = CONTENT_TYPES.get(target.suffix, "application/octet-stream")
-        return self._send(200, target.read_bytes(), ctype)
+        st = target.stat()
+        etag = f'W/"{st.st_mtime_ns}-{st.st_size}"'
+        cache = (
+            "public, max-age=31536000, immutable"
+            if target.suffix == ".woff2"
+            else "public, max-age=0, must-revalidate"
+        )
+        if self.headers.get("If-None-Match") == etag:
+            return self._not_modified(etag, cache)
+        return self._send(200, target.read_bytes(), ctype, cache=cache, etag=etag)
 
     def do_POST(self):
         path = self.path.split("?")[0]
         if path == "/api/hit":
             try:
                 length = int(self.headers.get("Content-Length", "0"))
+                if length > 4096:
+                    return self._json({"error": "payload too large"}, 413)
                 payload = json.loads(self.rfile.read(length))
             except Exception:  # noqa: BLE001 - malformed input is the client's fault
                 return self._json({"error": "bad payload"}, 400)
@@ -427,27 +418,30 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(204, b"")
         if not path.startswith("/api/push/"):
             return self._send(404, "not found", "text/plain; charset=utf-8")
-        if TOKEN and self.headers.get("X-Dash-Token") != TOKEN:
+        sent = self.headers.get("X-Dash-Token", "")
+        if TOKEN and sent != TOKEN:
             return self._json({"error": "bad token"}, 401)
         name = path.rsplit("/", 1)[-1][:40] or "unknown"
         try:
             length = int(self.headers.get("Content-Length", "0"))
+            if length > 65536:
+                return self._json({"error": "payload too large"}, 413)
             payload = json.loads(self.rfile.read(length) or b"{}")
         except Exception as exc:  # noqa: BLE001
             return self._json({"error": f"bad payload: {exc}"}, 400)
-        agents = load_agents()
-        rec = dict(agents.get(name, {}))
-        rec.update({k: payload[k] for k in (
-            "cpu_pct", "mem_pct", "mem_used", "mem_total",
-            "disk_pct", "uptime_s", "kind", "name") if k in payload})
-        rec["last_seen"] = int(time.time())
-        agents[name] = rec
-        save_agents(agents)
+        with _agents_lock:
+            agents = load_agents()
+            rec = dict(agents.get(name, {}))
+            rec.update({k: payload[k] for k in (
+                "cpu_pct", "mem_pct", "mem_used", "mem_total",
+                "disk_pct", "uptime_s", "kind", "name") if k in payload})
+            rec["last_seen"] = int(time.time())
+            agents[name] = rec
+            save_agents(agents)
         return self._json({"ok": True, "stored": name})
-
 
 if __name__ == "__main__":
     _local_cpu_pct()  # prime the cgroup CPU delta
     DATA.mkdir(parents=True, exist_ok=True)
-    print(f"dash listening on :{PORT}  pve={'on' if PVE_HOST and PVE_TOKEN else 'off'}  token={'set' if TOKEN else 'open'}", flush=True)
+    print(f"dash listening on :{PORT}  token={'set' if TOKEN else 'open'}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
