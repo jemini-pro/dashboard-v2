@@ -601,13 +601,92 @@ body {
 .bookmarks-grid {
     flex: 1 1 auto;
     min-height: 0;
-    overflow-y: auto;
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
-    gap: 8px;
-    align-content: start;
+    overflow: auto;
+    columns: 3;
+    column-gap: 20px;
     padding-right: 2px;
     scrollbar-width: thin;
+}
+
+/* Numbered rows: 01 · title / description · hover arrow. */
+.tool-category {
+    break-inside: avoid;
+    margin-bottom: 12px;
+}
+
+.tool-category-title {
+    padding-bottom: 4px;
+    margin-bottom: 3px;
+    border-bottom: 1px solid var(--sidebar-border);
+    font-size: 0.55rem;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+}
+
+.tool-list {
+    list-style: none;
+}
+
+.tool-link {
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
+    padding: 3px;
+    border-radius: 7px;
+    color: var(--text-color);
+    text-decoration: none;
+}
+
+.tool-link:hover {
+    background: var(--icon-bg);
+}
+
+.tool-num {
+    width: 15px;
+    flex: none;
+    font-size: 0.53rem;
+    color: var(--faint);
+    font-variant-numeric: tabular-nums;
+}
+
+.tool-link-main {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.tool-link-title {
+    font-size: 0.77rem;
+    font-weight: 500;
+    line-height: 1.25;
+}
+
+.tool-link-desc {
+    font-size: 0.6rem;
+    color: var(--faint);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.tool-link-arrow {
+    margin-left: auto;
+    font-size: 0.64rem;
+    color: var(--accent-color);
+    opacity: 0;
+}
+
+.tool-link:hover .tool-link-arrow,
+.tool-link:focus-visible .tool-link-arrow {
+    opacity: 1;
+}
+
+.tool-empty {
+    font-size: 0.75rem;
+    color: var(--muted);
+    padding: 10px 2px;
 }
 
 /* ---------- Network rail ---------- */
@@ -935,7 +1014,7 @@ input:focus-visible {
     }
 
     .bookmarks-grid {
-        grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+        columns: 2;
     }
 }
 
@@ -945,6 +1024,6 @@ input:focus-visible {
     }
 
     .bookmarks-grid {
-        grid-template-columns: 1fr;
+        columns: 1;
     }
 }
