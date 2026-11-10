@@ -2,26 +2,51 @@ name: stack
 
 services:
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2-alpine@sha256:78bd35025c7ba85961dd149ae670315129954e77abe2383ac47c89106b35ade9
     container_name: caddy
     restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 128m
+    memswap_limit: 128m
     ports:
-      - "8448:8448"
+      # The deploy sets DASH_BIND=10.10.10.20 so the LXC's LAN address is the
+      # only listener; Tailscale Serve on the PVE host is the only user entry.
+      - "${DASH_BIND:-0.0.0.0}:8448:8448"
+    env_file:
+      # Holds DASH_AUTH_HASH for this file. Live: /opt/stack/dash/.env.
+      - ${DASH_ENV_FILE:-./dash/.env}
     volumes:
       # Defaults are the live /opt/stack layout. Running from this repo
       # (server/) overrides CADDYFILE=./Caddyfile.
       - ${CADDYFILE:-./caddy/Caddyfile}:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+      - caddy_tmp:/tmp
     depends_on:
       - dash
 
-  # The dashboard: static page, bookmark store and device stats API.
+  # The dashboard: static page, bookmark store, click history and device stats.
   # Stdlib Python, no pip, no build step.
   dash:
-    image: python:3.13-alpine
+    image: python:3.13-alpine@sha256:1e1f6334529d1fb26a2ef619d7cffb30a7c7d7cc1cc7338ebee283a58d1aeaca
     container_name: dash
     restart: unless-stopped
+    read_only: true
+    user: "1000:1000"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 96
+    mem_limit: 256m
+    memswap_limit: 256m
+    tmpfs:
+      - /tmp
     working_dir: /app
     command: ["python", "-u", "app.py"]
     # Read the LXC's cgroup, not this container's: the card should describe
@@ -31,12 +56,12 @@ services:
       # Live: /opt/stack/dash/.env. Repo: DASH_ENV_FILE=./.env from server/.
       - ${DASH_ENV_FILE:-./dash/.env}
     volumes:
-      # The whole dashboard directory is bind-mounted. In the live stack the
-      # host side is /opt/stack/dash, so data/ (bookmarks.json, hits.json,
-      # agents.json) lives at /opt/stack/dash/data/ and survives recreating
-      # this container. Repo: DASH_DIR=. from server/ (with static/ copied in).
+      # The code mount is readable; data is a separate writable mount so the
+      # bookmark store and click history survive recreating this container.
       - ${DASH_DIR:-./dash}:/app
+      - ${DASH_DATA_DIR:-./dash/data}:/app/data
 
 volumes:
   caddy_data:
   caddy_config:
+  caddy_tmp:

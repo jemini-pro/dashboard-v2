@@ -63,9 +63,15 @@ class ApiTestCase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.data = Path(self._tmp.name)
-        self._old_data, self._old_hits = app.DATA, app.HITS_FILE
+        self._old_data, self._old_hits, self._old_static = app.DATA, app.HITS_FILE, app.STATIC
         app.DATA = self.data
         app.HITS_FILE = self.data / "hits.json"
+        self.static = self.data / "static"
+        self.static.mkdir()
+        (self.static / "index.html").write_text(
+            '<script id="bookmarks-data" type="application/json">__BOOKMARKS_JSON__</script>'
+        )
+        app.STATIC = self.static
         self.write_bookmarks(WORK_BOOKMARKS)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), QuietHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -76,7 +82,7 @@ class ApiTestCase(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
-        app.DATA, app.HITS_FILE = self._old_data, self._old_hits
+        app.DATA, app.HITS_FILE, app.STATIC = self._old_data, self._old_hits, self._old_static
         self._tmp.cleanup()
 
     def write_bookmarks(self, store):
@@ -232,6 +238,25 @@ class HitEndpointTest(ApiTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(data.get("work"), [])
 
+    def test_index_injects_scored_bookmarks_and_revalidates(self):
+        with frozen_time():
+            self.post_hit("https://mail.example.com")
+            with urllib.request.urlopen(self.base + "/", timeout=5) as resp:
+                html = resp.read().decode()
+                etag = resp.headers.get("ETag")
+                cache = resp.headers.get("Cache-Control")
+
+            self.assertEqual(cache, "no-cache")
+            self.assertNotIn("__BOOKMARKS_JSON__", html)
+            self.assertIn('id="bookmarks-data"', html)
+            self.assertIn("https://mail.example.com", html)
+            self.assertIn('"score": 1.0', html)
+
+            req = urllib.request.Request(self.base + "/", headers={"If-None-Match": etag})
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(req, timeout=5)
+            self.assertEqual(caught.exception.code, 304)
+
     def test_concurrent_hits_are_all_recorded(self):
         url = "https://mail.example.com"
 
@@ -338,28 +363,34 @@ class MostUsedCardTest(FrontEndSourceTest):
 
     def test_empty_state_keeps_the_card_and_shows_no_usage_yet(self):
         render = function_body(self.js, "renderMostUsed")
+        update = function_body(self.js, "updateDashboard")
+        injected = function_body(self.js, "injectedBookmarks")
 
         self.assertIn("No usage yet", render)
         self.assertIn("hidden = false", render)
         self.assertNotIn("hidden = true", render)
 
-    def test_first_paint_and_a_failed_fetch_both_show_no_usage_yet(self):
-        # First paint uses the scoreless embedded copy: the card must still
-        # render its quiet empty state instead of staying blank.
-        update = function_body(self.js, "updateDashboard")
+        # Server-injected first paint uses the scored store; with no injection
+        # (static-only hosting) the fetch fallback takes over.
+        self.assertIn("injectedBookmarks()", update)
         self.assertIn("renderMostUsed(bookmarkStore)", update)
+        self.assertIn("loadBookmarks()", update)
+        self.assertIn("bookmarks-data", injected)
+        self.assertIn("JSON.parse", injected)
 
-        # A failed /api/bookmarks fetch keeps that empty state rather than
-        # leaving a blank card.
+    def test_first_paint_and_a_failed_fetch_both_show_no_usage_yet(self):
+        # The injected store is scored; when /api/bookmarks is unreachable the
+        # card keeps its quiet empty state instead of a blank panel.
+        update = function_body(self.js, "updateDashboard")
         load = function_body(self.js, "loadBookmarks")
+
+        self.assertIn("renderMostUsed(bookmarkStore)", update)
         self.assertIn("renderMostUsed(bookmarkStore)", load)
 
         # Scoreless data can never populate rows: selection requires a score
-        # above the threshold, and the embedded copy carries no score at all.
+        # above the threshold.
         select = function_body(self.js, "selectMostUsed")
         self.assertIn("score > MOST_USED_MIN_SCORE", select)
-        embedded = self.js[self.js.index("const bookmarks = {"):self.js.index("const clockEl")]
-        self.assertNotIn("score", embedded)
 
     def test_only_the_scored_api_payload_populates_the_card(self):
         load = function_body(self.js, "loadBookmarks")
@@ -660,10 +691,9 @@ class MonogramIconTest(FrontEndSourceTest):
                 self.assertIn("monogram(item)", body)
                 self.assertNotIn("item.icon", body)
 
-        embedded = self.js[
-            self.js.index("const bookmarks = {"):self.js.index("const clockEl")
-        ]
-        self.assertNotRegex(embedded, r"\bicon\s*:")
+        # The embedded bookmark copy is gone: the server injects the scored
+        # store, so there is no in-page icon field to render.
+        self.assertNotIn("const bookmarks = {", self.js)
         self.assertNotIn("s2/favicons", self.js)
         for emoji in ("📧", "📅", "📊", "🐙", "🤖", "☁️"):
             self.assertNotIn(emoji, self.js)
@@ -1078,7 +1108,16 @@ class NetworkCardTest(FrontEndSourceTest):
         self.assertIn("renderNetwork(", apply)
         self.assertIn("patchNetwork(", apply)
 
-        self.assertIn("setInterval(refreshDevices, 10000)", self.js)
+        # Polling uses setTimeout with backoff, and pauses while the tab is
+        # hidden, rather than a fixed interval that keeps waking a background
+        # tab.
+        schedule = function_body(self.js, "scheduleRefresh")
+        self.assertIn("setTimeout(", schedule)
+        self.assertIn("document.hidden", schedule)
+        self.assertIn("10000", schedule)
+        self.assertIn("Math.min(60000", schedule)
+        self.assertIn("visibilitychange", self.js)
+        self.assertNotIn("setInterval(refreshDevices", self.js)
 
     def test_updated_label_uses_a_locale_independent_24_hour_clock(self):
         body = function_body(self.js, "updatedLabel")

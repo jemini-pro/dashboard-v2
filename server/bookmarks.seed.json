@@ -1,0 +1,245 @@
+{
+  "work": [
+    {
+      "category": "Google Workspace",
+      "items": [
+        {
+          "title": "Gmail",
+          "desc": "Email",
+          "icon": "\ud83d\udce7",
+          "url": "https://mail.google.com",
+          "pinned": true
+        },
+        {
+          "title": "Google Calendar",
+          "desc": "Meetings & scheduling",
+          "icon": "\ud83d\udcc5",
+          "url": "https://calendar.google.com",
+          "pinned": true
+        },
+        {
+          "title": "Google Sheets",
+          "desc": "Spreadsheets & data",
+          "icon": "\ud83d\udcca",
+          "url": "https://docs.google.com/spreadsheets",
+          "pinned": true
+        },
+        {
+          "title": "Google Docs",
+          "desc": "Documents",
+          "icon": "\ud83d\udcdd",
+          "url": "https://docs.google.com/document"
+        },
+        {
+          "title": "Google Forms",
+          "desc": "Forms",
+          "icon": "\ud83d\udccb",
+          "url": "https://docs.google.com/forms"
+        },
+        {
+          "title": "Shared Drive",
+          "desc": "Team storage",
+          "icon": "\ud83d\udcc1",
+          "url": "https://drive.google.com/drive/u/0/folders/0AAZUVdPYQtvyUk9PVA"
+        },
+        {
+          "title": "Data Studio",
+          "desc": "Dashboards & reporting",
+          "icon": "\ud83d\udcc8",
+          "url": "https://lookerstudio.google.com"
+        }
+      ]
+    },
+    {
+      "category": "Automation",
+      "items": [
+        {
+          "title": "OpenAI API Dashboard",
+          "desc": "AI & model management",
+          "icon": "\ud83e\udd16",
+          "url": "https://platform.openai.com"
+        },
+        {
+          "title": "Ollama",
+          "desc": "Usage & settings",
+          "icon": "\ud83e\udd99",
+          "url": "https://ollama.com/settings"
+        },
+        {
+          "title": "Make.com",
+          "desc": "Workflow automation",
+          "icon": "\u2699\ufe0f",
+          "url": "https://www.make.com"
+        },
+        {
+          "title": "GitHub",
+          "desc": "Code repository",
+          "icon": "\ud83d\udc19",
+          "url": "https://github.com/jemini-pro",
+          "pinned": true
+        },
+        {
+          "title": "Jules",
+          "desc": "Internal link",
+          "icon": "\ud83e\udd16",
+          "url": "https://jules.google.com"
+        }
+      ]
+    },
+    {
+      "category": "Analytics & Collaboration",
+      "items": [
+        {
+          "title": "Lucidchart",
+          "desc": "Diagrams & flowcharts",
+          "icon": "\ud83d\udcd0",
+          "url": "https://lucid.app"
+        },
+        {
+          "title": "AWS",
+          "desc": "Cloud platform & login",
+          "icon": "\u2601\ufe0f",
+          "url": "https://d-9c67692c29.awsapps.com/start/",
+          "pinned": true
+        },
+        {
+          "title": "Slack",
+          "desc": "Team communication",
+          "icon": "\ud83d\udcac",
+          "url": "https://slack.com",
+          "pinned": true
+        },
+        {
+          "title": "NIRA",
+          "desc": "File storage",
+          "icon": "\u2601\ufe0f",
+          "url": "https://nira.com"
+        }
+      ]
+    },
+    {
+      "category": "Social Media",
+      "items": [
+        {
+          "title": "Instagram",
+          "desc": "Content & engagement",
+          "icon": "\ud83d\udcf8",
+          "url": "https://www.instagram.com/surveyair/"
+        },
+        {
+          "title": "LinkedIn",
+          "desc": "Networking",
+          "icon": "\ud83d\udcbc",
+          "url": "https://www.linkedin.com/company/survey-air"
+        },
+        {
+          "title": "YouTube",
+          "desc": "Video content",
+          "icon": "\ud83c\udfa5",
+          "url": "https://www.youtube.com/@surveyair"
+        }
+      ]
+    },
+    {
+      "category": "Work Tools",
+      "items": [
+        {
+          "title": "Portal",
+          "desc": "Survey Air portal",
+          "icon": "\ud83d\udd11",
+          "url": "https://clients.surveyair.co.uk/login/"
+        },
+        {
+          "title": "Website",
+          "desc": "Survey Air website",
+          "icon": "\ud83c\udf10",
+          "url": "https://surveyair.co.uk/"
+        }
+      ]
+    },
+    {
+      "category": "Homelab",
+      "items": [
+        {
+          "title": "Proxmox",
+          "desc": "Host UI",
+          "icon": "\ud83d\udda5\ufe0f",
+          "url": "https://pve.tail73491d.ts.net/",
+          "pinned": true
+        },
+        {
+          "title": "T3 Code",
+          "desc": "Agent console",
+          "icon": "\ud83e\udd16",
+          "url": "https://pve.tail73491d.ts.net:8443/",
+          "pinned": true
+        },
+        {
+          "title": "Tailscale",
+          "desc": "Machines & ACLs",
+          "icon": "\ud83d\udd17",
+          "url": "https://login.tailscale.com/admin/machines"
+        }
+      ]
+    }
+  ],
+  "personal": [
+    {
+      "category": "Entertainment",
+      "items": [
+        {
+          "title": "YouTube",
+          "desc": "Video streaming",
+          "url": "https://youtube.com",
+          "icon": "\ud83d\udcfa"
+        },
+        {
+          "title": "Netflix",
+          "desc": "Movies & TV",
+          "url": "https://netflix.com",
+          "icon": "\ud83c\udf7f"
+        }
+      ]
+    },
+    {
+      "category": "Social",
+      "items": [
+        {
+          "title": "Reddit",
+          "desc": "Community",
+          "url": "https://reddit.com",
+          "icon": "\ud83d\udc7d"
+        },
+        {
+          "title": "Twitter",
+          "desc": "News & updates",
+          "url": "https://twitter.com",
+          "icon": "\ud83d\udc26"
+        },
+        {
+          "title": "GitHub",
+          "desc": "Personal projects",
+          "url": "https://github.com/jem-cell",
+          "icon": "\ud83d\udc19"
+        }
+      ]
+    },
+    {
+      "category": "Tools",
+      "items": [
+        {
+          "title": "Spotify",
+          "desc": "Music",
+          "url": "https://spotify.com",
+          "icon": "\ud83c\udfb5"
+        },
+        {
+          "title": "Amazon",
+          "desc": "Shopping",
+          "url": "https://amazon.com",
+          "icon": "\ud83d\uded2"
+        }
+      ]
+    }
+  ]
+}

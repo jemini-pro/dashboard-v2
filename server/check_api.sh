@@ -13,7 +13,6 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_DIR="$REPO/server"
 APP="$SERVER_DIR/app.py"
-APP_JS="$REPO/app.js"
 COMPOSE="$SERVER_DIR/docker-compose.yml"
 README="$SERVER_DIR/README.md"
 TMP="$(mktemp -d)"
@@ -25,7 +24,7 @@ BASE=""
 PID=""
 COUNT=0
 
-# Real embedded bookmarks (app.js) used as representative fixture URLs.
+# Representative URLs from the tracked bookmark seed.
 W_MAIL="https://mail.google.com"
 W_CAL="https://calendar.google.com"
 W_SHEETS="https://docs.google.com/spreadsheets"
@@ -161,26 +160,16 @@ PY
 }
 
 write_bookmarks() {
-    # Derive the fixture from the real embedded bookmark copy in app.js (24 work
-    # + 7 personal) so payload-size and ordering checks cover realistic titles,
-    # descriptions, icons and URLs rather than short "fixture" strings.
-    python3 - "$BOOKMARKS" "$APP_JS" <<'PY'
-import json, re, sys
-out, app_js = sys.argv[1], sys.argv[2]
-with open(app_js, encoding="utf-8") as f:
-    source = f.read()
-start = source.index("const bookmarks = ") + len("const bookmarks = ")
-end = source.index("\n};", start) + 2
-literal = source[start:end]
-# app.js embeds a JS object literal: bare keys and single-quoted strings.
-literal = re.sub(r"([{,]\s*)(\w+)(\s*:)", r'\1"\2"\3', literal)
-literal = literal.replace("'", '"')
-store = json.loads(literal)
+    # The seed is the tracked bookmark fixture the server injects; the front
+    # end no longer carries an embedded copy of these links.
+    cp "$SERVER_DIR/bookmarks.seed.json" "$BOOKMARKS"
+    python3 - "$BOOKMARKS" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    store = json.load(f)
 items = [item for cats in store.values() for cat in cats for item in cat["items"]]
 if len(items) < 31:
-    raise SystemExit(f"expected at least 31 embedded bookmarks in app.js, parsed {len(items)}")
-with open(out, "w", encoding="utf-8") as f:
-    json.dump(store, f)
+    raise SystemExit(f"expected at least 31 seed bookmarks, parsed {len(items)}")
 PY
 }
 
@@ -246,14 +235,14 @@ write_bookmarks
 start_server
 ok "server started on an ephemeral port with a throwaway DASH_DATA_DIR"
 
-# 0. The Launchpad is data-driven: a pinned flag passes through unchanged.
+# 1. The Launchpad is data-driven: a pinned flag passes through unchanged.
 pin_item "$W_MAIL"
 get_bookmarks
 [[ "$(json_item_field "$TMP/bookmarks.json" "$W_MAIL" pinned)" == "True" ]] \
     || fail "a pinned flag did not survive /api/bookmarks"
 ok "/api/bookmarks passes a pinned flag through unchanged"
 
-# 1. POST /api/hit -> 204, no body, timestamp stored.
+# 2. POST /api/hit -> 204, no body, timestamp stored.
 code="$(post_hit "$W_MAIL")"
 [[ "$code" == "204" ]] || fail "POST /api/hit returned $code, expected 204"
 [[ ! -s "$TMP/hit.body" ]] || fail "POST /api/hit returned a body"
@@ -262,7 +251,7 @@ code="$(post_hit "$W_MAIL")"
     || fail "one hit was not stored for $W_MAIL"
 ok "POST /api/hit returns 204 with no body and writes hits.json"
 
-# 2. Score appears in /api/bookmarks and rises with repeated clicks.
+# 3. Score appears in /api/bookmarks and rises with repeated clicks.
 get_bookmarks
 score_one="$(json_item_field "$TMP/bookmarks.json" "$W_MAIL" score)" \
     || fail "score missing for $W_MAIL"
@@ -275,7 +264,7 @@ assert_close "$score_three" 3.0 0.01 || fail "three clicks scored $score_three, 
 assert_gt "$score_three" "$score_one" || fail "score did not rise: $score_one -> $score_three"
 ok "score appears in /api/bookmarks and rises on repeated clicks (1.0 -> 3.0)"
 
-# 3. Decay ordering and the documented half life.
+# 4. Decay ordering and the documented half life.
 seed_hits
 get_bookmarks
 s7="$(json_item_field "$TMP/bookmarks.json" "$W_CAL" score)"
@@ -288,7 +277,7 @@ assert_gt "$s60" 0 || fail "60-day hit scored zero, expected non-zero"
 assert_close "$s14" 0.37 0.005 || fail "14-day half life scored $s14, expected 0.37"
 ok "older hits decay: 7d=$s7 > 28d=$s28 > 60d=$s60; 14d=$s14"
 
-# 4. 90-day trimming happens on write.
+# 5. 90-day trimming happens on write.
 [[ "$(hits_len "$W_FORMS")" == "2" ]] \
     || fail "seed hits for $W_FORMS were not written"
 post_hit "$W_FORMS" >/dev/null
@@ -304,14 +293,14 @@ assert max(now - ts for ts in stamps) <= 90 * 86400 + 5, stamps
 PY
 ok "hits older than 90 days are trimmed when a new hit is written"
 
-# 5. Unknown URL is accepted (a link may since have been deleted).
+# 6. Unknown URL is accepted (a link may since have been deleted).
 code="$(post_hit https://deleted.example.com)"
 [[ "$code" == "204" ]] || fail "unknown URL returned $code, expected 204"
 [[ "$(hits_len https://deleted.example.com)" == "1" ]] \
     || fail "unknown URL hit was not stored"
 ok "unknown URL is accepted with 204 and stored"
 
-# 6. Renaming a title keeps the score (history is keyed by URL).
+# 7. Renaming a title keeps the score (history is keyed by URL).
 score_before="$(json_item_field "$TMP/bookmarks.json" "$W_MAIL" score)"
 rename_mail
 get_bookmarks
@@ -322,18 +311,18 @@ assert_close "$score_after" "$score_before" 0.001 \
     || fail "rename changed the score: $score_before -> $score_after"
 ok "renaming a title keeps its score ($score_before -> $score_after)"
 
-# 7. Payload size for the representative 31 links from app.js stays under ~10 KB.
+# 8. Payload size for the 31 representative links in the seed stays under ~10 KB.
 items="$(json_item_count "$TMP/bookmarks.json")"
 [[ "$items" == "31" ]] \
-    || fail "expected 31 representative links derived from app.js, found $items"
+    || fail "expected 31 representative links in the seed, found $items"
 title="$(json_item_field "$TMP/bookmarks.json" "$W_DRIVE" title)"
 [[ "$title" == "Shared Drive" ]] \
-    || fail "fixture is not derived from app.js (expected 'Shared Drive', got '$title')"
+    || fail "fixture is not the tracked seed (expected 'Shared Drive', got '$title')"
 size="$(wc -c < "$TMP/bookmarks.json")"
 [[ "$size" -lt 10240 ]] || fail "/api/bookmarks is $size bytes, over the ~10 KB budget"
 ok "/api/bookmarks is $size bytes for $items links (under 10240)"
 
-# 8. Process restart: the same DASH_DATA_DIR keeps the history. This is the
+# 9. Process restart: the same DASH_DATA_DIR keeps the history. This is the
 # no-docker equivalent of recreating the `dash` container with its bind mount.
 score_before="$(json_item_field "$TMP/bookmarks.json" "$W_MAIL" score)"
 stamps_before="$(hits_len "$W_MAIL")"
@@ -349,11 +338,14 @@ assert_close "$score_restart" "$score_before" 0.001 \
     || fail "hit count changed across restart: $stamps_before -> $stamps_restart"
 ok "hits survived a full server restart (score $score_before -> $score_restart)"
 
-# 9. Static guarantees: no cookie is set and the feature makes no third-party
-# request. Deliberately scoped to the click-history/strip code so pre-existing
-# Google Fonts / calendar references do not produce false positives.
+# 10. Static guarantees: no cookie is set and the feature makes no third-party
+# request. Deliberately scoped to the click-history/strip code so unrelated
+# front-end code does not produce false positives.
 grep -q "Set-Cookie" "$APP" && fail "server sets a cookie"
 grep -q "document.cookie" "$REPO/app.js" && fail "front end touches document.cookie"
+grep -qE 'calendar\.google\.com|fonts\.googleapis\.com|fonts\.gstatic\.com' \
+    "$REPO/index.html" "$REPO/app.js" "$REPO/style.css" \
+    && fail "front end still references the calendar iframe or Google Fonts"
 grep -Fq "navigator.sendBeacon('/api/hit'" "$REPO/app.js" \
     || fail "click handler does not beacon to the same-origin /api/hit"
 grep -Fq "document.addEventListener('click', recordHit)" "$REPO/app.js" \
@@ -378,7 +370,7 @@ grep -Eq 'https?://|fetch\(|XMLHttpRequest|document\.cookie' "$TMP/strip-functio
     && fail "card/strip code makes an external request or touches cookies"
 ok "feature sets no cookie and makes no third-party request"
 
-# 10. Repo/deploy coherence: compose defaults describe the live /opt/stack
+# 11. Repo/deploy coherence: compose defaults describe the live /opt/stack
 # layout but can be pointed at the repo, and the durable host path is documented.
 grep -Fq '${DASH_DIR:-./dash}:/app' "$COMPOSE" \
     || fail "compose does not make the dash directory overridable"
@@ -396,12 +388,12 @@ grep -Fq 'server/check_api.sh' "$README" \
     || fail "README does not document this check"
 ok "compose paths are overridable, defaults match /opt/stack, and README documents both"
 
-# 11. README documents how an owner pins a Launchpad tool.
+# 12. README documents how an owner pins a Launchpad tool.
 grep -Fq '"pinned": true' "$README" \
     || fail "README does not document the pinned bookmark flag"
 ok "README documents the pinned: true bookmark flag"
 
-# 12. README documents the Workbench UI, its breakpoints and the checks.
+# 13. README documents the Workbench UI, its breakpoints and the checks.
 grep -Fq '## Workbench UI' "$README" \
     || fail "README does not document the Workbench UI"
 grep -Fq '1280×800' "$README" \

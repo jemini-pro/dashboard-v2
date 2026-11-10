@@ -35,89 +35,6 @@ const DEVICE_METRICS = [
     { label: 'DSK', key: 'disk', field: 'disk_pct' }
 ];
 
-const bookmarks = {
-    work: [
-        {
-            category: 'Google Workspace',
-            items: [
-                { title: 'Gmail', desc: 'Email', url: 'https://mail.google.com' },
-                { title: 'Google Calendar', desc: 'Meetings & scheduling', url: 'https://calendar.google.com' },
-                { title: 'Google Sheets', desc: 'Spreadsheets & data', url: 'https://docs.google.com/spreadsheets' },
-                { title: 'Google Docs', desc: 'Documents', url: 'https://docs.google.com/document' },
-                { title: 'Google Forms', desc: 'Forms', url: 'https://docs.google.com/forms' },
-                { title: 'Shared Drive', desc: 'Team storage', url: 'https://drive.google.com/drive/u/0/folders/0AAZUVdPYQtvyUk9PVA' },
-                { title: 'Data Studio', desc: 'Dashboards & reporting', url: 'https://lookerstudio.google.com' }
-            ]
-        },
-        {
-            category: 'Automation',
-            items: [
-                { title: 'OpenAI API Dashboard', desc: 'AI & model management', url: 'https://platform.openai.com' },
-                { title: 'Ollama', desc: 'Usage & settings', url: 'https://ollama.com/settings' },
-                { title: 'Make.com', desc: 'Workflow automation', url: 'https://www.make.com' },
-                { title: 'GitHub', desc: 'Code repository', url: 'https://github.com/jemini-pro' },
-                { title: 'Jules', desc: 'Internal link', url: 'https://jules.google.com' }
-            ]
-        },
-        {
-            category: 'Analytics & Collaboration',
-            items: [
-                { title: 'Lucidchart', desc: 'Diagrams & flowcharts', url: 'https://lucid.app' },
-                { title: 'AWS', desc: 'Cloud platform & login', url: 'https://d-9c67692c29.awsapps.com/start/' },
-                { title: 'Slack', desc: 'Team communication', url: 'https://slack.com' },
-                { title: 'NIRA', desc: 'File storage', url: 'https://nira.com' }
-            ]
-        },
-        {
-            category: 'Social Media',
-            items: [
-                { title: 'Instagram', desc: 'Content & engagement', url: 'https://www.instagram.com/surveyair/' },
-                { title: 'LinkedIn', desc: 'Networking', url: 'https://www.linkedin.com/company/survey-air' },
-                { title: 'YouTube', desc: 'Video content', url: 'https://www.youtube.com/@surveyair' }
-            ]
-        },
-        {
-            category: 'Work Tools',
-            items: [
-                { title: 'Portal', desc: 'Survey Air portal', url: 'https://clients.surveyair.co.uk/login/' },
-                { title: 'Website', desc: 'Survey Air website', url: 'https://surveyair.co.uk/' }
-            ]
-        },
-        {
-            category: 'Homelab',
-            items: [
-                { title: 'Proxmox', desc: 'Host UI', url: 'https://pve.tail73491d.ts.net/' },
-                { title: 'T3 Code', desc: 'Agent console', url: 'https://pve.tail73491d.ts.net:8443/' },
-                { title: 'Tailscale', desc: 'Machines & ACLs', url: 'https://login.tailscale.com/admin/machines' }
-            ]
-        }
-    ],
-    personal: [
-        {
-            category: 'Entertainment',
-            items: [
-                { title: 'YouTube', desc: 'Video streaming', url: 'https://youtube.com' },
-                { title: 'Netflix', desc: 'Movies & TV', url: 'https://netflix.com' }
-            ]
-        },
-        {
-            category: 'Social',
-            items: [
-                { title: 'Reddit', desc: 'Community', url: 'https://reddit.com' },
-                { title: 'Twitter', desc: 'News & updates', url: 'https://twitter.com' },
-                { title: 'GitHub', desc: 'Personal projects', url: 'https://github.com/jem-cell' }
-            ]
-        },
-        {
-            category: 'Tools',
-            items: [
-                { title: 'Spotify', desc: 'Music', url: 'https://spotify.com' },
-                { title: 'Amazon', desc: 'Shopping', url: 'https://amazon.com' }
-            ]
-        }
-    ]
-};
-
 const clockEl = document.getElementById('clock');
 const dateEl = document.getElementById('date');
 const searchInput = document.getElementById('search');
@@ -140,14 +57,16 @@ const debugControls = document.getElementById('debug-controls');
 let debugTimeOffset = null;
 let currentTheme = null;
 let bookmarksRendered = false;
-// Embedded copy paints first; /api/bookmarks replaces it when the server is up.
-let bookmarkStore = bookmarks.work;
+let bookmarkStore = [];
 let networkDevices = [];
 // Keyed by device identity so a poll can patch existing rows, and null until
 // the first successful payload so the initial "Loading devices…" is replaced.
 let networkDeviceKey = null;
 let networkUpdatedAt = null;
 let searchQuery = '';
+let statsFailures = 0;
+let refreshTimer = null;
+let pollingStarted = false;
 
 // Debug Menu Toggle
 debugMenuBtn.addEventListener('click', (e) => {
@@ -168,6 +87,20 @@ function getCurrentTime() {
         return new Date(Date.now() + debugTimeOffset);
     }
     return new Date();
+}
+
+// The server injects the scored bookmark store into index.html, so the first
+// paint needs no second request. Static-only hosting leaves the placeholder
+// behind; then this returns null and the fetch fallback takes over.
+function injectedBookmarks() {
+    const el = document.getElementById('bookmarks-data');
+    if (!el) return null;
+    try {
+        const data = JSON.parse(el.textContent);
+        return (data && Array.isArray(data.work) && data.work.length) ? data : null;
+    } catch (e) {
+        return null;
+    }
 }
 
 function updateDashboard() {
@@ -200,12 +133,16 @@ function updateDashboard() {
 
     if (!bookmarksRendered) {
         bookmarksRendered = true;
-        renderAllTools(bookmarkStore);        // instant paint from the embedded copy…
-        renderLaunchpad(bookmarkStore);
-        // The embedded copy carries no scores, so this paints the quiet
-        // "No usage yet" state rather than waiting on the network.
-        renderMostUsed(bookmarkStore);
-        loadBookmarks();                      // …then replace it from the server store
+        const inline = injectedBookmarks();
+        if (inline) {
+            bookmarkStore = inline.work;
+            renderAllTools(bookmarkStore);
+            renderLaunchpad(bookmarkStore);
+            renderMostUsed(bookmarkStore);
+        } else {
+            // Static-only hosting: no injected payload, so fetch the store.
+            loadBookmarks();
+        }
         startDevicePolling();
     }
 }
@@ -472,7 +409,7 @@ setInterval(updateDashboard, 1000);
 
 async function loadBookmarks() {
     try {
-        const res = await fetch('/api/bookmarks', { cache: 'no-store' });
+        const res = await fetch('/api/bookmarks');
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
         if (data && Array.isArray(data.work) && data.work.length) {
@@ -480,19 +417,17 @@ async function loadBookmarks() {
             renderAllTools(bookmarkStore);
             renderLaunchpad(bookmarkStore);
             renderMostUsed(data.work);
+            return;
         }
+        throw new Error('empty bookmark store');
     } catch (e) {
-        console.warn('bookmark store unreachable, keeping the embedded copy', e);
-        // Keep the quiet empty state (or the last scored rows) instead of
-        // leaving the card blank after a failed fetch.
+        console.warn('bookmark store unreachable', e);
+        // No scored store: paint the Workbench empty states rather than
+        // leaving the cards blank.
+        renderAllTools(bookmarkStore);
+        renderLaunchpad(bookmarkStore);
         renderMostUsed(bookmarkStore);
     }
-}
-
-function fmtBytes(n) {
-    if (!n) return '';
-    const gb = n / (1024 ** 3);
-    return gb.toFixed(gb >= 10 ? 1 : 2) + ' GB';
 }
 
 function fmtUptime(s) {
@@ -734,7 +669,7 @@ function renderHealth(devices) {
 
 async function refreshDevices() {
     try {
-        const res = await fetch('/api/stats', { cache: 'no-store' });
+        const res = await fetch('/api/stats');
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
         networkDevices = sortNetworkDevices(data.devices || []);
@@ -743,16 +678,45 @@ async function refreshDevices() {
         setNetworkStale(false);
         applyNetworkDevices(networkDevices);
         renderHealth(networkDevices);
+        statsFailures = 0;
+        return true;
     } catch (e) {
         // Keep the last good reading and label it stale: a failed poll must
         // never erase the panel or report a false all-clear.
+        statsFailures += 1;
         console.warn('stats unreachable, keeping the last good reading', e);
         setNetworkStale(true);
         renderHealth(networkDevices);
+        return false;
     }
 }
 
-function startDevicePolling() {
-    refreshDevices();
-    setInterval(refreshDevices, 10000);
+function scheduleRefresh(delay) {
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(async () => {
+        if (document.hidden) {
+            refreshTimer = null;
+            return;
+        }
+        const ok = await refreshDevices();
+        const next = ok
+            ? 10000
+            : Math.min(60000, 10000 * 2 ** Math.min(statsFailures, 3));
+        scheduleRefresh(next);
+    }, delay);
 }
+
+function startDevicePolling() {
+    if (pollingStarted) return;
+    pollingStarted = true;
+    scheduleRefresh(0);
+}
+
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        clearTimeout(refreshTimer);
+        refreshTimer = null;
+    } else if (pollingStarted && !refreshTimer) {
+        scheduleRefresh(0);
+    }
+});
