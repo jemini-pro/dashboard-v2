@@ -260,13 +260,8 @@ def stats():
     return body
 
 
-def bookmarks():
-    try:
-        with open(DATA / "bookmarks.json") as f:
-            store = json.load(f)
-    except (OSError, ValueError):  # a fresh install has no store yet
-        return {"work": []}
-    scores = hit_scores()
+def with_scores(store, scores):
+    """Stamp each bookmark item with its decayed click score."""
     if isinstance(store, dict):
         for categories in store.values():
             if not isinstance(categories, list):
@@ -280,15 +275,40 @@ def bookmarks():
     return store
 
 
+def bookmarks():
+    try:
+        with open(DATA / "bookmarks.json") as f:
+            store = json.load(f)
+    except (OSError, ValueError):  # a fresh install has no store yet
+        return {"work": []}
+    return with_scores(store, hit_scores())
+
+
 # ---------- click history ----------
 
-def load_hits():
+def _valid_hit_timestamp(ts, cutoff):
+    """A real POSIX timestamp at or after cutoff. bool is an int subclass, so reject it."""
+    return not isinstance(ts, bool) and isinstance(ts, (int, float)) and ts >= cutoff
+
+
+def load_hits(now):
+    """Read the click store, dropping malformed entries and expired stamps."""
     try:
         with open(HITS_FILE) as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
     except Exception:  # noqa: BLE001 - a missing store means no clicks yet
         return {}
+    if not isinstance(data, dict):
+        return {}
+    cutoff = now - HIT_RETENTION_SECONDS
+    hits = {}
+    for url, stamps in data.items():
+        if not isinstance(stamps, list):
+            continue
+        live = [ts for ts in stamps if _valid_hit_timestamp(ts, cutoff)]
+        if live:
+            hits[url] = live
+    return hits
 
 
 def save_hits(hits):
@@ -306,10 +326,7 @@ def trim_hits(hits, now):
     for url, stamps in hits.items():
         if not isinstance(stamps, list):
             continue
-        live = [
-            ts for ts in stamps
-            if not isinstance(ts, bool) and isinstance(ts, (int, float)) and ts >= cutoff
-        ]
+        live = [ts for ts in stamps if _valid_hit_timestamp(ts, cutoff)]
         if live:
             kept[url] = live
     return kept
@@ -318,25 +335,27 @@ def trim_hits(hits, now):
 def record_hit(url):
     now = time.time()
     with _hits_lock:
-        hits = load_hits()
+        hits = load_hits(now)
         hits.setdefault(url, []).append(now)
         save_hits(trim_hits(hits, now))
 
 
-def hit_scores(now=None):
-    """Decayed click weight per URL: sum(exp(-age_days / HALF_LIFE_DAYS))."""
-    now = time.time() if now is None else now
+def hit_scores():
+    """Decayed click weight per URL: sum(exp(-age_days / HALF_LIFE_DAYS)).
+
+    Every URL in the hit store is scored, not just rendered categories. The
+    browser strip then filters to the `work` list it renders (see selectMostUsed
+    in app.js), so clicks on personal links are kept but never shown there.
+    """
+    now = time.time()
     scores = {}
-    for url, stamps in load_hits().items():
-        if not isinstance(stamps, list):
-            continue
+    for url, stamps in load_hits(now).items():
         total = 0.0
         for ts in stamps:
-            if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+            if ts > now:  # clock skew: not scorable until the clock catches up
                 continue
             age_days = (now - ts) / 86400.0
-            if 0 <= age_days <= HIT_RETENTION_DAYS:
-                total += math.exp(-age_days / HALF_LIFE_DAYS)
+            total += math.exp(-age_days / HALF_LIFE_DAYS)
         if total:
             scores[url] = round(total, 2)
     return scores
@@ -402,8 +421,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:  # noqa: BLE001 - malformed input is the client's fault
                 return self._json({"error": "bad payload"}, 400)
             url = payload.get("url") if isinstance(payload, dict) else None
-            if not isinstance(url, str):
-                return self._json({"error": "missing url"}, 400)
+            if not isinstance(url, str) or not url.strip():
+                return self._json({"error": "missing or empty url"}, 400)
             record_hit(url)
             return self._send(204, b"")
         if not path.startswith("/api/push/"):

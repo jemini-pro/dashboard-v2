@@ -4,20 +4,39 @@ Run from the repo root:
     python3 -m unittest discover -s server -p 'test_*.py' -v
 """
 import json
+import re
 import sys
 import tempfile
 import threading
-import time
 import unittest
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import app  # noqa: E402
 
 from http.server import ThreadingHTTPServer  # noqa: E402
+
+APP_JS = Path(__file__).resolve().parent.parent / "app.js"
+
+# A fixed clock keeps decay assertions exact instead of racing wall time.
+NOW = 1_700_000_000.0
+
+
+def frozen_time(ts=NOW):
+    """Patch the one clock app.py reads, so scores are deterministic."""
+    return mock.patch("time.time", return_value=ts)
+
+
+def js_number_constant(name):
+    source = APP_JS.read_text()
+    match = re.search(r"\b" + name + r"\s*=\s*([0-9.]+)", source)
+    if not match:
+        raise AssertionError("constant not found in app.js: " + name)
+    return float(match.group(1))
 
 
 class QuietHandler(app.Handler):
@@ -92,52 +111,58 @@ class ApiTestCase(unittest.TestCase):
 
 class HitEndpointTest(ApiTestCase):
     def test_post_hit_returns_204_and_stores_a_timestamp(self):
-        status, body = self.post_hit("https://mail.example.com")
+        with frozen_time():
+            status, body = self.post_hit("https://mail.example.com")
 
         self.assertEqual(status, 204)
         self.assertEqual(body, b"")
-        self.assertAlmostEqual(
-            self.stored_hits()["https://mail.example.com"][0], time.time(), delta=5
-        )
+        self.assertEqual(self.stored_hits()["https://mail.example.com"], [NOW])
 
     def write_hits(self, hits):
         (self.data / "hits.json").write_text(json.dumps(hits))
 
     def test_never_clicked_link_scores_zero(self):
-        self.assertEqual(self.score("https://docs.example.com"), 0)
+        with frozen_time():
+            score = self.score("https://docs.example.com")
+        self.assertEqual(score, 0)
 
-    def test_a_click_raises_the_score_on_the_next_load(self):
-        self.post_hit("https://mail.example.com")
+    def test_a_single_fresh_hit_scores_1_0_and_clears_the_strip_threshold(self):
+        with frozen_time():
+            self.post_hit("https://mail.example.com")
+            score = self.score("https://mail.example.com")
 
-        self.assertEqual(self.score("https://mail.example.com"), 1.0)
+        self.assertEqual(score, 1.0)
+        # One fresh click already qualifies: the strip threshold is a floor, not
+        # the spec's descriptive "~3 clicks".
+        self.assertGreater(score, js_number_constant("MOST_USED_MIN_SCORE"))
 
     def test_score_decays_with_age(self):
-        now = time.time()
         self.write_hits({
-            "https://mail.example.com": [now - 14 * 86400],
-            "https://docs.example.com": [now - 28 * 86400],
+            "https://mail.example.com": [NOW - 14 * 86400],
+            "https://docs.example.com": [NOW - 28 * 86400],
         })
 
-        self.assertEqual(self.score("https://mail.example.com"), 0.37)
-        self.assertEqual(self.score("https://docs.example.com"), 0.14)
+        with frozen_time():
+            self.assertEqual(self.score("https://mail.example.com"), 0.37)
+            self.assertEqual(self.score("https://docs.example.com"), 0.14)
 
     def test_repeated_clicks_add_up(self):
-        now = time.time()
-        self.write_hits({"https://mail.example.com": [now, now - 14 * 86400]})
+        self.write_hits({"https://mail.example.com": [NOW, NOW - 14 * 86400]})
 
-        self.assertEqual(self.score("https://mail.example.com"), 1.37)
+        with frozen_time():
+            self.assertEqual(self.score("https://mail.example.com"), 1.37)
 
     def test_hits_older_than_90_days_are_trimmed_on_write(self):
-        now = time.time()
         self.write_hits({
-            "https://mail.example.com": [now - 91 * 86400, now - 86400],
+            "https://mail.example.com": [NOW - 91 * 86400, NOW - 86400],
         })
 
-        self.post_hit("https://mail.example.com")
+        with frozen_time():
+            self.post_hit("https://mail.example.com")
+            stamps = self.stored_hits()["https://mail.example.com"]
 
-        stamps = self.stored_hits()["https://mail.example.com"]
         self.assertEqual(len(stamps), 2)
-        self.assertLessEqual(max(now - ts for ts in stamps), 90 * 86400 + 5)
+        self.assertLessEqual(max(NOW - ts for ts in stamps), 90 * 86400)
 
     def test_unknown_url_is_accepted(self):
         status, body = self.post_hit("https://deleted.example.com")
@@ -145,6 +170,14 @@ class HitEndpointTest(ApiTestCase):
         self.assertEqual(status, 204)
         self.assertEqual(body, b"")
         self.assertIn("https://deleted.example.com", self.stored_hits())
+
+    def test_empty_or_whitespace_url_is_rejected_and_not_stored(self):
+        for url in ("", "   ", "\t\n"):
+            with self.subTest(url=url):
+                status, _ = self.post_hit(url)
+                self.assertEqual(status, 400)
+
+        self.assertFalse((self.data / "hits.json").exists())
 
     def test_malformed_payloads_are_rejected_and_the_server_survives(self):
         for body in (b"", b"not json", b"{}", b'{"url": 42}', b"[]"):
@@ -183,12 +216,14 @@ class HitEndpointTest(ApiTestCase):
     def test_concurrent_hits_are_all_recorded(self):
         url = "https://mail.example.com"
 
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            results = list(pool.map(lambda _: self.post_hit(url), range(20)))
+        with frozen_time():
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(lambda _: self.post_hit(url), range(20)))
+            score = self.score(url)
 
         self.assertTrue(all(status == 204 for status, _ in results))
         self.assertEqual(len(self.stored_hits()[url]), 20)
-        self.assertEqual(self.score(url), 20.0)
+        self.assertEqual(score, 20.0)
 
 
 def function_body(source, name):
@@ -209,20 +244,22 @@ def function_body(source, name):
     raise AssertionError("unbalanced function body for " + name)
 
 
-class MostUsedStripTest(unittest.TestCase):
-    """The Most used strip is browser JS; there is no JS runtime in this repo.
-
-    So these are source-level assertions over the small pure helpers plus the
-    markup they render. Manual check in a browser: serve the dashboard, click
-    one link three times, reload, and confirm the strip appears above Network.
-    """
-
-    ROOT = Path(__file__).resolve().parent.parent
+class FrontEndSourceTest(unittest.TestCase):
+    """Shared harness for browser-only code, which has no JS runtime here."""
 
     def setUp(self):
-        self.js = (self.ROOT / "app.js").read_text()
-        self.html = (self.ROOT / "index.html").read_text()
-        self.css = (self.ROOT / "style.css").read_text()
+        self.source = APP_JS.read_text()
+        self.js = self.source
+        self.html = (APP_JS.parent / "index.html").read_text()
+        self.css = (APP_JS.parent / "style.css").read_text()
+
+
+class MostUsedStripTest(FrontEndSourceTest):
+    """Source-level assertions over the strip helpers and the markup they render.
+
+    Manual check in a browser: serve the dashboard, click one link, reload, and
+    confirm the strip appears above Network.
+    """
 
     def test_strip_sits_directly_above_the_network_panel_and_starts_hidden(self):
         strip = self.html.index('id="most-used"')
@@ -238,9 +275,10 @@ class MostUsedStripTest(unittest.TestCase):
         self.assertRegex(self.js, r"MOST_USED_LIMIT\s*=\s*6\b")
 
         body = function_body(self.js, "selectMostUsed")
-        self.assertRegex(body, r"score\s*>\s*(MIN_SCORE|minScore|MOST_USED_MIN_SCORE)")
+        self.assertRegex(body, r"function selectMostUsed\(categories\)")
+        self.assertRegex(body, r"score\s*>\s*MOST_USED_MIN_SCORE\b")
         self.assertRegex(body, r"sort\(\s*\(a,\s*b\)\s*=>\s*b\.score\s*-\s*a\.score\s*\)")
-        self.assertRegex(body, r"slice\(\s*0,\s*limit\s*\)")
+        self.assertRegex(body, r"slice\(\s*0,\s*MOST_USED_LIMIT\s*\)")
 
     def test_strip_is_populated_only_after_the_scored_api_payload_arrives(self):
         load = function_body(self.js, "loadBookmarks")
@@ -262,16 +300,37 @@ class MostUsedStripTest(unittest.TestCase):
 
     def test_category_contents_and_order_are_never_sorted(self):
         body = function_body(self.js, "renderBookmarks")
+        section = function_body(self.js, "categorySection")
 
         self.assertNotIn(".sort(", body)
-        self.assertRegex(body, r"categories\.map\(cat\s*=>")
-        self.assertRegex(body, r"cat\.items\.map\(")
+        self.assertNotIn(".sort(", section)
+        self.assertRegex(
+            body,
+            r"categories\.map\(\s*cat\s*=>\s*categorySection\(cat\.category,\s*cat\.items\)",
+        )
+        self.assertRegex(section, r"items\.map\(item\s*=>\s*bookmarkCard\(item\)\)")
+
+    def test_bookmarks_and_strip_share_one_category_section_renderer(self):
+        self.assertIn(
+            "categorySection(cat.category, cat.items)",
+            function_body(self.js, "renderBookmarks"),
+        )
+        self.assertIn(
+            "categorySection('Most used', items)",
+            function_body(self.js, "renderMostUsed"),
+        )
+        section = function_body(self.js, "categorySection")
+        self.assertIn('class="category-section"', section)
+        self.assertIn('class="category-title"', section)
+        self.assertIn('class="items-grid"', section)
 
     def test_strip_tiles_reuse_bookmark_card_markup_and_open_like_tiles(self):
         render = function_body(self.js, "renderMostUsed")
+        section = function_body(self.js, "categorySection")
         card = function_body(self.js, "bookmarkCard")
 
-        self.assertIn("bookmarkCard(", render)
+        self.assertIn("categorySection('Most used', items)", render)
+        self.assertIn("bookmarkCard(", section)
         self.assertIn('class="bookmark-card"', card)
         self.assertIn('target="_blank"', card)
 
@@ -283,13 +342,8 @@ class MostUsedStripTest(unittest.TestCase):
         )
 
 
-class FrontEndWiringTest(unittest.TestCase):
+class FrontEndWiringTest(FrontEndSourceTest):
     """No JS runtime here, so guard the exact wiring the browser needs."""
-
-    APP_JS = Path(__file__).resolve().parent.parent / "app.js"
-
-    def setUp(self):
-        self.source = self.APP_JS.read_text()
 
     def test_bookmark_clicks_use_sendbeacon_for_click_and_auxclick(self):
         self.assertIn("navigator.sendBeacon('/api/hit', JSON.stringify({ url }))", self.source)
@@ -300,3 +354,11 @@ class FrontEndWiringTest(unittest.TestCase):
         self.assertNotIn("document.cookie", self.source)
         self.assertNotIn("fetch('/api/hit'", self.source)
         self.assertNotIn('fetch("/api/hit"', self.source)
+
+    def test_strip_has_its_own_click_and_auxclick_listeners(self):
+        self.assertIn(
+            "mostUsedEl.addEventListener('click', recordBookmarkHit)", self.source
+        )
+        self.assertIn(
+            "mostUsedEl.addEventListener('auxclick', recordBookmarkHit)", self.source
+        )
