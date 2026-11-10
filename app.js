@@ -487,7 +487,7 @@ function groupDevicesByKind(devices) {
 function averageSample(devices, field) {
     const samples = devices
         .filter((d) => d.online && isNumericSample(d[field]))
-        .map((d) => d[field]);
+        .map((d) => clampPct(d[field]));
     if (!samples.length) return null;
     return samples.reduce((sum, value) => sum + value, 0) / samples.length;
 }

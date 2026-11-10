@@ -973,6 +973,18 @@ class NetworkCardTest(FrontEndSourceTest):
         self.assertIn("typeof value === 'number'", numeric)
         self.assertIn("Number.isFinite", numeric)
 
+    def test_averages_clamp_samples_like_the_metric_bars(self):
+        # The local cgroup CPU reading can exceed 100% on a multi-core host.
+        # Averages must clamp each sample just as the device bars do, or a
+        # kind chip can read "125% cpu".
+        body = function_body(self.js, "averageSample")
+
+        self.assertIn("clampPct(d[field])", body)
+        self.assertIn(
+            "Math.max(0, Math.min(100, value))",
+            function_body(self.js, "clampPct"),
+        )
+
     def test_kind_chips_show_count_and_online_numeric_averages(self):
         body = function_body(self.js, "kindChips")
         meta = function_body(self.js, "chipMeta")
