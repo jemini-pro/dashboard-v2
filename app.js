@@ -6,6 +6,14 @@ const WORK_END_HOUR = 17;
 const MOST_USED_MIN_SCORE = 0.5;
 const MOST_USED_LIMIT = 6;
 
+// Launchpad: items opt in with `pinned: true`; with none, these titles stand in.
+// Both paths stay in store order and cap at eight, so the tile count follows data.
+const PINNED_LIMIT = 8;
+const PINNED_FALLBACK_TITLES = [
+    'Gmail', 'Google Calendar', 'Google Sheets', 'GitHub',
+    'Slack', 'T3 Code', 'Proxmox', 'AWS'
+];
+
 const bookmarks = {
     work: [
         {
@@ -214,9 +222,41 @@ function renderAllTools(categories) {
     renderBookmarks(categories);
 }
 
-// Launchpad render hook. #43 fills this with the pinned tool tiles.
+// Launchpad selection. A store item opts in with `pinned: true`; only when
+// nothing opts in do the fallback titles stand in. Either way the store order
+// is preserved and the result is capped, independent of the embedded copy size.
+function selectLaunchpad(categories) {
+    const items = [];
+    (categories || []).forEach(cat => {
+        (cat.items || []).forEach(item => items.push(item));
+    });
+    const pinned = items.filter(item => item && item.pinned === true);
+    if (!pinned.length) {
+        return items
+            .filter(item => item && PINNED_FALLBACK_TITLES.includes(item.title))
+            .slice(0, PINNED_LIMIT);
+    }
+    return pinned.slice(0, PINNED_LIMIT);
+}
+
+// Launchpad render hook. Monogram icon plus a two-line label; the CSS clamps
+// the label. The title attribute keeps the description discoverable.
 function renderLaunchpad(categories) {
-    launchpadGridEl.innerHTML = '<div class="card-empty">Pinned tools appear here</div>';
+    const items = selectLaunchpad(categories);
+    launchpadGridEl.innerHTML = items.length
+        ? items.map(launchpadTile).join('')
+        : '<div class="card-empty">No pinned tools</div>';
+}
+
+function launchpadTile(item) {
+    const title = escapeHtml(item.title);
+    const desc = escapeHtml(item.desc || '');
+    return '<a class="launchpad-tile" href="' + escapeHtml(item.url) + '" ' +
+        'target="_blank" rel="noreferrer" title="' + title +
+        (desc ? ' — ' + desc : '') + '">' +
+        '<span class="launchpad-icon">' + monogram(item) + '</span>' +
+        '<span class="launchpad-tile-label">' + title + '</span>' +
+        '</a>';
 }
 
 function renderBookmarks(categories) {
@@ -276,6 +316,19 @@ bookmarksGridEl.addEventListener('click', recordBookmarkHit);
 bookmarksGridEl.addEventListener('auxclick', recordBookmarkHit);
 mostUsedEl.addEventListener('click', recordBookmarkHit);
 mostUsedEl.addEventListener('auxclick', recordBookmarkHit);
+
+// Launchpad tiles share the same beacon contract as bookmark cards.
+function recordLaunchpadHit(event) {
+    if (event.type === 'auxclick' && event.button !== 1) return;
+    const tile = event.target.closest('.launchpad-tile');
+    if (!tile) return;
+    const url = tile.getAttribute('href');
+    if (!url) return;
+    navigator.sendBeacon('/api/hit', JSON.stringify({ url }));
+}
+
+launchpadGridEl.addEventListener('click', recordLaunchpadHit);
+launchpadGridEl.addEventListener('auxclick', recordLaunchpadHit);
 
 // ---------- search ----------
 

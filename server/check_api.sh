@@ -207,6 +207,24 @@ with open(path, "w") as f:
 PY
 }
 
+pin_item() { # pin_item <url> - add "pinned": true to a fixture item
+    python3 - "$BOOKMARKS" "$1" <<'PY'
+import json, sys
+path, url = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    store = json.load(f)
+for category_list in store.values():
+    if not isinstance(category_list, list):
+        continue
+    for category in category_list:
+        for item in category.get("items", []):
+            if item.get("url") == url:
+                item["pinned"] = True
+with open(path, "w") as f:
+    json.dump(store, f)
+PY
+}
+
 rename_mail() {
     python3 - "$BOOKMARKS" "$W_MAIL" <<'PY'
 import json, sys
@@ -227,6 +245,13 @@ mkdir -p "$DATA_DIR"
 write_bookmarks
 start_server
 ok "server started on an ephemeral port with a throwaway DASH_DATA_DIR"
+
+# 0. The Launchpad is data-driven: a pinned flag passes through unchanged.
+pin_item "$W_MAIL"
+get_bookmarks
+[[ "$(json_item_field "$TMP/bookmarks.json" "$W_MAIL" pinned)" == "True" ]] \
+    || fail "a pinned flag did not survive /api/bookmarks"
+ok "/api/bookmarks passes a pinned flag through unchanged"
 
 # 1. POST /api/hit -> 204, no body, timestamp stored.
 code="$(post_hit "$W_MAIL")"
@@ -370,5 +395,10 @@ grep -Fq '/opt/stack/dash/data/hits.json' "$README" \
 grep -Fq 'server/check_api.sh' "$README" \
     || fail "README does not document this check"
 ok "compose paths are overridable, defaults match /opt/stack, and README documents both"
+
+# 11. README documents how an owner pins a Launchpad tool.
+grep -Fq '"pinned": true' "$README" \
+    || fail "README does not document the pinned bookmark flag"
+ok "README documents the pinned: true bookmark flag"
 
 echo "all $COUNT checks passed"
