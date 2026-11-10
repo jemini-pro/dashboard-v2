@@ -1,5 +1,10 @@
 const WORK_START_HOUR = 9;
 const WORK_END_HOUR = 17;
+// One fresh click scores 1.0 (a single exp(0) term), so any clicked link already
+// clears this 0.5 bar. The spec's "~3 clicks" wording describes typical use, not
+// a gate: the threshold and 14-day half-life are the actual rule.
+const MOST_USED_MIN_SCORE = 0.5;
+const MOST_USED_LIMIT = 6;
 
 const bookmarks = {
     work: [
@@ -87,6 +92,7 @@ const bookmarks = {
 const clockEl = document.getElementById('clock');
 const greetingEl = document.getElementById('greeting');
 const bookmarksGridEl = document.getElementById('bookmarks-grid');
+const mostUsedEl = document.getElementById('most-used');
 const debugTimeInput = document.getElementById('debug-time');
 const resetTimeBtn = document.getElementById('reset-time');
 const debugMenuBtn = document.getElementById('debug-menu-btn');
@@ -153,29 +159,86 @@ function updateDashboard() {
     }
 }
 
+function bookmarkCard(item) {
+    return `
+        <a href="${item.url}" class="bookmark-card" target="_blank">
+            <div class="bookmark-icon-text">${item.icon}</div>
+            <div class="bookmark-details">
+                <div class="bookmark-title">${item.title}</div>
+                <div class="bookmark-desc">${item.desc || ''}</div>
+            </div>
+        </a>
+    `;
+}
+
+// One section skeleton for both the bookmark categories and the Most used strip,
+// so the two grids can never drift apart in markup.
+function categorySection(title, items) {
+    return `
+        <div class="category-section">
+            <h2 class="category-title">${title}</h2>
+            <div class="items-grid">
+                ${items.map(item => bookmarkCard(item)).join('')}
+            </div>
+        </div>
+    `;
+}
+
 function renderBookmarks(categories) {
     // If the data is flat (old personal array structure fallback), wrap it
     if (categories.length > 0 && !categories[0].category) {
         categories = [{ category: 'Bookmarks', items: categories }];
     }
 
-    bookmarksGridEl.innerHTML = categories.map(cat => `
-        <div class="category-section">
-            <h2 class="category-title">${cat.category}</h2>
-            <div class="items-grid">
-                ${cat.items.map(item => `
-                    <a href="${item.url}" class="bookmark-card" target="_blank">
-                        <div class="bookmark-icon-text">${item.icon}</div>
-                        <div class="bookmark-details">
-                            <div class="bookmark-title">${item.title}</div>
-                            <div class="bookmark-desc">${item.desc || ''}</div>
-                        </div>
-                    </a>
-                `).join('')}
-            </div>
-        </div>
-    `).join('');
+    bookmarksGridEl.innerHTML = categories.map(
+        cat => categorySection(cat.category, cat.items)
+    ).join('');
 }
+
+// The Most used strip draws from the decayed `score` the server adds to each
+// item; the scoreless embedded copy used for the first paint never qualifies.
+// This picks copies for the strip and leaves the category order untouched.
+function selectMostUsed(categories) {
+    const scored = [];
+    (categories || []).forEach(cat => {
+        (cat.items || []).forEach(item => {
+            const score = Number(item.score) || 0;
+            if (score > MOST_USED_MIN_SCORE) scored.push({ item, score });
+        });
+    });
+    return scored
+        .sort((a, b) => b.score - a.score)
+        .slice(0, MOST_USED_LIMIT)
+        .map(entry => entry.item);
+}
+
+function renderMostUsed(categories) {
+    const items = selectMostUsed(categories);
+    if (!items.length) {
+        mostUsedEl.hidden = true;
+        mostUsedEl.innerHTML = '';
+        return;
+    }
+    mostUsedEl.innerHTML = categorySection('Most used', items);
+    mostUsedEl.hidden = false;
+}
+
+// Record bookmark activation server-side. sendBeacon survives the navigation
+// that a plain fetch would cancel; auxclick covers middle-click, while plain
+// and ctrl/cmd clicks arrive as click.
+function recordBookmarkHit(event) {
+    if (event.type === 'auxclick' && event.button !== 1) return;
+    const card = event.target.closest('.bookmark-card');
+    if (!card) return;
+    const url = card.getAttribute('href');
+    if (!url) return;
+    navigator.sendBeacon('/api/hit', JSON.stringify({ url }));
+}
+
+bookmarksGridEl.addEventListener('click', recordBookmarkHit);
+bookmarksGridEl.addEventListener('auxclick', recordBookmarkHit);
+mostUsedEl.addEventListener('click', recordBookmarkHit);
+mostUsedEl.addEventListener('auxclick', recordBookmarkHit);
 
 // Debug Controls
 debugTimeInput.addEventListener('change', (e) => {
@@ -208,7 +271,10 @@ async function loadBookmarks() {
         const res = await fetch('/api/bookmarks', { cache: 'no-store' });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
-        if (data && Array.isArray(data.work) && data.work.length) renderBookmarks(data.work);
+        if (data && Array.isArray(data.work) && data.work.length) {
+            renderBookmarks(data.work);
+            renderMostUsed(data.work);
+        }
     } catch (e) {
         console.warn('bookmark store unreachable, keeping the embedded copy', e);
     }

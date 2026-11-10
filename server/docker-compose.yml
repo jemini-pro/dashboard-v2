@@ -1,0 +1,42 @@
+name: stack
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "8448:8448"
+    volumes:
+      # Defaults are the live /opt/stack layout. Running from this repo
+      # (server/) overrides CADDYFILE=./Caddyfile.
+      - ${CADDYFILE:-./caddy/Caddyfile}:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - dash
+
+  # The dashboard: static page, bookmark store and device stats API.
+  # Stdlib Python, no pip, no build step.
+  dash:
+    image: python:3.13-alpine
+    container_name: dash
+    restart: unless-stopped
+    working_dir: /app
+    command: ["python", "-u", "app.py"]
+    # Read the LXC's cgroup, not this container's: the card should describe
+    # the box, not one 12 MB process inside it.
+    cgroup: host
+    env_file:
+      # Live: /opt/stack/dash/.env. Repo: DASH_ENV_FILE=./.env from server/.
+      - ${DASH_ENV_FILE:-./dash/.env}
+    volumes:
+      # The whole dashboard directory is bind-mounted. In the live stack the
+      # host side is /opt/stack/dash, so data/ (bookmarks.json, hits.json,
+      # agents.json) lives at /opt/stack/dash/data/ and survives recreating
+      # this container. Repo: DASH_DIR=. from server/ (with static/ copied in).
+      - ${DASH_DIR:-./dash}:/app
+
+volumes:
+  caddy_data:
+  caddy_config:
