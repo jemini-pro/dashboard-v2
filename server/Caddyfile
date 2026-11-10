@@ -1,0 +1,14 @@
+# One entry point on 8448. TLS is terminated by Tailscale on the host.
+:8448 {
+	encode zstd gzip
+
+	# The dashboard owns the root, including /api/*.
+	handle {
+		reverse_proxy dash:8000
+	}
+
+	# Homepage, parked but reachable if wanted back at /homepage/.
+	# handle_path /homepage/* {
+	# 	reverse_proxy homepage:3000
+	# }
+}

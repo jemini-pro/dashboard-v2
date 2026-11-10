@@ -1,0 +1,35 @@
+name: stack
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "8448:8448"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - dash
+
+  # The dashboard: static page, bookmark store and device stats API.
+  # Stdlib Python, no pip, no build step.
+  dash:
+    image: python:3.13-alpine
+    container_name: dash
+    restart: unless-stopped
+    working_dir: /app
+    command: ["python", "-u", "app.py"]
+    # Read the LXC's cgroup, not this container's: the card should describe
+    # the box, not one 12 MB process inside it.
+    cgroup: host
+    env_file:
+      - ./dash/.env
+    volumes:
+      - ./dash:/app
+
+volumes:
+  caddy_data:
+  caddy_config:
