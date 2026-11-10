@@ -3,6 +3,10 @@
 The front end in the repo root is static. This directory is the runtime that serves it:
 a stdlib Python API, a Caddy entry point, and one-shot agents that push device metrics.
 
+The UI is the **Workbench** layout: a dense one-screen command centre made of a toolbar,
+a main column (Jump back in, Launchpad, All tools) and a Network rail. There is no
+`prototype/` directory and no `?variant=` switcher — the Workbench is the only layout.
+
 ## Layout
 
 | Path | What |
@@ -34,15 +38,46 @@ Reads are open on the tailnet. Only pushes are authenticated — a leaked token 
 a metric, nothing more. `/api/hit` accepts any non-empty URL string, including one no
 longer in the store; missing, non-string and empty/whitespace values get a 4xx.
 
-## Most used strip
+## Workbench UI
+
+The page never scrolls; the body grid, All tools list and Network rail own their own
+overflow. At the target desktop sizes every core section fits in one screen.
+
+| Region | Contents |
+|---|---|
+| Toolbar | date, live clock, `Search all tools…` field, health dot + `n/m online` |
+| Jump back in | most-used rows from the scored API payload, with a normalised bar |
+| Launchpad | pinned tool tiles (monogram + two-line label) |
+| All tools | every category in store order, numbered rows, live search count |
+| Network | `n/m online · x% avg CPU`, kind-average chips, compact device rows |
+
+- Search filters title, description and category case-insensitively, shows `x of N tools`
+  and names the query when nothing matches. `/` focuses the field; `Esc` clears and blurs.
+- Health is amber when any device is offline and green only when all are. Device status is
+  carried by a dot **and** text, never colour alone.
+- Icons are monograms only: no emoji and no runtime third-party icon requests.
+- A failed stats poll keeps the last good reading and shows the `stale` label.
+- The work/personal theme (09:00–17:00) and the debug time control still apply.
+
+Responsive rules:
+
+- `≥1181px`: two-column body; the rail is `clamp(320px, 25vw, 390px)` wide.
+- `901–1180px`: one-column body; Network sits below the main column in one rail column.
+- `≤900px`: Launchpad stacks under Jump back in; All tools uses two columns.
+- `≤600px`: All tools uses one column; the Launchpad auto-fits four tiles per row.
+- `≤850px` height: tighter shell/card padding, a shorter usage list and tighter device rows
+  so **1280×800** still fits without page scroll.
+
+## Jump back in (click scores)
 
 Click history is keyed by URL in `data/hits.json`. The server scores **every URL in the
 store**: `score = sum(exp(-age_days / 14))`, rounded to 2 dp, with hits older than 90 days
 trimmed. `/api/bookmarks` stamps that score on every item it returns.
 
-The browser strip is narrower than the scoring: `selectMostUsed()` only looks at the
-rendered `work` list, keeps items scoring above `0.5`, and shows at most six. A click on
-a personal link is still recorded and scored, but can never appear in the strip.
+The browser card is narrower than the scoring: `selectMostUsed()` only looks at the
+rendered `work` list, keeps items scoring above `0.5`, and shows at most six in descending
+order. A click on a personal link is still recorded and scored, but can never appear in the
+card. The card stays visible with a quiet `No usage yet` row when nothing qualifies.
 
 One fresh click scores `1.0` (a single `exp(0)` term), so a single click already clears the
 `0.5` threshold; the spec's "~3 clicks" wording describes typical use, not a gating rule.
@@ -115,6 +150,39 @@ cd /path/to/dashboard-v2
 env -u DASH_TOKEN python3 server/app.py
 ```
 
+## Workbench checks
+
+Run the stdlib suite (API plus source-level front-end assertions) and the black-box API
+check:
+
+```bash
+python3 -m unittest discover -s server -p 'test_*.py' -v
+server/check_api.sh
+```
+
+For the layout, copy the three front-end files into `server/static/` and open the app:
+
+```bash
+mkdir -p server/static
+cp index.html app.js style.css server/static/
+env -u DASH_TOKEN DASH_PORT=8080 DASH_DATA_DIR=/tmp/dash-data python3 server/app.py
+```
+
+Then verify in a browser:
+
+- `1440×900` and `1280×800`: `document.documentElement.scrollHeight <= window.innerHeight`
+  — every core section and device row visible without page scroll.
+- `390×844`: usable phone layout; the body grid scrolls internally, Launchpad shows four
+  tiles per row and All tools is one column.
+- Breakpoints: two body columns at `≥1181px`; one column with Network below main at
+  `901–1180px`; stacked Launchpad and two list columns at `≤900px`; one list column at
+  `≤600px`; tighter shell/card padding and device rows at `≤850px` height.
+- Click a bookmark, a Launchpad tile and a Jump back in row; each sends `POST /api/hit`
+  via `sendBeacon`, and the score rises after a reload.
+
+Automated screenshots are captured when a headless browser is available; otherwise the
+viewport items above are the remaining manual checks.
+
 ## Manual check
 
 With `DASH_TOKEN` unset, the API listens on `:8000` and `/api/hit` is open. Point
@@ -152,7 +220,8 @@ It asserts: `POST /api/hit` → `204` with no body; the score appears in
 hits older than 90 days are trimmed on write; an unknown URL is accepted; a title rename
 keeps the score; `/api/bookmarks` stays under ~10 KB for the current 31 links; hits
 survive a full process restart; and the click feature sets no cookie and makes no
-third-party request. It also guards the compose/README path documentation below.
+third-party request. It also guards the compose/README path documentation below and the
+Workbench UI, breakpoint and check documentation above.
 
 ## Click-history durability
 

@@ -768,6 +768,84 @@ class AllToolsTest(FrontEndSourceTest):
         self.assertNotIn("fetch('/api/hit'", handler)
 
 
+class WorkbenchResponsiveTest(FrontEndSourceTest):
+    """Ticket #46: acceptance breakpoints, one-screen fit and cleanup.
+
+    The shell is static CSS; there is no layout engine here. These pin the
+    media-query contract, while the browser pass measured 1280x800,
+    1440x900 and 390x844 against the real app.
+    """
+
+    def media_block(self, condition):
+        marker = "@media " + condition
+        start = self.css.index(marker)
+        depth = 0
+        for offset, char in enumerate(self.css[start:], start):
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return self.css[start:offset + 1]
+        raise AssertionError("unbalanced media block for " + condition)
+
+    def test_below_1181_the_body_is_one_column_and_sized_to_its_content(self):
+        block = self.media_block("(max-width: 1180px)")
+
+        self.assertRegex(
+            block,
+            r"\.body-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)",
+        )
+        # The grid becomes the scroll container, so its rows must size to the
+        # content. Stretching them squeezes All tools to zero height and lets
+        # the rail overlap the main column at phone widths.
+        self.assertRegex(block, r"\.body-grid\s*\{[^}]*grid-auto-rows:\s*max-content")
+        # Agenda is dropped, so Network sits below the whole main column in a
+        # single column rather than occupying half of a two-column rail.
+        self.assertRegex(
+            block,
+            r"\.rail\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)",
+        )
+
+    def test_tablets_stack_the_launchpad_and_use_two_list_columns(self):
+        block = self.media_block("(max-width: 900px)")
+
+        self.assertRegex(block, r"\.top-row\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)")
+        self.assertRegex(block, r"\.bookmarks-grid\s*\{[^}]*columns:\s*2\b")
+
+    def test_phones_use_one_list_column_and_four_launchpad_tiles_per_row(self):
+        block = self.media_block("(max-width: 600px)")
+
+        self.assertRegex(block, r"\.bookmarks-grid\s*\{[^}]*columns:\s*1\b")
+        # auto-fit + a quarter-width minimum (minus the three 8px gaps) fits
+        # exactly four tiles per row at any phone width, while collapsing empty
+        # tracks when fewer than four tools are pinned.
+        self.assertRegex(
+            block,
+            r"\.launchpad-grid\s*\{[^}]*repeat\(auto-fit,\s*"
+            r"minmax\(calc\(25%\s*-\s*6px\),\s*1fr\)\)",
+        )
+
+    def test_short_viewports_tighten_the_shell_cards_and_device_rows(self):
+        block = self.media_block("(max-height: 850px)")
+
+        self.assertRegex(block, r"\.workbench\s*\{[^}]*padding:\s*14px")
+        self.assertRegex(block, r"\.card,\s*\.network-panel\s*\{[^}]*padding:\s*12px 14px")
+        self.assertRegex(block, r"\.device-row\s*\{[^}]*padding:\s*3px 0")
+        self.assertRegex(block, r"\.usage-list\s*\{[^}]*max-height:\s*150px")
+
+    def test_no_prototype_directory_or_variant_switcher_remains(self):
+        root = APP_JS.parent
+        self.assertFalse((root / "prototype").exists(), "prototype/ is still present")
+
+        for name in ("app.js", "index.html", "style.css"):
+            text = (root / name).read_text()
+            with self.subTest(file=name):
+                self.assertNotIn("?variant", text)
+                self.assertNotIn("variant=", text)
+                self.assertNotIn("proto-bar", text)
+
+
 class NetworkCardTest(FrontEndSourceTest):
     """Ticket #45: kind averages, compact device rows and in-place polling.
 
