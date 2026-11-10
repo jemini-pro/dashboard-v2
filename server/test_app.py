@@ -205,6 +205,25 @@ class HitEndpointTest(ApiTestCase):
         self.assertEqual(item["title"], "Mail")
         self.assertEqual(item["score"], 1.0)
 
+    def test_bookmarks_preserve_a_pinned_flag_on_items(self):
+        """The Launchpad is data-driven: /api/bookmarks passes `pinned` through."""
+        self.write_bookmarks({"work": [{
+            "category": "Pinned",
+            "items": [
+                {"title": "Gmail", "desc": "Email", "icon": "M",
+                 "url": "https://mail.example.com", "pinned": True},
+                {"title": "Docs", "desc": "Docs", "icon": "D",
+                 "url": "https://docs.example.com"},
+            ],
+        }]})
+
+        _, data = self.get_json("/api/bookmarks")
+
+        items = {item["title"]: item for item in data["work"][0]["items"]}
+        self.assertIs(items["Gmail"]["pinned"], True)
+        self.assertNotIn("pinned", items["Docs"])
+        self.assertIn("score", items["Gmail"])
+
     def test_missing_bookmark_store_degrades_gracefully(self):
         (self.data / "bookmarks.json").unlink()
 
@@ -370,6 +389,86 @@ class MostUsedCardTest(FrontEndSourceTest):
             self.css,
             r"\.usage-bar > span\s*\{[^}]*background:\s*var\(--accent-color\)",
         )
+
+
+class LaunchpadSourceTest(FrontEndSourceTest):
+    """Ticket #43: pinned Launchpad selection, tiles and beacon delegation."""
+
+    def test_pinned_items_keep_store_order_and_cap_at_eight(self):
+        self.assertRegex(self.js, r"PINNED_LIMIT\s*=\s*8\b")
+        body = function_body(self.js, "selectLaunchpad")
+
+        self.assertIn("pinned === true", body)
+        self.assertIn("slice(0, PINNED_LIMIT)", body)
+        # The count follows the store; never assume the embedded 24-link copy.
+        self.assertNotIn("24", body)
+
+    def test_no_pinned_items_fall_back_to_the_named_titles(self):
+        fallback = re.search(r"PINNED_FALLBACK_TITLES\s*=\s*\[(.*?)\]", self.js, re.S)
+        self.assertIsNotNone(fallback, "PINNED_FALLBACK_TITLES not found")
+        titles = re.findall(r"'([^']+)'", fallback.group(1))
+        self.assertEqual(titles, [
+            "Gmail", "Google Calendar", "Google Sheets", "GitHub",
+            "Slack", "T3 Code", "Proxmox", "AWS",
+        ])
+
+        body = function_body(self.js, "selectLaunchpad")
+        # Fallback applies only when nothing opted in. Missing titles are simply
+        # absent from the filter result, so they are skipped without errors.
+        self.assertIn("if (!pinned.length)", body)
+        self.assertIn("PINNED_FALLBACK_TITLES.includes(item.title)", body)
+        self.assertIn("slice(0, PINNED_LIMIT)", body)
+
+    def test_tiles_use_monogram_and_a_two_line_label_and_open_a_new_tab(self):
+        render = function_body(self.js, "renderLaunchpad")
+        tile = function_body(self.js, "launchpadTile")
+
+        self.assertIn("selectLaunchpad(categories)", render)
+        self.assertIn(".map(launchpadTile)", render)
+        self.assertIn('class="launchpad-tile"', tile)
+        self.assertIn("monogram(item)", tile)
+        self.assertIn('class="launchpad-tile-label"', tile)
+        self.assertIn('target="_blank"', tile)
+        self.assertIn('rel="noreferrer"', tile)
+
+        self.assertRegex(
+            self.css,
+            r"\.launchpad-tile-label\s*\{[^}]*-webkit-line-clamp:\s*2",
+        )
+
+    def test_tile_count_follows_the_store_not_the_embedded_copy(self):
+        render = function_body(self.js, "renderLaunchpad")
+        select = function_body(self.js, "selectLaunchpad")
+
+        self.assertIn("items.map(launchpadTile)", render)
+        self.assertNotIn("24", render + select)
+        self.assertNotIn("bookmarks.work", render + select)
+
+        # The embedded copy paints the fallback first; the API response then
+        # re-renders from whatever the store actually pins.
+        self.assertIn(
+            "renderLaunchpad(bookmarkStore)", function_body(self.js, "updateDashboard")
+        )
+        load = function_body(self.js, "loadBookmarks")
+        self.assertIn("bookmarkStore = data.work", load)
+        self.assertIn("renderLaunchpad(bookmarkStore)", load)
+
+    def test_click_and_auxclick_delegate_to_sendbeacon_without_fetch(self):
+        body = function_body(self.js, "recordLaunchpadHit")
+
+        self.assertIn("closest('.launchpad-tile')", body)
+        self.assertIn(
+            "navigator.sendBeacon('/api/hit', JSON.stringify({ url }))", body
+        )
+        self.assertIn("event.type === 'auxclick' && event.button !== 1", body)
+
+        self.assertIn(
+            "launchpadGridEl.addEventListener('click', recordLaunchpadHit)", self.js
+        )
+        self.assertIn(
+            "launchpadGridEl.addEventListener('auxclick', recordLaunchpadHit)", self.js
+        )
+        self.assertNotIn("fetch('/api/hit'", self.js)
 
 
 class FrontEndWiringTest(FrontEndSourceTest):
