@@ -518,10 +518,24 @@ body {
 
 .network-header {
     display: flex;
-    align-items: baseline;
+    align-items: flex-start;
     justify-content: space-between;
     gap: 12px;
     margin-bottom: 8px;
+}
+
+.network-summary {
+    font-size: 0.68rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.network-status {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex: none;
 }
 
 .network-updated {
@@ -531,37 +545,133 @@ body {
     white-space: nowrap;
 }
 
+/* A failed poll keeps the last good numbers and marks them stale. */
+.network-stale {
+    font-size: 0.55rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #ed8936;
+}
+
+.network-stale[hidden] {
+    display: none;
+}
+
+.kind-chips {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 7px;
+    margin: 10px 0 8px;
+}
+
+.kind-chip {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 1px 8px;
+    padding: 7px 9px;
+    border-radius: 10px;
+    background: var(--icon-bg);
+}
+
+.kind-name {
+    font-size: 0.55rem;
+    font-weight: 600;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.kind-count {
+    font-size: 0.68rem;
+    font-weight: 600;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+.kind-meta {
+    grid-column: 1 / -1;
+    font-size: 0.55rem;
+    color: var(--faint);
+    font-variant-numeric: tabular-nums;
+}
+
 .device-grid {
     display: grid;
     grid-template-columns: 1fr;
-    gap: 6px;
+    gap: 0;
 }
 
-.device-card {
-    background: var(--icon-bg);
-    border-radius: 12px;
-    padding: 8px 9px;
+.device-grid.is-stale {
+    opacity: 0.78;
 }
 
-.device-card.offline {
-    opacity: 0.5;
+.device-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) repeat(3, 46px);
+    align-items: center;
+    gap: 8px;
+    padding: 5px 0;
 }
 
-.device-head {
+.device-row + .device-row {
+    border-top: 1px solid var(--sidebar-border);
+}
+
+/* Offline rows dim but keep their numbers and last-seen time readable. */
+.device-row.offline {
+    opacity: 0.48;
+}
+
+.device-id {
     display: flex;
     align-items: center;
-    gap: 0.45rem;
-    margin-bottom: 0.45rem;
+    gap: 7px;
     min-width: 0;
+}
+
+.device-text {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+}
+
+.device-name {
+    font-size: 0.76rem;
+    font-weight: 600;
+    line-height: 1.2;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.device-sub {
+    font-size: 0.52rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--faint);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .device-dot {
     width: 7px;
     height: 7px;
     border-radius: 50%;
-    background: #48bb78;
-    box-shadow: 0 0 8px rgba(72, 187, 120, 0.7);
+    background: #a0aec0;
+    opacity: 0.7;
     flex: none;
+}
+
+.device-dot.online {
+    background: #48bb78;
+    opacity: 1;
+    box-shadow: 0 0 8px rgba(72, 187, 120, 0.65);
 }
 
 .device-dot.offline {
@@ -569,78 +679,56 @@ body {
     box-shadow: none;
 }
 
-.device-name {
-    font-weight: 600;
-    font-size: 0.8rem;
-    letter-spacing: -0.01em;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+.device-error {
+    font-size: 0.56rem;
+    color: #e53e3e;
+    line-height: 1.25;
+    word-break: break-word;
 }
 
-.device-kind {
-    margin-left: auto;
-    font-size: 0.55rem;
-    color: var(--muted);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    white-space: nowrap;
+.device-error[hidden] {
+    display: none;
 }
 
-.metric-row {
+.metric {
     display: grid;
-    grid-template-columns: 2rem 3.1rem 1fr;
-    align-items: center;
-    gap: 0.3rem;
-    margin-bottom: 0.25rem;
+    justify-items: end;
+    gap: 2px;
 }
 
-.metric-row .metric-label {
-    font-size: 0.6rem;
-    color: var(--muted);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
+.metric-label {
+    font-size: 0.53rem;
+    letter-spacing: 0.08em;
+    color: var(--faint);
 }
 
 .metric-value {
-    font-size: 0.66rem;
+    font-size: 0.68rem;
     font-variant-numeric: tabular-nums;
 }
 
 .metric-bar {
+    width: 100%;
     height: 3px;
     border-radius: 999px;
-    background: var(--card-border);
+    background: var(--icon-bg);
     overflow: hidden;
 }
 
 .metric-fill {
+    display: block;
     height: 100%;
-    border-radius: 999px;
+    border-radius: inherit;
     background: var(--accent-color);
     transition: width 0.5s ease;
 }
 
-.metric-extra {
-    grid-column: 1 / -1;
-    font-size: 0.58rem;
-    color: var(--muted);
-    margin: -0.1rem 0 0.1rem;
-    font-variant-numeric: tabular-nums;
+.metric.is-warn .metric-value {
+    color: #ed8936;
 }
 
-.device-foot {
-    font-size: 0.6rem;
-    color: var(--muted);
-    margin-top: 0.25rem;
-    font-variant-numeric: tabular-nums;
-}
-
-.device-error {
-    font-size: 0.6rem;
-    color: #e53e3e;
-    margin-bottom: 0.35rem;
-    word-break: break-word;
+.metric.is-warn .metric-fill {
+    background: #ed8936;
 }
 
 .device-empty {
@@ -778,6 +866,15 @@ input:focus-visible {
 
     .most-used {
         max-height: 150px;
+    }
+
+    /* 1280×800 must fit every device row without page scroll. */
+    .device-row {
+        padding: 3px 0;
+    }
+
+    .kind-chip {
+        padding: 6px 8px;
     }
 }
 

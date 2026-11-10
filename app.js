@@ -6,6 +6,12 @@ const WORK_END_HOUR = 17;
 const MOST_USED_MIN_SCORE = 0.5;
 const MOST_USED_LIMIT = 6;
 
+// Network metrics turn amber at this percentage. Status is carried by the
+// number as well as the colour, so the value is never colour-only.
+const METRIC_WARN_PCT = 80;
+const KIND_LABELS = { host: 'Hosts', lxc: 'LXC', 'lxc-guest': 'LXC guests', pc: 'PC', mac: 'Mac' };
+const KIND_ORDER = ['host', 'lxc', 'lxc-guest', 'pc', 'mac'];
+
 const bookmarks = {
     work: [
         {
@@ -98,7 +104,10 @@ const bookmarksGridEl = document.getElementById('bookmarks-grid');
 const mostUsedEl = document.getElementById('most-used');
 const launchpadGridEl = document.getElementById('launchpad-grid');
 const deviceGridEl = document.getElementById('device-grid');
+const kindChipsEl = document.getElementById('kind-chips');
+const networkSummaryEl = document.getElementById('network-summary');
 const networkUpdatedEl = document.getElementById('network-updated');
+const networkStaleEl = document.getElementById('network-stale');
 const debugTimeInput = document.getElementById('debug-time');
 const resetTimeBtn = document.getElementById('reset-time');
 const debugMenuBtn = document.getElementById('debug-menu-btn');
@@ -110,6 +119,10 @@ let bookmarksRendered = false;
 // Embedded copy paints first; /api/bookmarks replaces it when the server is up.
 let bookmarkStore = bookmarks.work;
 let networkDevices = [];
+// Keyed by device identity so a poll can patch existing rows, and null until
+// the first successful payload so the initial "Loading devices…" is replaced.
+let networkDeviceKey = null;
+let networkUpdatedAt = null;
 let searchQuery = '';
 
 // Debug Menu Toggle
@@ -375,39 +388,202 @@ function fmtAgo(ts) {
     return Math.floor(s / 3600) + 'h ago';
 }
 
-function metricRow(label, pct, extra) {
-    const v = (pct === null || pct === undefined) ? null : Math.max(0, Math.min(100, pct));
-    return '<div class="metric-row">' +
+// ---------- Network card ----------
+
+function isNumericSample(value) {
+    return typeof value === 'number' && Number.isFinite(value);
+}
+
+// Metric values are clamped to 0-100 for the bar; a missing sample stays null
+// so it can render as an em dash instead of a false zero.
+function clampPct(value) {
+    if (!isNumericSample(value)) return null;
+    return Math.max(0, Math.min(100, value));
+}
+
+// Known kinds get their proper plural label; anything else is made readable
+// ("nas-box" -> "Nas box") instead of leaking a raw slug into the UI.
+function kindLabel(kind) {
+    if (KIND_LABELS[kind]) return KIND_LABELS[kind];
+    const text = String(kind || '').replace(/[-_]+/g, ' ').trim();
+    if (!text) return 'Other';
+    return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+function kindRank(kind) {
+    const index = KIND_ORDER.indexOf(kind);
+    return index === -1 ? KIND_ORDER.length : index;
+}
+
+function groupDevicesByKind(devices) {
+    const groups = {};
+    devices.forEach((d) => {
+        const key = d.kind || 'other';
+        if (!groups[key]) groups[key] = [];
+        groups[key].push(d);
+    });
+    return groups;
+}
+
+// Kind and summary averages include online devices with a real numeric sample
+// only; offline readings and nulls never drag the average toward zero.
+function averageSample(devices, field) {
+    const samples = devices
+        .filter((d) => d.online && isNumericSample(d[field]))
+        .map((d) => d[field]);
+    if (!samples.length) return null;
+    return samples.reduce((sum, value) => sum + value, 0) / samples.length;
+}
+
+function avgText(value) {
+    return value === null ? '—' : Math.round(value) + '%';
+}
+
+function networkSummary(devices) {
+    const total = devices.length;
+    if (!total) return 'no device data';
+    const online = devices.filter((d) => d.online).length;
+    const cpu = averageSample(devices, 'cpu_pct');
+    return online + '/' + total + ' online · ' +
+        (cpu === null ? '—' : Math.round(cpu) + '% avg CPU');
+}
+
+function kindChips(devices) {
+    const groups = groupDevicesByKind(devices);
+    return Object.keys(groups)
+        .sort((a, b) => kindRank(a) - kindRank(b))
+        .map((key) => {
+            const group = groups[key];
+            return '<div class="kind-chip" data-kind="' + escapeHtml(key) + '">' +
+                '<span class="kind-name">' + escapeHtml(kindLabel(key)) + '</span>' +
+                '<span class="kind-count">' + group.length + '</span>' +
+                '<span class="kind-meta">' + avgText(averageSample(group, 'cpu_pct')) + ' cpu · ' +
+                avgText(averageSample(group, 'mem_pct')) + ' ram</span>' +
+                '</div>';
+        })
+        .join('');
+}
+
+function updatedLabel(timestamp) {
+    if (!timestamp) return '';
+    return 'updated ' + new Date(timestamp * 1000).toLocaleTimeString([], {
+        hour: '2-digit', minute: '2-digit'
+    });
+}
+
+function metricCell(label, key, raw) {
+    const value = clampPct(raw);
+    const warn = value !== null && value >= METRIC_WARN_PCT ? ' is-warn' : '';
+    return '<span class="metric' + warn + '" data-metric="' + key + '">' +
         '<span class="metric-label">' + label + '</span>' +
-        '<span class="metric-value">' + (v === null ? '—' : v.toFixed(1) + '%') + '</span>' +
-        '<div class="metric-bar"><div class="metric-fill" style="width:' + (v === null ? 0 : v) + '%"></div></div>' +
-        '<span class="metric-extra">' + (extra || '') + '</span>' +
-        '</div>';
+        '<span class="metric-value">' + (value === null ? '—' : Math.round(value) + '%') + '</span>' +
+        '<span class="metric-bar"><i class="metric-fill" style="width:' + (value === null ? 0 : value) + '%"></i></span>' +
+        '</span>';
 }
 
-function deviceCard(d) {
-    const state = d.online ? 'online' : 'offline';
-    const sub = (d.source === 'agent' && d.last_seen) ? fmtAgo(d.last_seen) : (d.kind || '');
-    return '<div class="device-card ' + state + '">' +
-        '<div class="device-head">' +
-        '<span class="device-dot ' + state + '"></span>' +
+// Online rows read "kind · up 3d 4h"; offline rows keep their last-seen time
+// so a missing heartbeat is legible without opening anything.
+function deviceSub(d) {
+    if (!d.online) {
+        return d.last_seen ? fmtAgo(d.last_seen) : kindLabel(d.kind);
+    }
+    const kind = kindLabel(d.kind);
+    return d.uptime_s === null || d.uptime_s === undefined
+        ? kind
+        : kind + ' · up ' + fmtUptime(d.uptime_s);
+}
+
+function deviceRow(d) {
+    const online = !!d.online;
+    const state = online ? 'online' : 'offline';
+    return '<div class="device-row ' + state + '" data-device-id="' + escapeHtml(d.id || d.name) + '">' +
+        '<div class="device-id">' +
+        '<span class="device-dot ' + state + '" aria-hidden="true"></span>' +
+        '<span class="device-text">' +
         '<span class="device-name">' + escapeHtml(d.name) + '</span>' +
-        '<span class="device-kind">' + escapeHtml(sub) + '</span>' +
+        '<span class="device-sub">' + escapeHtml(deviceSub(d)) + '</span>' +
+        '<span class="device-error"' + (d.error ? '' : ' hidden') + '>' + escapeHtml(d.error || '') + '</span>' +
+        '</span>' +
         '</div>' +
-        (d.error ? '<div class="device-error">' + escapeHtml(d.error) + '</div>' : '') +
-        metricRow('CPU', d.cpu_pct) +
-        metricRow('RAM', d.mem_pct, d.mem_total ? fmtBytes(d.mem_used) + ' / ' + fmtBytes(d.mem_total) : '') +
-        ((d.disk_pct === null || d.disk_pct === undefined) ? '' : metricRow('Disk', d.disk_pct)) +
-        '<div class="device-foot">up ' + fmtUptime(d.uptime_s) + '</div>' +
+        metricCell('CPU', 'cpu', d.cpu_pct) +
+        metricCell('RAM', 'ram', d.mem_pct) +
+        metricCell('DSK', 'disk', d.disk_pct) +
         '</div>';
 }
 
-// Network render hook. #45 replaces the device cards with kind averages and
-// compact rows.
+function sortNetworkDevices(devices) {
+    return devices.slice().sort((a, b) =>
+        kindRank(a.kind) - kindRank(b.kind) ||
+        String(a.name || '').localeCompare(String(b.name || ''))
+    );
+}
+
+// Full render happens once and whenever the device set itself changes.
 function renderNetwork(devices) {
+    networkDeviceKey = networkKey(devices);
+    kindChipsEl.innerHTML = kindChips(devices);
     deviceGridEl.innerHTML = devices.length
-        ? devices.map(deviceCard).join('')
+        ? devices.map(deviceRow).join('')
         : '<div class="device-empty">No devices reporting</div>';
+    networkSummaryEl.textContent = networkSummary(devices);
+}
+
+function networkKey(devices) {
+    return devices.map((d) => (d.id || d.name) + ':' + (d.kind || '')).join('|');
+}
+
+function patchMetric(cell, raw) {
+    if (!cell) return;
+    const value = clampPct(raw);
+    cell.classList.toggle('is-warn', value !== null && value >= METRIC_WARN_PCT);
+    cell.querySelector('.metric-value').textContent = value === null ? '—' : Math.round(value) + '%';
+    cell.querySelector('.metric-fill').style.width = (value === null ? 0 : value) + '%';
+}
+
+// The 10s poll changes values, not structure: existing device rows and kind
+// chips keep their elements so bars animate and nothing flickers.
+function patchNetwork(devices) {
+    networkSummaryEl.textContent = networkSummary(devices);
+
+    const rows = deviceGridEl.querySelectorAll('.device-row');
+    rows.forEach((row, index) => {
+        const d = devices[index];
+        if (!d) return;
+        const online = !!d.online;
+        row.classList.toggle('online', online);
+        row.classList.toggle('offline', !online);
+        row.querySelector('.device-dot').className = 'device-dot ' + (online ? 'online' : 'offline');
+        row.querySelector('.device-name').textContent = d.name;
+        row.querySelector('.device-sub').textContent = deviceSub(d);
+        const errorEl = row.querySelector('.device-error');
+        errorEl.textContent = d.error || '';
+        errorEl.hidden = !d.error;
+        patchMetric(row.querySelector('[data-metric="cpu"]'), d.cpu_pct);
+        patchMetric(row.querySelector('[data-metric="ram"]'), d.mem_pct);
+        patchMetric(row.querySelector('[data-metric="disk"]'), d.disk_pct);
+    });
+
+    const groups = groupDevicesByKind(devices);
+    kindChipsEl.querySelectorAll('.kind-chip').forEach((chip) => {
+        const group = groups[chip.getAttribute('data-kind')] || [];
+        chip.querySelector('.kind-count').textContent = String(group.length);
+        chip.querySelector('.kind-meta').textContent =
+            avgText(averageSample(group, 'cpu_pct')) + ' cpu · ' +
+            avgText(averageSample(group, 'mem_pct')) + ' ram';
+    });
+}
+
+function applyNetworkDevices(devices) {
+    if (networkKey(devices) !== networkDeviceKey) {
+        renderNetwork(devices);
+        return;
+    }
+    patchNetwork(devices);
+}
+
+function setNetworkStale(stale) {
+    networkStaleEl.hidden = !stale;
+    deviceGridEl.classList.toggle('is-stale', stale);
 }
 
 // Health is the toolbar's dot plus "n/m online". Amber whenever anything is
@@ -425,16 +601,17 @@ async function refreshDevices() {
         const res = await fetch('/api/stats', { cache: 'no-store' });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
-        const order = { host: 0, lxc: 1, 'lxc-guest': 2, pc: 3, mac: 4 };
-        networkDevices = (data.devices || []).slice()
-            .sort((a, b) => (order[a.kind] === undefined ? 9 : order[a.kind]) - (order[b.kind] === undefined ? 9 : order[b.kind]));
-        networkUpdatedEl.textContent = 'updated ' + new Date(data.generated * 1000).toLocaleTimeString();
-        renderNetwork(networkDevices);
+        networkDevices = sortNetworkDevices(data.devices || []);
+        networkUpdatedAt = data.generated || Math.floor(Date.now() / 1000);
+        networkUpdatedEl.textContent = updatedLabel(networkUpdatedAt);
+        setNetworkStale(false);
+        applyNetworkDevices(networkDevices);
         renderHealth(networkDevices);
     } catch (e) {
-        // Keep the last good reading: a failed poll must not erase the panel or
-        // report a false all-clear. #45 adds the stale indicator.
+        // Keep the last good reading and label it stale: a failed poll must
+        // never erase the panel or report a false all-clear.
         console.warn('stats unreachable, keeping the last good reading', e);
+        setNetworkStale(true);
         renderHealth(networkDevices);
     }
 }

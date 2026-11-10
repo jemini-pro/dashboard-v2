@@ -82,10 +82,17 @@
             <aside class="rail">
                 <section class="network-panel" aria-labelledby="network-title">
                     <div class="network-header card-head">
-                        <h2 id="network-title" class="card-heading">Network</h2>
-                        <span id="network-updated" class="network-updated"></span>
+                        <div class="card-title">
+                            <h2 id="network-title" class="card-heading">Network</h2>
+                            <span id="network-summary" class="network-summary">Checking…</span>
+                        </div>
+                        <div class="network-status">
+                            <span id="network-stale" class="network-stale" hidden>stale</span>
+                            <span id="network-updated" class="network-updated"></span>
+                        </div>
                     </div>
-                    <!-- #45 replaces the device cards with kind averages + compact rows. -->
+                    <!-- #45 fills this with per-kind averages, then compact device rows. -->
+                    <div id="kind-chips" class="kind-chips"></div>
                     <div id="device-grid" class="device-grid">
                         <div class="device-empty">Loading devices…</div>
                     </div>
