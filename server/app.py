@@ -8,10 +8,12 @@ Endpoints
     GET  /                  static dashboard
     GET  /api/bookmarks     bookmark store (JSON, single source of truth)
     GET  /api/stats         device telemetry
+    POST /api/hit           record a bookmark click (beacon)
     POST /api/push/<name>   agent heartbeat + metrics (needs X-Dash-Token)
     GET  /api/health        liveness
 """
 import json
+import math
 import os
 import shutil
 import ssl
@@ -23,8 +25,13 @@ from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
 STATIC = BASE / "static"
-DATA = BASE / "data"
+DATA = Path(os.environ.get("DASH_DATA_DIR") or BASE / "data")
 AGENTS_FILE = DATA / "agents.json"
+HITS_FILE = DATA / "hits.json"
+
+HALF_LIFE_DAYS = 14.0
+HIT_RETENTION_DAYS = 90
+HIT_RETENTION_SECONDS = HIT_RETENTION_DAYS * 86400
 PORT = int(os.environ.get("DASH_PORT", "8000"))
 TOKEN = os.environ.get("DASH_TOKEN", "").strip()
 
@@ -33,6 +40,7 @@ PVE_NODE = os.environ.get("PVE_NODE", "pve").strip()
 PVE_TOKEN = os.environ.get("PVE_TOKEN", "").strip()
 
 _lock = threading.Lock()
+_hits_lock = threading.Lock()
 _cache = {"at": 0.0, "body": None}
 _prev_cpu = {"usec": None, "at": None}
 
@@ -253,8 +261,85 @@ def stats():
 
 
 def bookmarks():
-    with open(DATA / "bookmarks.json") as f:
-        return json.load(f)
+    try:
+        with open(DATA / "bookmarks.json") as f:
+            store = json.load(f)
+    except (OSError, ValueError):  # a fresh install has no store yet
+        return {"work": []}
+    scores = hit_scores()
+    if isinstance(store, dict):
+        for categories in store.values():
+            if not isinstance(categories, list):
+                continue
+            for category in categories:
+                if not isinstance(category, dict):
+                    continue
+                for item in category.get("items", []):
+                    if isinstance(item, dict) and isinstance(item.get("url"), str):
+                        item["score"] = scores.get(item["url"], 0.0)
+    return store
+
+
+# ---------- click history ----------
+
+def load_hits():
+    try:
+        with open(HITS_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001 - a missing store means no clicks yet
+        return {}
+
+
+def save_hits(hits):
+    DATA.mkdir(parents=True, exist_ok=True)
+    tmp = HITS_FILE.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(hits, f)
+    tmp.replace(HITS_FILE)
+
+
+def trim_hits(hits, now):
+    """Drop timestamps older than the retention window, per URL."""
+    cutoff = now - HIT_RETENTION_SECONDS
+    kept = {}
+    for url, stamps in hits.items():
+        if not isinstance(stamps, list):
+            continue
+        live = [
+            ts for ts in stamps
+            if not isinstance(ts, bool) and isinstance(ts, (int, float)) and ts >= cutoff
+        ]
+        if live:
+            kept[url] = live
+    return kept
+
+
+def record_hit(url):
+    now = time.time()
+    with _hits_lock:
+        hits = load_hits()
+        hits.setdefault(url, []).append(now)
+        save_hits(trim_hits(hits, now))
+
+
+def hit_scores(now=None):
+    """Decayed click weight per URL: sum(exp(-age_days / HALF_LIFE_DAYS))."""
+    now = time.time() if now is None else now
+    scores = {}
+    for url, stamps in load_hits().items():
+        if not isinstance(stamps, list):
+            continue
+        total = 0.0
+        for ts in stamps:
+            if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+                continue
+            age_days = (now - ts) / 86400.0
+            if 0 <= age_days <= HIT_RETENTION_DAYS:
+                total += math.exp(-age_days / HALF_LIFE_DAYS)
+        if total:
+            scores[url] = round(total, 2)
+    return scores
 
 
 # ---------- http ----------
@@ -310,6 +395,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
+        if path == "/api/hit":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length))
+            except Exception:  # noqa: BLE001 - malformed input is the client's fault
+                return self._json({"error": "bad payload"}, 400)
+            url = payload.get("url") if isinstance(payload, dict) else None
+            if not isinstance(url, str):
+                return self._json({"error": "missing url"}, 400)
+            record_hit(url)
+            return self._send(204, b"")
         if not path.startswith("/api/push/"):
             return self._send(404, "not found", "text/plain; charset=utf-8")
         if TOKEN and self.headers.get("X-Dash-Token") != TOKEN:

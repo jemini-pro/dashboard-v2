@@ -177,6 +177,21 @@ function renderBookmarks(categories) {
     `).join('');
 }
 
+// Record bookmark activation server-side. sendBeacon survives the navigation
+// that a plain fetch would cancel; auxclick covers middle-click, while plain
+// and ctrl/cmd clicks arrive as click.
+function recordBookmarkHit(event) {
+    if (event.type === 'auxclick' && event.button !== 1) return;
+    const card = event.target.closest('.bookmark-card');
+    if (!card) return;
+    const url = card.getAttribute('href');
+    if (!url) return;
+    navigator.sendBeacon('/api/hit', JSON.stringify({ url }));
+}
+
+bookmarksGridEl.addEventListener('click', recordBookmarkHit);
+bookmarksGridEl.addEventListener('auxclick', recordBookmarkHit);
+
 // Debug Controls
 debugTimeInput.addEventListener('change', (e) => {
     if (!e.target.value) return;
