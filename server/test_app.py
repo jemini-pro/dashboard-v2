@@ -362,3 +362,166 @@ class FrontEndWiringTest(FrontEndSourceTest):
         self.assertIn(
             "mostUsedEl.addEventListener('auxclick', recordBookmarkHit)", self.source
         )
+
+
+class WorkbenchShellTest(FrontEndSourceTest):
+    """Ticket #41: the Workbench shell, toolbar and body layout.
+
+    The page shell is static markup plus CSS; these assertions pin the ordering
+    and the two-column grid the other Workbench tickets fill in.
+    """
+
+    def test_toolbar_sits_above_a_two_column_body(self):
+        toolbar = self.html.index('class="toolbar')
+        body = self.html.index('class="body-grid"')
+        main = self.html.index('class="main-column"')
+        rail = self.html.index('class="rail"')
+
+        self.assertLess(toolbar, body)
+        self.assertLess(main, rail)
+
+    def test_main_column_stacks_usage_and_launchpad_above_all_tools(self):
+        top_row = self.html.index('class="top-row"')
+        usage = self.html.index('id="most-used"')
+        launchpad = self.html.index('id="launchpad-grid"')
+        all_tools = self.html.index('id="bookmarks-grid"')
+
+        self.assertLess(top_row, usage)
+        self.assertLess(usage, all_tools)
+        self.assertLess(launchpad, all_tools)
+
+    def test_network_tops_the_rail(self):
+        rail = self.html.index('class="rail"')
+        network = self.html.index('class="network-panel"')
+
+        self.assertLess(rail, network)
+        self.assertLess(network, self.html.index("</aside>"))
+
+    def test_body_grid_uses_the_specified_columns_and_gap(self):
+        self.assertRegex(
+            self.css,
+            r"\.body-grid\s*\{[^}]*grid-template-columns:\s*"
+            r"minmax\(0,\s*1fr\)\s+clamp\(320px,\s*25vw,\s*390px\)",
+        )
+        self.assertRegex(self.css, r"\.body-grid\s*\{[^}]*gap:\s*16px")
+
+    def test_main_starts_with_a_1_35fr_by_0_9fr_row(self):
+        self.assertRegex(self.css, r"\.top-row\s*\{[^}]*1\.35fr[^}]*0\.9fr")
+
+    def test_page_never_scrolls_only_inner_regions_do(self):
+        self.assertRegex(self.css, r"body\s*\{[^}]*overflow:\s*hidden")
+        self.assertRegex(self.css, r"\.body-grid\s*\{[^}]*min-height:\s*0")
+
+    def test_agenda_calendar_embed_and_greeting_are_gone(self):
+        self.assertNotIn("calendar.google.com/embed", self.html)
+        self.assertNotIn("<iframe", self.html)
+        self.assertNotIn("Agenda", self.html)
+        self.assertNotIn("greeting", self.html)
+        self.assertNotIn("greeting", self.js)
+        self.assertNotIn("Time to Focus", self.js)
+        self.assertNotIn("Time to Relax", self.js)
+
+
+class SearchWiringTest(FrontEndSourceTest):
+    """Ticket #41: search placeholder, slash focus, Escape clear/blur."""
+
+    def test_search_field_has_placeholder_and_accessible_label(self):
+        self.assertIn('placeholder="Search all tools…"', self.html)
+        self.assertRegex(
+            self.html, r'<input[^>]*id="search"[^>]*aria-label="Search all tools"'
+        )
+
+    def test_slash_focuses_the_field_unless_already_typing(self):
+        self.assertIn("e.key !== '/'", self.js)
+        self.assertIn("searchInput.focus()", self.js)
+
+        guard = function_body(self.js, "isTypingTarget")
+        self.assertIn("INPUT", guard)
+        self.assertIn("TEXTAREA", guard)
+        self.assertIn("isContentEditable", guard)
+
+        # The global shortcut must consult the guard before focusing.
+        handler = self.js[self.js.index("e.key !== '/'"):]
+        self.assertIn("isTypingTarget", handler[:400])
+
+    def test_escape_clears_and_blurs_the_search(self):
+        self.assertIn("e.key !== 'Escape'", self.js)
+        self.assertIn("searchInput.value = ''", self.js)
+        self.assertIn("searchInput.blur()", self.js)
+
+    def test_arrow_keys_are_never_intercepted(self):
+        self.assertNotIn("Arrow", self.js)
+
+
+class ThemeAndDebugTest(FrontEndSourceTest):
+    """Ticket #41: theme keeps flipping at 09:00-17:00 and debug time wins."""
+
+    def test_work_hours_drive_the_theme(self):
+        self.assertRegex(self.js, r"WORK_START_HOUR\s*=\s*9\b")
+        self.assertRegex(self.js, r"WORK_END_HOUR\s*=\s*17\b")
+
+        body = function_body(self.js, "updateDashboard")
+        self.assertIn("getCurrentTime()", body)
+        self.assertIn("WORK_START_HOUR", body)
+        self.assertIn("data-theme", body)
+        self.assertIn("setAttribute", body)
+
+    def test_debug_time_overrides_the_clock_and_theme(self):
+        body = function_body(self.js, "getCurrentTime")
+        self.assertIn("debugTimeOffset", body)
+        self.assertIn(
+            "debugTimeOffset = debugDate.getTime() - now.getTime()", self.js
+        )
+        self.assertIn("debugTimeOffset = null", self.js)
+
+    def test_clock_and_date_live_in_the_toolbar(self):
+        self.assertIn('id="clock"', self.html)
+        self.assertIn('id="date"', self.html)
+        self.assertRegex(self.css, r"\.clock\s*\{[^}]*font-size:\s*1\.55rem")
+
+
+class MonogramIconTest(FrontEndSourceTest):
+    """Ticket #41: monograms only, no emoji, no third-party icon requests."""
+
+    def test_monogram_helper_renders_the_first_letter_only(self):
+        body = function_body(self.js, "monogram")
+
+        self.assertIn('class="monogram"', body)
+        self.assertIn("charAt(0).toUpperCase()", body)
+        self.assertNotIn("http", body)
+        self.assertNotIn("<img", body)
+
+    def test_bookmarks_use_the_monogram_helper_not_emoji(self):
+        card = function_body(self.js, "bookmarkCard")
+        self.assertIn("monogram(item)", card)
+        self.assertNotIn("item.icon", card)
+
+        embedded = self.js[
+            self.js.index("const bookmarks = {"):self.js.index("const clockEl")
+        ]
+        self.assertNotRegex(embedded, r"\bicon\s*:")
+        self.assertNotIn("s2/favicons", self.js)
+        for emoji in ("📧", "📅", "📊", "🐙", "🤖", "☁️"):
+            self.assertNotIn(emoji, self.js)
+
+
+class HealthIndicatorTest(FrontEndSourceTest):
+    """Ticket #41: dot plus n/m online; amber partial, green only all online."""
+
+    def test_health_shows_online_counts_and_only_goes_green_when_all_are_online(self):
+        body = function_body(self.js, "renderHealth")
+
+        self.assertIn("online + '/' + total + ' online'", body)
+        self.assertIn("online === total", body)
+        self.assertIn("'warn'", body)
+        self.assertIn("'online'", body)
+
+    def test_health_dot_amber_when_partial_and_green_when_all_online(self):
+        self.assertRegex(self.css, r"\.health-dot\.online\s*\{[^}]*#48bb78")
+        self.assertRegex(self.css, r"\.health-dot\.warn\s*\{[^}]*#ed8936")
+
+    def test_stats_poll_updates_health_without_hiding_the_panel(self):
+        body = function_body(self.js, "refreshDevices")
+
+        self.assertIn("renderHealth(", body)
+        self.assertNotIn("display = 'none'", body)
