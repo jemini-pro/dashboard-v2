@@ -48,6 +48,29 @@ One fresh click scores `1.0` (a single `exp(0)` term), so a single click already
 `0.5` threshold; the spec's "~3 clicks" wording describes typical use, not a gating rule.
 The threshold and the 14-day half-life are the actual rule.
 
+## Launchpad pinned tools
+
+The Launchpad is data-driven: an item in `bookmarks.json` opts in with a `"pinned": true`
+field. `/api/bookmarks` already passes item fields through unchanged alongside the stamped
+`score`, so no server change is needed.
+
+On the live host, edit `/opt/stack/dash/data/bookmarks.json` (read per request, so reload
+the page; no restart) and add the flag to an item:
+
+```json
+{
+  "title": "Gmail",
+  "desc": "Email",
+  "url": "https://mail.google.com",
+  "pinned": true
+}
+```
+
+Tiles keep store order and are capped at eight. When no item is pinned, the browser falls
+back to these titles when they are present in the store; missing ones are skipped:
+
+> Gmail, Google Calendar, Google Sheets, GitHub, Slack, T3 Code, Proxmox, AWS
+
 ## Running it
 
 ### Live layout (`/opt/stack`)

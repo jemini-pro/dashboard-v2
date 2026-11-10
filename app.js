@@ -6,6 +6,14 @@ const WORK_END_HOUR = 17;
 const MOST_USED_MIN_SCORE = 0.5;
 const MOST_USED_LIMIT = 6;
 
+// Launchpad: items opt in with `pinned: true`; with none, these titles stand in.
+// Both paths stay in store order and cap at eight, so the tile count follows data.
+const PINNED_LIMIT = 8;
+const PINNED_FALLBACK_TITLES = [
+    'Gmail', 'Google Calendar', 'Google Sheets', 'GitHub',
+    'Slack', 'T3 Code', 'Proxmox', 'AWS'
+];
+
 // Network metrics turn amber at this percentage. Status is carried by the
 // number as well as the colour, so the value is never colour-only.
 const METRIC_WARN_PCT = 80;
@@ -208,8 +216,8 @@ function bookmarkCard(item) {
     `;
 }
 
-// One section skeleton for both the bookmark categories and the Most used strip,
-// so the two grids can never drift apart in markup.
+// Category grid skeleton for All tools. The Jump back in card has its own
+// compact row renderer below, so the two layouts stay independent.
 function categorySection(title, items) {
     return `
         <div class="category-section">
@@ -227,9 +235,41 @@ function renderAllTools(categories) {
     renderBookmarks(categories);
 }
 
-// Launchpad render hook. #43 fills this with the pinned tool tiles.
+// Launchpad selection. A store item opts in with `pinned: true`; only when
+// nothing opts in do the fallback titles stand in. Either way the store order
+// is preserved and the result is capped, independent of the embedded copy size.
+function selectLaunchpad(categories) {
+    const items = [];
+    (categories || []).forEach(cat => {
+        (cat.items || []).forEach(item => items.push(item));
+    });
+    const pinned = items.filter(item => item && item.pinned === true);
+    if (!pinned.length) {
+        return items
+            .filter(item => item && PINNED_FALLBACK_TITLES.includes(item.title))
+            .slice(0, PINNED_LIMIT);
+    }
+    return pinned.slice(0, PINNED_LIMIT);
+}
+
+// Launchpad render hook. Monogram icon plus a two-line label; the CSS clamps
+// the label. The title attribute keeps the description discoverable.
 function renderLaunchpad(categories) {
-    launchpadGridEl.innerHTML = '<div class="card-empty">Pinned tools appear here</div>';
+    const items = selectLaunchpad(categories);
+    launchpadGridEl.innerHTML = items.length
+        ? items.map(launchpadTile).join('')
+        : '<div class="card-empty">No pinned tools</div>';
+}
+
+function launchpadTile(item) {
+    const title = escapeHtml(item.title);
+    const desc = escapeHtml(item.desc || '');
+    return '<a class="launchpad-tile" href="' + escapeHtml(item.url) + '" ' +
+        'target="_blank" rel="noreferrer" title="' + title +
+        (desc ? ' — ' + desc : '') + '">' +
+        '<span class="launchpad-icon">' + monogram(item) + '</span>' +
+        '<span class="launchpad-tile-label">' + title + '</span>' +
+        '</a>';
 }
 
 function renderBookmarks(categories) {
@@ -243,9 +283,9 @@ function renderBookmarks(categories) {
     ).join('');
 }
 
-// The Most used strip draws from the decayed `score` the server adds to each
-// item; the scoreless embedded copy used for the first paint never qualifies.
-// This picks copies for the strip and leaves the category order untouched.
+// Jump back in draws from the decayed `score` the server adds to each item;
+// the scoreless embedded copy used for the first paint never qualifies. This
+// picks copies for the card and leaves the category order untouched.
 function selectMostUsed(categories) {
     const scored = [];
     (categories || []).forEach(cat => {
@@ -256,29 +296,52 @@ function selectMostUsed(categories) {
     });
     return scored
         .sort((a, b) => b.score - a.score)
-        .slice(0, MOST_USED_LIMIT)
-        .map(entry => entry.item);
+        .slice(0, MOST_USED_LIMIT);
 }
 
-// Jump back in render hook. #44 replaces the card grid with the compact
-// Most used rows and the quiet "No usage yet" empty state.
+// The bar compares each row with the highest score currently on show, so the
+// top row always fills it. Callers never render the raw score as a number.
+function usageBarPercent(score, maxScore) {
+    if (!maxScore || maxScore <= 0) return 0;
+    return Math.max(0, Math.min(100, Math.round((score / maxScore) * 100)));
+}
+
+function usageRow(entry, maxScore) {
+    const item = entry.item;
+    const pct = usageBarPercent(entry.score, maxScore);
+    return `
+        <li>
+            <a href="${escapeHtml(item.url)}" class="usage-row" target="_blank" rel="noreferrer">
+                <span class="usage-icon">${monogram(item)}</span>
+                <span class="usage-main">
+                    <span class="usage-title">${escapeHtml(item.title)}</span>
+                    <span class="usage-desc">${escapeHtml(item.desc || '')}</span>
+                </span>
+                <span class="usage-bar" aria-hidden="true"><span style="width:${pct}%"></span></span>
+            </a>
+        </li>
+    `;
+}
+
+// The card stays visible when nothing qualifies, with a quiet empty row.
 function renderMostUsed(categories) {
-    const items = selectMostUsed(categories);
-    if (!items.length) {
-        mostUsedEl.hidden = true;
-        mostUsedEl.innerHTML = '';
+    const entries = selectMostUsed(categories);
+    mostUsedEl.hidden = false;
+    if (!entries.length) {
+        mostUsedEl.innerHTML = '<li class="usage-empty">No usage yet</li>';
         return;
     }
-    mostUsedEl.innerHTML = categorySection('Most used', items);
-    mostUsedEl.hidden = false;
+    const maxScore = entries[0].score;
+    mostUsedEl.innerHTML = entries.map(entry => usageRow(entry, maxScore)).join('');
 }
 
-// Record bookmark activation server-side. sendBeacon survives the navigation
-// that a plain fetch would cancel; auxclick covers middle-click, while plain
-// and ctrl/cmd clicks arrive as click.
+// Record bookmark activation server-side, for both All tools cards and Jump
+// back in rows. sendBeacon survives the navigation that a plain fetch would
+// cancel; auxclick covers middle-click, while plain and ctrl/cmd clicks arrive
+// as click.
 function recordBookmarkHit(event) {
     if (event.type === 'auxclick' && event.button !== 1) return;
-    const card = event.target.closest('.bookmark-card');
+    const card = event.target.closest('.bookmark-card, .usage-row');
     if (!card) return;
     const url = card.getAttribute('href');
     if (!url) return;
@@ -289,6 +352,19 @@ bookmarksGridEl.addEventListener('click', recordBookmarkHit);
 bookmarksGridEl.addEventListener('auxclick', recordBookmarkHit);
 mostUsedEl.addEventListener('click', recordBookmarkHit);
 mostUsedEl.addEventListener('auxclick', recordBookmarkHit);
+
+// Launchpad tiles share the same beacon contract as bookmark cards.
+function recordLaunchpadHit(event) {
+    if (event.type === 'auxclick' && event.button !== 1) return;
+    const tile = event.target.closest('.launchpad-tile');
+    if (!tile) return;
+    const url = tile.getAttribute('href');
+    if (!url) return;
+    navigator.sendBeacon('/api/hit', JSON.stringify({ url }));
+}
+
+launchpadGridEl.addEventListener('click', recordLaunchpadHit);
+launchpadGridEl.addEventListener('auxclick', recordLaunchpadHit);
 
 // ---------- search ----------
 
