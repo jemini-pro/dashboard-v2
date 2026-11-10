@@ -35,12 +35,14 @@ COMMIT="$(git -C "$BUILD" rev-parse --short HEAD)"
 
 say "preflight"
 for f in server/app.py server/Caddyfile server/docker-compose.yml \
-         index.html app.js style.css server/bookmarks.seed.json; do
+         index.html app.js style.css metrics.html metrics.js metrics.css \
+         server/bookmarks.seed.json; do
     [ -f "$BUILD/$f" ] || die "missing $BUILD/$f"
 done
 [ -d "$BUILD/fonts" ] || die "missing $BUILD/fonts/"
 if grep -RqsE 'calendar\.google\.com|fonts\.googleapis\.com|fonts\.gstatic\.com' \
-        "$BUILD/index.html" "$BUILD/app.js" "$BUILD/style.css"; then
+        "$BUILD/index.html" "$BUILD/app.js" "$BUILD/style.css" \
+        "$BUILD/metrics.html" "$BUILD/metrics.js" "$BUILD/metrics.css"; then
     die "third-party references remain in the front end"
 fi
 
@@ -64,6 +66,9 @@ install -m 0644 "$BUILD/server/app.py" "$STACK/dash/app.py"
 install -m 0644 "$BUILD/index.html" "$STACK/dash/static/index.html"
 install -m 0644 "$BUILD/app.js" "$STACK/dash/static/app.js"
 install -m 0644 "$BUILD/style.css" "$STACK/dash/static/style.css"
+install -m 0644 "$BUILD/metrics.html" "$STACK/dash/static/metrics.html"
+install -m 0644 "$BUILD/metrics.js" "$STACK/dash/static/metrics.js"
+install -m 0644 "$BUILD/metrics.css" "$STACK/dash/static/metrics.css"
 rm -rf "$STACK/dash/static/fonts"
 mkdir -p "$STACK/dash/static/fonts"
 cp -a "$BUILD/fonts/." "$STACK/dash/static/fonts/"
@@ -100,6 +105,8 @@ html = urllib.request.urlopen("http://127.0.0.1:8000/").read().decode()
 assert "__BOOKMARKS_JSON__" not in html, "bookmark placeholder was not replaced"
 assert 'id="bookmarks-data"' in html, "bookmark data script is missing"
 assert "calendar.google.com" not in html, "calendar reference survived"
+metrics = urllib.request.urlopen("http://127.0.0.1:8000/metrics.html").read().decode()
+assert "Metrics" in metrics and "metrics.js" in metrics, "metrics page is missing"
 print("page ok")
 PY
     die "page render check failed; rollback: tar -xzf $BACKUP -C $STACK && (cd $STACK && docker compose up -d)"

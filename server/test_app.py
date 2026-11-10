@@ -8,6 +8,7 @@ import re
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -64,8 +65,14 @@ class ApiTestCase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.data = Path(self._tmp.name)
         self._old_data, self._old_hits, self._old_static = app.DATA, app.HITS_FILE, app.STATIC
+        self._old_agents, self._old_metrics = app.AGENTS_FILE, app.METRICS_FILE
         app.DATA = self.data
         app.HITS_FILE = self.data / "hits.json"
+        app.AGENTS_FILE = self.data / "agents.json"
+        app.METRICS_FILE = self.data / "metrics.db"
+        app._cache.update(at=0.0, body=None)
+        app._availability_cache.update(at=0.0, by_id={})
+        app._last_prune["at"] = 0.0
         self.static = self.data / "static"
         self.static.mkdir()
         (self.static / "index.html").write_text(
@@ -83,6 +90,10 @@ class ApiTestCase(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=5)
         app.DATA, app.HITS_FILE, app.STATIC = self._old_data, self._old_hits, self._old_static
+        app.AGENTS_FILE, app.METRICS_FILE = self._old_agents, self._old_metrics
+        app._cache.update(at=0.0, body=None)
+        app._availability_cache.update(at=0.0, by_id={})
+        app._last_prune["at"] = 0.0
         self._tmp.cleanup()
 
     def write_bookmarks(self, store):
@@ -1159,3 +1170,268 @@ class NetworkCardTest(FrontEndSourceTest):
         self.assertRegex(self.css, r"\.device-row\s*\{[^}]*padding:\s*5px 0")
         self.assertRegex(self.css, r"\.device-row\s*\{[^}]*repeat\(3,\s*46px\)")
         self.assertNotRegex(self.css, r"\.device-grid\s*\{[^}]*max-height")
+
+
+class MetricsHistoryTest(ApiTestCase):
+    """The server-side history store, its derived signals and its endpoints."""
+
+    # Aligned to an hour so every 60 s sample lands in the intended bucket.
+    BASE = int(NOW) - (int(NOW) % 3600)
+
+    def device(self, device_id="docker01", name=None, kind="lxc", online=True,
+               cpu=10.0, mem=40.0, disk=50.0, uptime=1000, **extra):
+        record = {
+            "id": device_id,
+            "name": name or device_id,
+            "kind": kind,
+            "online": online,
+            "cpu_pct": cpu,
+            "mem_pct": mem,
+            "mem_used": 400,
+            "mem_total": 1000,
+            "disk_pct": disk,
+            "uptime_s": uptime,
+            "last_seen": self.BASE,
+        }
+        record.update(extra)
+        return record
+
+    def sample(self, devices, now=None):
+        return app.record_samples(devices, now=self.BASE if now is None else now)
+
+    def stored_samples(self):
+        con = app._connect_metrics()
+        try:
+            return con.execute(
+                "SELECT device_id, ts, cpu_pct, online FROM samples ORDER BY ts"
+            ).fetchall()
+        finally:
+            con.close()
+
+    def get_status(self, path):
+        try:
+            with urllib.request.urlopen(self.base + path, timeout=5) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+
+    def test_one_bucketed_row_per_device_and_a_repeat_within_the_bucket_updates_it(self):
+        self.sample([self.device(cpu=10.0)], now=self.BASE)
+        self.sample([self.device(cpu=22.0)], now=self.BASE + 10)
+
+        rows = self.stored_samples()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][2], 22.0)
+
+        payload = app.metrics_series("docker01", "1h", 60, now=self.BASE + 60)
+        self.assertEqual(len(payload["points"]), 1)
+        self.assertEqual(payload["points"][0][1], 22.0)
+
+    def test_non_numeric_agent_values_are_stored_as_missing(self):
+        self.sample([self.device(cpu="99", mem=True, disk=None)])
+
+        payload = app.metrics_series("docker01", "1h", 60, now=self.BASE + 60)
+        _ts, cpu, mem, disk, _online = payload["points"][0]
+        self.assertIsNone(cpu)
+        self.assertIsNone(mem)
+        self.assertIsNone(disk)
+
+    def test_offline_run_is_availability_downtime_and_an_event(self):
+        pve = "agent:pve"
+        for offset, online, uptime in (
+            (0, True, 1000), (60, True, 1060), (120, False, 1120),
+            (180, False, 1180), (240, True, 1240),
+        ):
+            self.sample([self.device(pve, "pve", "host", online=online, uptime=uptime)],
+                        now=self.BASE + offset)
+
+        summary = app.metrics_summary("1h", now=self.BASE + 240)["devices"][0]
+        self.assertEqual(summary["samples"], 5)
+        self.assertEqual(summary["availability_pct"], 60.0)
+        self.assertEqual(summary["offline_events"], 1)
+        self.assertEqual(summary["downtime_s"], 120)
+        self.assertEqual(summary["last_offline"], self.BASE + 120)
+
+        payload = app.metrics_series(pve, "1h", 60, now=self.BASE + 240)
+        self.assertEqual(
+            [(event["type"], event["ts"]) for event in payload["events"]],
+            [("online", self.BASE + 240), ("offline", self.BASE + 120)],
+        )
+        self.assertEqual(payload["events"][0]["down_s"], 120)
+
+    def test_a_dropped_uptime_is_a_restart_not_an_offline_event(self):
+        pve = "agent:pve"
+        self.sample([self.device(pve, uptime=5000)], now=self.BASE)
+        self.sample([self.device(pve, uptime=5050)], now=self.BASE + 60)
+        self.sample([self.device(pve, uptime=40)], now=self.BASE + 120)
+
+        summary = app.metrics_summary("1h", now=self.BASE + 120)["devices"][0]
+        self.assertEqual(summary["restarts"], 1)
+        self.assertEqual(summary["offline_events"], 0)
+
+    def test_a_restart_across_an_offline_gap_is_still_detected(self):
+        pve = "agent:pve"
+        self.sample([self.device(pve, uptime=5000)], now=self.BASE)
+        self.sample([self.device(pve, online=False, uptime=5060)], now=self.BASE + 60)
+        self.sample([self.device(pve, uptime=30)], now=self.BASE + 120)
+
+        summary = app.metrics_summary("1h", now=self.BASE + 120)["devices"][0]
+        self.assertEqual(summary["restarts"], 1)
+        self.assertEqual(summary["offline_events"], 1)
+
+    def test_disk_growth_is_a_linear_trend_and_projects_days_to_90(self):
+        for offset, disk in ((0, 50.0), (3600, 50.5), (7200, 51.0)):
+            self.sample([self.device(disk=disk)], now=self.BASE + offset)
+        # The sampler buckets to a minute; these are whole hours, so no overlap.
+        summary = app.metrics_summary("24h", now=self.BASE + 7200)["devices"][0]
+        self.assertAlmostEqual(summary["disk_growth_per_day"], 12.0, places=2)
+        self.assertAlmostEqual(summary["days_to_90"], 3.2, places=1)
+
+    def test_retention_prunes_samples_older_than_the_history_window(self):
+        self.sample([self.device()], now=self.BASE - app.HISTORY_SECONDS - 600)
+        self.assertEqual(len(self.stored_samples()), 1)
+
+        app._last_prune["at"] = 0.0  # force the hourly prune to run now
+        self.sample([self.device()], now=self.BASE)
+
+        rows = self.stored_samples()
+        self.assertEqual(len(rows), 1)
+        self.assertGreaterEqual(rows[0][1], self.BASE - 60)
+
+    def test_step_is_clamped_and_buckets_average_the_samples_inside_them(self):
+        for index in range(6):
+            self.sample([self.device(cpu=float(index * 10))], now=self.BASE + index * 60)
+
+        payload = app.metrics_series("docker01", "1h", 180, now=self.BASE + 300)
+        self.assertEqual(payload["step"], 180)
+        self.assertEqual(len(payload["points"]), 2)
+        self.assertEqual(payload["points"][0][1], 10.0)  # 0, 10, 20
+        self.assertEqual(payload["points"][1][1], 40.0)  # 30, 40, 50
+
+        tiny = app.metrics_series("docker01", "1h", 1, now=self.BASE + 300)
+        self.assertEqual(tiny["step"], 60)
+
+    def test_a_step_too_fine_for_the_window_is_raised_to_cap_the_point_count(self):
+        step = app._step_for(app.METRIC_WINDOWS["30d"], 60)
+        self.assertLessEqual(app.METRIC_WINDOWS["30d"] / step, app.MAX_POINTS)
+        self.assertGreaterEqual(step, 60)
+
+    def test_metrics_endpoints_validate_window_device_and_step(self):
+        self.sample([self.device()], now=time.time())
+
+        self.assertEqual(self.get_status("/api/metrics/summary?window=2h")[0], 400)
+        self.assertEqual(self.get_status("/api/metrics?device=docker01&window=2h")[0], 400)
+        self.assertEqual(self.get_status("/api/metrics?window=1h")[0], 400)
+        self.assertEqual(self.get_status("/api/metrics?device=docker01&window=1h&step=x")[0], 400)
+        self.assertEqual(self.get_status("/api/metrics?device=nope&window=1h")[0], 404)
+
+        status, body = self.get_status("/api/metrics?device=docker01&window=1h")
+        payload = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["device"]["id"], "docker01")
+        self.assertEqual(payload["window"], "1h")
+        self.assertTrue(payload["points"])
+
+    def test_summary_returns_every_device_with_a_sparkline(self):
+        self.sample([
+            self.device("docker01", cpu=10.0),
+            self.device("agent:pve", "pve", "host", cpu=20.0),
+        ])
+
+        payload = app.metrics_summary("1h", now=self.BASE + 60)
+        self.assertEqual({device["id"] for device in payload["devices"]},
+                         {"docker01", "agent:pve"})
+        for device in payload["devices"]:
+            self.assertEqual(len(device["spark"]), 12)
+
+    def test_stats_stamps_24h_availability_from_the_history_store(self):
+        for offset, online in ((0, True), (60, True), (120, False)):
+            self.sample([self.device(online=online)], now=self.BASE + offset)
+        app._cache.update(at=0.0, body=None)
+        app._availability_cache.update(at=0.0, by_id={})
+
+        with frozen_time(self.BASE + 180):
+            payload = app.stats()
+
+        docker = next(device for device in payload["devices"] if device["id"] == "docker01")
+        self.assertEqual(docker["availability_24h"], 66.7)
+
+    def test_a_fresh_install_returns_an_empty_summary_without_creating_a_database(self):
+        payload = app.metrics_summary("24h", now=self.BASE)
+        self.assertEqual(payload["devices"], [])
+        self.assertEqual(app.metrics_series("docker01", "24h", None, now=self.BASE), None)
+
+
+class MetricsPageSourceTest(FrontEndSourceTest):
+    """The metrics page, chart markup and deploy wiring, asserted at the source."""
+
+    def setUp(self):
+        super().setUp()
+        self.metrics_html = (APP_JS.parent / "metrics.html").read_text()
+        self.metrics_js = (APP_JS.parent / "metrics.js").read_text()
+        self.metrics_css = (APP_JS.parent / "metrics.css").read_text()
+
+    def test_page_has_range_tabs_a_chart_a_table_view_and_the_device_rail(self):
+        self.assertIn('id="range-tabs"', self.metrics_html)
+        for window in ("1h", "6h", "24h", "7d", "30d"):
+            self.assertIn('data-range="' + window + '"', self.metrics_html)
+        self.assertIn('id="chart"', self.metrics_html)
+        self.assertIn('id="table-view"', self.metrics_html)
+        self.assertIn('id="device-list"', self.metrics_html)
+        self.assertIn('id="events"', self.metrics_html)
+        self.assertIn("metrics.js", self.metrics_html)
+        self.assertIn("metrics.css", self.metrics_html)
+
+    def test_chart_has_three_series_a_legend_and_a_table_fallback(self):
+        self.assertRegex(self.metrics_js, r"SERIES\s*=\s*\[")
+        for key in ("cpu", "ram", "disk"):
+            self.assertIn("key: '" + key + "'", self.metrics_js)
+        self.assertIn("chart-legend", self.metrics_js)
+        self.assertIn("renderTable", self.metrics_js)
+        self.assertIn("chart-table", self.metrics_html)
+        # Identity is never colour alone: the legend names and values each line.
+        self.assertIn("legend-label", self.metrics_js)
+
+    def test_lines_are_two_pixels_with_surface_ringed_dots_and_hairline_grid(self):
+        self.assertRegex(self.metrics_css, r"\.chart-line\s*\{[^}]*stroke-width:\s*2px")
+        self.assertRegex(self.metrics_css, r"\.chart-dot\s*\{[^}]*stroke:\s*var\(--chart-surface\)")
+        self.assertRegex(self.metrics_css, r"\.chart-grid\s*\{[^}]*stroke-width:\s*1px")
+
+    def test_series_colours_are_the_validated_first_three_slots_per_theme(self):
+        self.assertIn("--series-cpu: #2a78d6", self.metrics_css)
+        self.assertIn("--series-ram: #eb6834", self.metrics_css)
+        self.assertIn("--series-disk: #1baf7a", self.metrics_css)
+        dark = self.metrics_css.split('[data-theme="personal"]', 1)[1]
+        self.assertIn("--series-cpu: #3987e5", dark)
+        self.assertIn("--series-ram: #d95926", dark)
+        self.assertIn("--series-disk: #199e70", dark)
+
+    def test_chart_is_interactive_with_a_crosshair_tooltip_and_resize_redraw(self):
+        self.assertIn("pointermove", self.metrics_js)
+        self.assertIn("chart-crosshair", self.metrics_js)
+        self.assertIn("chart-tooltip", self.metrics_js)
+        self.assertIn("ResizeObserver", self.metrics_js)
+
+    def test_page_fetches_only_the_local_metrics_api(self):
+        self.assertIn("'/api/metrics/summary?window='", self.metrics_js)
+        self.assertIn("'/api/metrics?device='", self.metrics_js)
+        self.assertNotRegex(self.metrics_js, r"https?://")
+        self.assertNotIn("document.cookie", self.metrics_js)
+
+    def test_dashboard_rail_links_to_the_page_and_shows_24h_availability(self):
+        self.assertIn('href="metrics.html"', self.html)
+        availability = function_body(self.source, "deviceAvailability")
+        self.assertIn("availability_24h", availability)
+        row = function_body(self.source, "deviceRow")
+        self.assertIn("deviceAvailability(d)", row)
+        self.assertIn("device-avail", row)
+        patch = function_body(self.source, "patchNetwork")
+        self.assertIn("availabilityEl", patch)
+        self.assertIn(".device-avail", patch)
+        self.assertRegex(self.css, r"\.device-avail\s*\{")
+
+    def test_deploy_ships_the_metrics_page_and_checks_it(self):
+        deploy = (Path(__file__).resolve().parent / "deploy.sh").read_text()
+        for name in ("metrics.html", "metrics.js", "metrics.css"):
+            self.assertIn(name, deploy)
+        self.assertIn("metrics.html", deploy.split('say "smoke"', 1)[1])

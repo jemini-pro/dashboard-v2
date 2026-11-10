@@ -7,7 +7,9 @@ Stdlib only: no pip, no build step.
 Endpoints
     GET  /                  static dashboard
     GET  /api/bookmarks     bookmark store (JSON, single source of truth)
-    GET  /api/stats         device telemetry
+    GET  /api/stats         device telemetry (live, plus 24 h availability)
+    GET  /api/metrics       one device's history for a window
+    GET  /api/metrics/summary   every device's derived history summary
     POST /api/hit           record a bookmark click (beacon)
     POST /api/push/<name>   agent heartbeat + metrics (needs X-Dash-Token)
     GET  /api/health        liveness
@@ -17,16 +19,19 @@ import json
 import math
 import os
 import shutil
+import sqlite3
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 BASE = Path(__file__).resolve().parent
 STATIC = BASE / "static"
 DATA = Path(os.environ.get("DASH_DATA_DIR") or BASE / "data")
 AGENTS_FILE = DATA / "agents.json"
 HITS_FILE = DATA / "hits.json"
+METRICS_FILE = DATA / "metrics.db"
 
 HALF_LIFE_DAYS = 14.0
 HIT_RETENTION_DAYS = 90
@@ -34,11 +39,34 @@ HIT_RETENTION_SECONDS = HIT_RETENTION_DAYS * 86400
 PORT = int(os.environ.get("DASH_PORT", "8000"))
 TOKEN = os.environ.get("DASH_TOKEN", "").strip()
 
+# History is sampled server-side on a timer, so it keeps running whether or
+# not a browser is open. One row per device per bucket; the browser poll rate
+# has no bearing on it.
+SAMPLE_SECONDS = max(5, int(os.environ.get("DASH_SAMPLE_SECONDS", "60")))
+HISTORY_DAYS = max(1, int(os.environ.get("DASH_HISTORY_DAYS", "30")))
+HISTORY_SECONDS = HISTORY_DAYS * 86400
+PRUNE_INTERVAL = 3600
+METRIC_WINDOWS = {
+    "1h": 3600,
+    "6h": 6 * 3600,
+    "24h": 86400,
+    "7d": 7 * 86400,
+    "30d": 30 * 86400,
+}
+DEFAULT_WINDOW = "24h"
+# Each default lands at or below MAX_POINTS so a chart never gets a payload it
+# cannot draw. An explicit ?step= is clamped the same way.
+DEFAULT_STEPS = {"1h": 60, "6h": 300, "24h": 300, "7d": 1800, "30d": 7200}
+MAX_POINTS = 400
+
 _lock = threading.Lock()
 _agents_lock = threading.Lock()
 _hits_lock = threading.Lock()
+_db_lock = threading.Lock()
 _cache = {"at": 0.0, "body": None}
 _prev_cpu = {"usec": None, "at": None}
+_availability_cache = {"at": 0.0, "by_id": {}}
+_last_prune = {"at": 0.0}
 
 
 # ---------- local machine ----------
@@ -184,6 +212,416 @@ def agent_devices():
     return out
 
 
+# ---------- metrics history ----------
+# SQLite is stdlib and a single file on the same writable data mount as the
+# bookmark and click stores. The whole JSON stores are rewritten per write,
+# which is fine for occasional clicks but not for a sample every minute.
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS devices (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    first_seen INTEGER NOT NULL,
+    last_seen  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS samples (
+    device_id TEXT NOT NULL,
+    ts        INTEGER NOT NULL,
+    cpu_pct   REAL,
+    mem_pct   REAL,
+    mem_used  INTEGER,
+    mem_total INTEGER,
+    disk_pct  REAL,
+    uptime_s  INTEGER,
+    online    INTEGER NOT NULL,
+    PRIMARY KEY (device_id, ts)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS samples_ts ON samples (ts);
+"""
+
+
+def _connect_metrics():
+    DATA.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(METRICS_FILE), timeout=5)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.execute("PRAGMA busy_timeout=5000")
+    # Idempotent: also repairs a zero-byte or half-created file after a crash.
+    con.executescript(SCHEMA)
+    return con
+
+
+def _metric_number(value, cast=float):
+    """A finite number from an agent payload, or None. bool is not a sample."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return cast(value)
+
+
+def _device_identity(device):
+    raw_id = device.get("id") or device.get("name") or "unknown"
+    raw_name = device.get("name") or raw_id
+    return str(raw_id)[:80], str(raw_name)[:80], str(device.get("kind") or "other")[:40]
+
+
+def record_samples(devices, now=None):
+    """Write one bucketed row per device, replacing a duplicate in the bucket."""
+    now = time.time() if now is None else now
+    ts = int(now) - (int(now) % SAMPLE_SECONDS)
+    wrote = 0
+    with _db_lock:
+        con = _connect_metrics()
+        try:
+            for device in devices:
+                device_id, name, kind = _device_identity(device)
+                online = 1 if device.get("online") else 0
+                con.execute(
+                    "INSERT INTO devices (id, name, kind, first_seen, last_seen) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET "
+                    "name = excluded.name, kind = excluded.kind, "
+                    "last_seen = MAX(devices.last_seen, excluded.last_seen)",
+                    (device_id, name, kind, ts, ts),
+                )
+                con.execute(
+                    "INSERT INTO samples (device_id, ts, cpu_pct, mem_pct, mem_used, "
+                    "mem_total, disk_pct, uptime_s, online) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(device_id, ts) DO UPDATE SET "
+                    "cpu_pct = excluded.cpu_pct, mem_pct = excluded.mem_pct, "
+                    "mem_used = excluded.mem_used, mem_total = excluded.mem_total, "
+                    "disk_pct = excluded.disk_pct, uptime_s = excluded.uptime_s, "
+                    "online = excluded.online",
+                    (
+                        device_id, ts,
+                        _metric_number(device.get("cpu_pct")),
+                        _metric_number(device.get("mem_pct")),
+                        _metric_number(device.get("mem_used"), int),
+                        _metric_number(device.get("mem_total"), int),
+                        _metric_number(device.get("disk_pct")),
+                        _metric_number(device.get("uptime_s"), int),
+                        online,
+                    ),
+                )
+                wrote += 1
+            con.commit()
+        finally:
+            con.close()
+    prune_metrics(now)
+    return wrote
+
+
+def sample_all(now=None):
+    """Sample the local device and every known agent once."""
+    now = time.time() if now is None else now
+    return record_samples([local_device()] + agent_devices(), now=now)
+
+
+def prune_metrics(now=None):
+    """Drop samples outside the retention window, at most once an hour."""
+    now = time.time() if now is None else now
+    with _db_lock:
+        if _last_prune["at"] and now - _last_prune["at"] < PRUNE_INTERVAL:
+            return 0
+        _last_prune["at"] = now
+        if not METRICS_FILE.exists():
+            return 0
+        # Keep the delete on the same single-writer path as the sampler.
+        con = _connect_metrics()
+        try:
+            cur = con.execute("DELETE FROM samples WHERE ts < ?",
+                              (int(now) - HISTORY_SECONDS,))
+            con.commit()
+            return cur.rowcount
+        finally:
+            con.close()
+
+
+def monitor_loop(interval=None):
+    """Sample forever. The first pass runs immediately, before the first sleep."""
+    interval = SAMPLE_SECONDS if interval is None else max(1, interval)
+    while True:
+        started = time.time()
+        try:
+            sample_all()
+        except Exception as exc:  # noqa: BLE001 - a sampler bug must not kill the API
+            print(f"metrics sampler failed: {type(exc).__name__}: {exc}", flush=True)
+        time.sleep(max(1.0, interval - (time.time() - started)))
+
+
+def start_monitor(interval=None):
+    thread = threading.Thread(target=monitor_loop, args=(interval,), daemon=True,
+                              name="metrics-monitor")
+    thread.start()
+    return thread
+
+
+def availability_24h(now=None):
+    """Mean online share per device over the last 24 h, cached for a minute."""
+    now = time.time() if now is None else now
+    with _db_lock:
+        if _availability_cache["at"] and now - _availability_cache["at"] < 60:
+            return _availability_cache["by_id"]
+    if not METRICS_FILE.exists():
+        return {}
+    con = _connect_metrics()
+    try:
+        rows = con.execute(
+            "SELECT device_id, AVG(online) FROM samples WHERE ts >= ? GROUP BY device_id",
+            (int(now) - 86400,),
+        ).fetchall()
+    finally:
+        con.close()
+    by_id = {
+        device_id: round(100.0 * share, 1)
+        for device_id, share in rows
+        if share is not None
+    }
+    with _db_lock:
+        _availability_cache["at"] = now
+        _availability_cache["by_id"] = by_id
+    return by_id
+
+
+def _live_state(now):
+    """Current online flag and last-seen for every device we know about.
+
+    The local container is always up; an agent is online when its last push is
+    younger than the 150 s grace the live stats card uses. This keeps the
+    history page from lagging a full sample interval behind /api/stats.
+    """
+    state = {
+        d["id"]: {"online": bool(d["online"]), "last_seen": int(d["last_seen"])}
+        for d in agent_devices()
+    }
+    state["docker01"] = {"online": True, "last_seen": int(now)}
+    return state
+
+
+def _history_rows(con, device_id, since, until):
+    return con.execute(
+        "SELECT ts, cpu_pct, mem_pct, disk_pct, uptime_s, online FROM samples "
+        "WHERE device_id = ? AND ts >= ? AND ts <= ? ORDER BY ts",
+        (device_id, int(since), int(until)),
+    ).fetchall()
+
+
+def _events(rows, limit=None):
+    """Offline/recovery/restart transitions, newest first."""
+    events = []
+    offline_since = None
+    prev = None
+    for row in rows:
+        ts, _cpu, _mem, _disk, uptime, online = row
+        if prev is None:
+            if not online:
+                offline_since = ts
+        else:
+            if prev[5] and not online:
+                offline_since = ts
+                events.append({"ts": int(ts), "type": "offline"})
+            elif not prev[5] and online:
+                down = int(ts - offline_since) if offline_since is not None else None
+                events.append({"ts": int(ts), "type": "online", "down_s": down})
+                offline_since = None
+            # A reboot resets uptime; a one-sample wobble should not count.
+            # Compare even across an offline run: a machine that rebooted and
+            # then reconnected has a lower uptime than its last pre-outage row.
+            if uptime is not None and prev[4] is not None and online:
+                if uptime < prev[4] - 60:
+                    events.append({"ts": int(ts), "type": "restart"})
+        prev = row
+    events.sort(key=lambda event: event["ts"], reverse=True)
+    return events[:limit] if limit else events
+
+
+def _disk_growth_per_day(rows):
+    """Least-squares disk slope in percentage points per day, online only."""
+    points = [(ts, disk) for ts, _cpu, _mem, disk, _uptime, online in rows
+              if online and disk is not None]
+    if len(points) < 3:
+        return None
+    t0 = points[0][0]
+    xs = [ts - t0 for ts, _ in points]
+    ys = [value for _, value in points]
+    count = len(xs)
+    mean_x = sum(xs) / count
+    mean_y = sum(ys) / count
+    denom = sum((x - mean_x) ** 2 for x in xs)
+    if denom <= 0:
+        return None
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denom
+    return slope * 86400
+
+
+def _derive_summary(rows, until):
+    """Availability, averages, offline events and disk trend for one window."""
+    count = len(rows)
+    if not count:
+        return {
+            "samples": 0, "availability_pct": None, "downtime_s": 0,
+            "offline_events": 0, "last_offline": None, "restarts": 0,
+            "cpu_avg": None, "cpu_max": None, "mem_avg": None,
+            "disk_pct": None, "disk_growth_per_day": None, "days_to_90": None,
+        }
+    online_rows = [row for row in rows if row[5]]
+    cpu_values = [row[1] for row in online_rows if row[1] is not None]
+    mem_values = [row[2] for row in online_rows if row[2] is not None]
+
+    events = _events(rows)
+    offline_events = [event for event in events if event["type"] == "offline"]
+
+    downtime = 0
+    offline_since = None
+    for row in rows:
+        ts, online = row[0], row[5]
+        if not online and offline_since is None:
+            offline_since = ts
+        elif online and offline_since is not None:
+            downtime += ts - offline_since
+            offline_since = None
+    if offline_since is not None:
+        downtime += max(0, int(until) - offline_since)
+
+    latest = rows[-1]
+    disk_now = latest[3]
+    growth = _disk_growth_per_day(rows)
+    days_to_90 = None
+    if growth is not None and growth > 0.01 and disk_now is not None and disk_now < 90:
+        days_to_90 = round((90.0 - disk_now) / growth, 1)
+
+    return {
+        "samples": count,
+        "availability_pct": round(100.0 * len(online_rows) / count, 1),
+        "downtime_s": int(downtime),
+        "offline_events": len(offline_events),
+        "last_offline": int(offline_events[0]["ts"]) if offline_events else None,
+        "restarts": sum(1 for event in events if event["type"] == "restart"),
+        "cpu_pct": round(float(latest[1]), 1) if latest[1] is not None else None,
+        "cpu_avg": round(sum(cpu_values) / len(cpu_values), 1) if cpu_values else None,
+        "cpu_max": round(max(cpu_values), 1) if cpu_values else None,
+        "mem_pct": round(float(latest[2]), 1) if latest[2] is not None else None,
+        "mem_avg": round(sum(mem_values) / len(mem_values), 1) if mem_values else None,
+        "disk_pct": round(float(disk_now), 1) if disk_now is not None else None,
+        "disk_growth_per_day": round(growth, 2) if growth is not None else None,
+        "days_to_90": days_to_90,
+    }
+
+
+def _spark(rows, now, minutes=60, buckets=12):
+    """Small CPU sparkline for the rail: one value per 5-minute bucket."""
+    since = now - minutes * 60
+    size = (minutes * 60) / float(buckets)
+    totals = [0.0] * buckets
+    counts = [0] * buckets
+    for row in rows:
+        ts, cpu, _mem, _disk, _uptime, online = row
+        if ts < since or not online or cpu is None:
+            continue
+        index = min(buckets - 1, int((ts - since) // size))
+        totals[index] += cpu
+        counts[index] += 1
+    return [round(totals[i] / counts[i], 1) if counts[i] else None for i in range(buckets)]
+
+
+def _window_seconds(window):
+    return METRIC_WINDOWS.get(window)
+
+
+def _step_for(window_s, requested):
+    step = requested if requested is not None else DEFAULT_STEPS.get(
+        next((name for name, seconds in METRIC_WINDOWS.items() if seconds == window_s), None),
+        300,
+    )
+    step = max(60, min(int(step), window_s))
+    if window_s / step > MAX_POINTS:
+        step = int(math.ceil(window_s / MAX_POINTS))
+    return step
+
+
+def _known_devices(con):
+    return con.execute(
+        "SELECT id, name, kind, first_seen, last_seen FROM devices ORDER BY kind, name"
+    ).fetchall()
+
+
+def metrics_summary(window=DEFAULT_WINDOW, now=None):
+    """Every known device with its derived window summary and a CPU sparkline."""
+    now = time.time() if now is None else now
+    window_s = _window_seconds(window) or METRIC_WINDOWS[DEFAULT_WINDOW]
+    since = now - window_s
+    payload = {"generated": int(now), "window": window, "window_s": window_s,
+               "devices": []}
+    if not METRICS_FILE.exists():
+        return payload
+    live = _live_state(now)
+    con = _connect_metrics()
+    try:
+        for device_id, name, kind, _first, last_seen in _known_devices(con):
+            rows = _history_rows(con, device_id, since, now)
+            summary = _derive_summary(rows, now)
+            state = live.get(device_id, {})
+            payload["devices"].append({
+                "id": device_id,
+                "name": name,
+                "kind": kind,
+                "online": state.get("online", bool(rows[-1][5]) if rows else False),
+                "last_seen": state.get("last_seen", int(last_seen)),
+                "spark": _spark(rows, now),
+                **summary,
+            })
+    finally:
+        con.close()
+    return payload
+
+
+def metrics_series(device_id, window=DEFAULT_WINDOW, requested_step=None, now=None):
+    """One device's bucketed time series, derived summary and events."""
+    now = time.time() if now is None else now
+    window_s = _window_seconds(window) or METRIC_WINDOWS[DEFAULT_WINDOW]
+    step = _step_for(window_s, requested_step)
+    since = now - window_s
+    payload = {
+        "generated": int(now), "window": window, "window_s": window_s, "step": step,
+        "device": None, "summary": _derive_summary([], now), "points": [], "events": [],
+    }
+    if not METRICS_FILE.exists():
+        return None if device_id else payload
+    live = _live_state(now)
+    con = _connect_metrics()
+    try:
+        meta = con.execute(
+            "SELECT id, name, kind, last_seen FROM devices WHERE id = ?", (device_id,)
+        ).fetchone()
+        if meta is None:
+            return None
+        rows = _history_rows(con, device_id, since, now)
+        points = con.execute(
+            "SELECT ts - (ts % ?) AS bucket, "
+            "ROUND(AVG(cpu_pct), 1), ROUND(AVG(mem_pct), 1), "
+            "ROUND(AVG(disk_pct), 1), MIN(online) "
+            "FROM samples WHERE device_id = ? AND ts >= ? AND ts <= ? "
+            "GROUP BY bucket ORDER BY bucket",
+            (step, device_id, int(since), int(now)),
+        ).fetchall()
+    finally:
+        con.close()
+    state = live.get(device_id, {})
+    payload["device"] = {
+        "id": meta[0], "name": meta[1], "kind": meta[2],
+        "online": state.get("online", bool(rows[-1][5]) if rows else False),
+        "last_seen": state.get("last_seen", int(meta[3])),
+    }
+    payload["summary"] = _derive_summary(rows, now)
+    payload["points"] = [list(point) for point in points]
+    payload["events"] = _events(rows, limit=20)
+    return payload
+
+
 # ---------- aggregate ----------
 
 def stats():
@@ -192,6 +630,11 @@ def stats():
         if _cache["body"] and now - _cache["at"] < 5:
             return _cache["body"]
     devices = [local_device()] + agent_devices()
+    # The rail shows 24 h availability next to each device; the query is cached
+    # for a minute so the 5 s stats cache is not backed by a 60 s table scan.
+    availability = availability_24h(now)
+    for device in devices:
+        device["availability_24h"] = availability.get(device["id"])
     body = {"generated": int(now), "devices": devices}
     with _lock:
         _cache["at"] = now
@@ -363,12 +806,35 @@ class Handler(BaseHTTPRequestHandler):
         return html.replace("__BOOKMARKS_JSON__", payload)
 
     def do_GET(self):
-        path = self.path.split("?")[0]
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
         try:
             if path == "/api/stats":
                 return self._json(stats())
             if path == "/api/bookmarks":
                 return self._json_cached(bookmarks())
+            if path == "/api/metrics/summary":
+                window = (query.get("window") or [DEFAULT_WINDOW])[0]
+                if window not in METRIC_WINDOWS:
+                    return self._json({"error": "unknown window"}, 400)
+                return self._json(metrics_summary(window))
+            if path == "/api/metrics":
+                window = (query.get("window") or [DEFAULT_WINDOW])[0]
+                if window not in METRIC_WINDOWS:
+                    return self._json({"error": "unknown window"}, 400)
+                device_id = (query.get("device") or [""])[0].strip()[:200]
+                if not device_id:
+                    return self._json({"error": "missing device"}, 400)
+                raw_step = (query.get("step") or [None])[0]
+                try:
+                    step = int(raw_step) if raw_step is not None else None
+                except ValueError:
+                    return self._json({"error": "bad step"}, 400)
+                payload = metrics_series(device_id, window, step)
+                if payload is None:
+                    return self._json({"error": "unknown device"}, 404)
+                return self._json(payload)
             if path == "/api/health":
                 return self._json({"ok": True})
         except Exception as exc:  # noqa: BLE001
@@ -443,5 +909,7 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     _local_cpu_pct()  # prime the cgroup CPU delta
     DATA.mkdir(parents=True, exist_ok=True)
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    start_monitor()
     print(f"dash listening on :{PORT}  token={'set' if TOKEN else 'open'}", flush=True)
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    server.serve_forever()

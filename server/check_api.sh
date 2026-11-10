@@ -70,7 +70,7 @@ PY
 start_server() {
     PORT="$(free_port)"
     BASE="http://127.0.0.1:$PORT"
-    DASH_DATA_DIR="$DATA_DIR" DASH_PORT="$PORT" DASH_TOKEN= \
+    DASH_DATA_DIR="$DATA_DIR" DASH_PORT="$PORT" DASH_TOKEN= DASH_SAMPLE_SECONDS=1 \
         python3 -u "$APP" >>"$TMP/server.log" 2>&1 &
     PID=$!
     local i
@@ -147,6 +147,51 @@ import sys
 a, b = (float(x) for x in sys.argv[1:3])
 if not a > b:
     raise SystemExit(f"expected {a} > {b}")
+PY
+}
+
+wait_for_samples() {
+    local i
+    for i in $(seq 1 100); do
+        if curl -fsS "$BASE/api/metrics/summary?window=1h" -o "$TMP/metrics-summary.json" 2>/dev/null; then
+            if python3 - "$TMP/metrics-summary.json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+raise SystemExit(0 if any(d.get("samples", 0) > 0 for d in data.get("devices", [])) else 1)
+PY
+            then
+                return 0
+            fi
+        fi
+        sleep 0.1
+    done
+    fail "the metrics sampler wrote no sample within 10 s"
+}
+
+metrics_summary_field() { # metrics_summary_field <device-id> <field>
+    python3 - "$TMP/metrics-summary.json" "$1" "$2" <<'PY'
+import json, sys
+path, device_id, field = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    data = json.load(f)
+for device in data.get("devices", []):
+    if device.get("id") == device_id:
+        print(device.get(field, ""))
+        raise SystemExit(0)
+raise SystemExit(f"{device_id} absent from the metrics summary")
+PY
+}
+
+metrics_min_ts() {
+    python3 - "$DATA_DIR/metrics.db" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+try:
+    row = con.execute("SELECT MIN(ts) FROM samples").fetchone()
+finally:
+    con.close()
+print(row[0] if row and row[0] is not None else "")
 PY
 }
 
@@ -322,7 +367,49 @@ size="$(wc -c < "$TMP/bookmarks.json")"
 [[ "$size" -lt 10240 ]] || fail "/api/bookmarks is $size bytes, over the ~10 KB budget"
 ok "/api/bookmarks is $size bytes for $items links (under 10240)"
 
-# 9. Process restart: the same DASH_DATA_DIR keeps the history. This is the
+# 9. Server-side history: the sampler writes even though nobody is polling the
+# browser, and the derived endpoints expose availability and points.
+wait_for_samples
+samples="$(metrics_summary_field docker01 samples)"
+availability="$(metrics_summary_field docker01 availability_pct)"
+[[ "$samples" -ge 1 ]] || fail "docker01 has no stored samples ($samples)"
+[[ "$availability" == "100.0" ]] || fail "docker01 availability is $availability, expected 100.0"
+python3 - "$TMP/metrics-summary.json" <<'PY' || fail "summary sparkline is not 12 points"
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+assert all(len(device.get("spark", [])) == 12 for device in data["devices"]), data
+PY
+ok "the server-side sampler stores history without a browser open ($samples samples)"
+
+curl -fsS "$BASE/api/metrics?device=docker01&window=1h" -o "$TMP/metrics-series.json" \
+    || fail "GET /api/metrics failed"
+python3 - "$TMP/metrics-series.json" <<'PY' || fail "metrics series payload is wrong"
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+assert data["device"]["id"] == "docker01", data.get("device")
+assert data["window"] == "1h", data.get("window")
+assert data["step"] >= 60, data.get("step")
+assert data["points"], "no points"
+assert len(data["points"]) <= 400, len(data["points"])
+assert len(data["points"][0]) == 5, data["points"][0]
+assert "availability_pct" in data["summary"], data.get("summary")
+PY
+ok "/api/metrics returns bucketed points, a step and a derived summary"
+
+code="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/metrics/summary?window=2h")"
+[[ "$code" == "400" ]] || fail "unknown window returned $code, expected 400"
+code="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/metrics?window=1h")"
+[[ "$code" == "400" ]] || fail "missing device returned $code, expected 400"
+code="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/metrics?device=nope&window=1h")"
+[[ "$code" == "404" ]] || fail "unknown device returned $code, expected 404"
+ok "metrics endpoints reject unknown windows, missing and unknown devices"
+
+min_ts_before="$(metrics_min_ts)"
+[[ -n "$min_ts_before" ]] || fail "metrics.db has no samples before the restart"
+
+# 10. Process restart: the same DASH_DATA_DIR keeps the history. This is the
 # no-docker equivalent of recreating the `dash` container with its bind mount.
 score_before="$(json_item_field "$TMP/bookmarks.json" "$W_MAIL" score)"
 stamps_before="$(hits_len "$W_MAIL")"
@@ -338,14 +425,23 @@ assert_close "$score_restart" "$score_before" 0.001 \
     || fail "hit count changed across restart: $stamps_before -> $stamps_restart"
 ok "hits survived a full server restart (score $score_before -> $score_restart)"
 
-# 10. Static guarantees: no cookie is set and the feature makes no third-party
+wait_for_samples
+min_ts_after="$(metrics_min_ts)"
+[[ "$min_ts_after" == "$min_ts_before" ]] \
+    || fail "metrics history changed across restart: $min_ts_before -> $min_ts_after"
+ok "metrics history survived a full server restart (first sample $min_ts_after)"
+
+# 11. Static guarantees: no cookie is set and the feature makes no third-party
 # request. Deliberately scoped to the click-history/strip code so unrelated
 # front-end code does not produce false positives.
 grep -q "Set-Cookie" "$APP" && fail "server sets a cookie"
 grep -q "document.cookie" "$REPO/app.js" && fail "front end touches document.cookie"
 grep -qE 'calendar\.google\.com|fonts\.googleapis\.com|fonts\.gstatic\.com' \
     "$REPO/index.html" "$REPO/app.js" "$REPO/style.css" \
+    "$REPO/metrics.html" "$REPO/metrics.js" "$REPO/metrics.css" \
     && fail "front end still references the calendar iframe or Google Fonts"
+grep -qE 'https?://|document\.cookie' "$REPO/metrics.js" \
+    && fail "metrics page makes an external request or touches cookies"
 grep -Fq "navigator.sendBeacon('/api/hit'" "$REPO/app.js" \
     || fail "click handler does not beacon to the same-origin /api/hit"
 grep -Fq "document.addEventListener('click', recordHit)" "$REPO/app.js" \
@@ -370,7 +466,7 @@ grep -Eq 'https?://|fetch\(|XMLHttpRequest|document\.cookie' "$TMP/strip-functio
     && fail "card/strip code makes an external request or touches cookies"
 ok "feature sets no cookie and makes no third-party request"
 
-# 11. Repo/deploy coherence: compose defaults describe the live /opt/stack
+# 12. Repo/deploy coherence: compose defaults describe the live /opt/stack
 # layout but can be pointed at the repo, and the durable host path is documented.
 grep -Fq '${DASH_DIR:-./dash}:/app' "$COMPOSE" \
     || fail "compose does not make the dash directory overridable"
@@ -382,18 +478,26 @@ grep -Fq 'DATA = Path(os.environ.get("DASH_DATA_DIR") or BASE / "data")' "$APP" 
     || fail "server data directory is not DASH_DATA_DIR-or-BASE/data"
 grep -Fq 'HITS_FILE = DATA / "hits.json"' "$APP" \
     || fail "hit history is not stored as DATA/hits.json"
+grep -Fq 'METRICS_FILE = DATA / "metrics.db"' "$APP" \
+    || fail "metrics history is not stored as DATA/metrics.db"
 grep -Fq '/opt/stack/dash/data/hits.json' "$README" \
     || fail "README does not document the durable hits.json host path"
 grep -Fq 'server/check_api.sh' "$README" \
     || fail "README does not document this check"
+grep -Fq '## Metrics history' "$README" \
+    || fail "README does not document metrics history"
+grep -Fq '/api/metrics' "$README" \
+    || fail "README does not document the metrics endpoints"
+grep -Fq '/opt/stack/dash/data/metrics.db' "$README" \
+    || fail "README does not document the durable metrics.db path"
 ok "compose paths are overridable, defaults match /opt/stack, and README documents both"
 
-# 12. README documents how an owner pins a Launchpad tool.
+# 13. README documents how an owner pins a Launchpad tool.
 grep -Fq '"pinned": true' "$README" \
     || fail "README does not document the pinned bookmark flag"
 ok "README documents the pinned: true bookmark flag"
 
-# 13. README documents the Workbench UI, its breakpoints and the checks.
+# 14. README documents the Workbench UI, its breakpoints and the checks.
 grep -Fq '## Workbench UI' "$README" \
     || fail "README does not document the Workbench UI"
 grep -Fq '1280×800' "$README" \

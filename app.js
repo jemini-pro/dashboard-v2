@@ -566,6 +566,16 @@ function deviceSub(d) {
     return detail + ' · online';
 }
 
+// 24 h availability is stamped by /api/stats from the history store. It sits
+// beside the name, not in the sub-line: the sub-line is already tight in a
+// 320 px rail and would ellipsise the number away. Absent until the first
+// samples exist, so the rail never claims 100% it has not measured.
+function deviceAvailability(d) {
+    return typeof d.availability_24h === 'number'
+        ? d.availability_24h.toFixed(1) + '%'
+        : '';
+}
+
 function deviceKey(d) {
     return d.id || d.name;
 }
@@ -573,11 +583,16 @@ function deviceKey(d) {
 function deviceRow(d) {
     const online = !!d.online;
     const state = online ? 'online' : 'offline';
+    const availability = deviceAvailability(d);
     return '<div class="device-row ' + state + '" data-device-id="' + escapeHtml(deviceKey(d)) + '">' +
         '<div class="device-id">' +
         '<span class="device-dot ' + state + '" aria-hidden="true"></span>' +
         '<span class="device-text">' +
+        '<span class="device-name-row">' +
         '<span class="device-name">' + escapeHtml(d.name) + '</span>' +
+        '<span class="device-avail"' + (availability ? ' title="24h availability"' : ' hidden') + '>' +
+        availability + '</span>' +
+        '</span>' +
         '<span class="device-sub">' + escapeHtml(deviceSub(d)) + '</span>' +
         '<span class="device-error"' + (d.error ? '' : ' hidden') + '>' + escapeHtml(d.error || '') + '</span>' +
         '</span>' +
@@ -629,6 +644,10 @@ function patchNetwork(devices) {
         row.querySelector('.device-dot').className = 'device-dot ' + (online ? 'online' : 'offline');
         row.querySelector('.device-name').textContent = d.name;
         row.querySelector('.device-sub').textContent = deviceSub(d);
+        const availability = deviceAvailability(d);
+        const availabilityEl = row.querySelector('.device-avail');
+        availabilityEl.textContent = availability;
+        availabilityEl.hidden = !availability;
         const errorEl = row.querySelector('.device-error');
         errorEl.textContent = d.error || '';
         errorEl.hidden = !d.error;
