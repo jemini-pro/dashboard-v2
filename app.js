@@ -146,8 +146,10 @@ function updateDashboard() {
 
     // Work bookmarks are the main bookmarks all the time
     if (!bookmarksRendered) {
-        renderBookmarks(bookmarks.work);
+        renderBookmarks(bookmarks.work);   // instant paint from the embedded copy…
         bookmarksRendered = true;
+        loadBookmarks();                   // …then replace it from the server store
+        startDevicePolling();
     }
 }
 
@@ -196,3 +198,91 @@ resetTimeBtn.addEventListener('click', () => {
 // Initial Run & Interval
 updateDashboard();
 setInterval(updateDashboard, 1000);
+
+// ---------- server data ----------
+const deviceGridEl = document.getElementById('device-grid');
+const networkUpdatedEl = document.getElementById('network-updated');
+
+async function loadBookmarks() {
+    try {
+        const res = await fetch('/api/bookmarks', { cache: 'no-store' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        if (data && Array.isArray(data.work) && data.work.length) renderBookmarks(data.work);
+    } catch (e) {
+        console.warn('bookmark store unreachable, keeping the embedded copy', e);
+    }
+}
+
+function fmtBytes(n) {
+    if (!n) return '';
+    const gb = n / (1024 ** 3);
+    return gb.toFixed(gb >= 10 ? 1 : 2) + ' GB';
+}
+
+function fmtUptime(s) {
+    if (s === null || s === undefined) return '—';
+    const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+    if (d) return d + 'd ' + h + 'h';
+    if (h) return h + 'h ' + m + 'm';
+    return m + 'm';
+}
+
+function fmtAgo(ts) {
+    const s = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.floor(s / 60) + 'm ago';
+    return Math.floor(s / 3600) + 'h ago';
+}
+
+function metricRow(label, pct, extra) {
+    const v = (pct === null || pct === undefined) ? null : Math.max(0, Math.min(100, pct));
+    return '<div class="metric-row">' +
+        '<span class="metric-label">' + label + '</span>' +
+        '<span class="metric-value">' + (v === null ? '—' : v.toFixed(1) + '%') + '</span>' +
+        '<div class="metric-bar"><div class="metric-fill" style="width:' + (v === null ? 0 : v) + '%"></div></div>' +
+        '<span class="metric-extra">' + (extra || '') + '</span>' +
+        '</div>';
+}
+
+function deviceCard(d) {
+    const state = d.online ? 'online' : 'offline';
+    const sub = (d.source === 'agent' && d.last_seen) ? fmtAgo(d.last_seen) : (d.kind || '');
+    return '<div class="device-card ' + state + '">' +
+        '<div class="device-head">' +
+        '<span class="device-dot ' + state + '"></span>' +
+        '<span class="device-name">' + d.name + '</span>' +
+        '<span class="device-kind">' + sub + '</span>' +
+        '</div>' +
+        (d.error ? '<div class="device-error">' + d.error + '</div>' : '') +
+        metricRow('CPU', d.cpu_pct) +
+        metricRow('RAM', d.mem_pct, d.mem_total ? fmtBytes(d.mem_used) + ' / ' + fmtBytes(d.mem_total) : '') +
+        ((d.disk_pct === null || d.disk_pct === undefined) ? '' : metricRow('Disk', d.disk_pct)) +
+        '<div class="device-foot">up ' + fmtUptime(d.uptime_s) + '</div>' +
+        '</div>';
+}
+
+async function refreshDevices() {
+    try {
+        const res = await fetch('/api/stats', { cache: 'no-store' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        const order = { host: 0, lxc: 1, 'lxc-guest': 2, pc: 3, mac: 4 };
+        const devices = (data.devices || []).slice()
+            .sort((a, b) => (order[a.kind] === undefined ? 9 : order[a.kind]) - (order[b.kind] === undefined ? 9 : order[b.kind]));
+        deviceGridEl.innerHTML = devices.length
+            ? devices.map(deviceCard).join('')
+            : '<div class="device-empty">No devices reporting</div>';
+        networkUpdatedEl.textContent = 'updated ' + new Date(data.generated * 1000).toLocaleTimeString();
+    } catch (e) {
+        // No API (e.g. the repo served as plain static files): hide the panel
+        // rather than show a permanent error card.
+        const panel = document.querySelector('.network-panel');
+        if (panel) panel.style.display = 'none';
+    }
+}
+
+function startDevicePolling() {
+    refreshDevices();
+    setInterval(refreshDevices, 10000);
+}

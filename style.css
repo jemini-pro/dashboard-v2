@@ -470,3 +470,139 @@ h1 {
         font-size: 1.35rem;
     }
 }
+
+/* ---------- Network panel ---------- */
+
+.network-panel {
+    margin-bottom: 1.5rem;
+}
+
+.network-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: 0.7rem;
+}
+
+.network-updated {
+    font-size: 0.72rem;
+    opacity: 0.55;
+    font-variant-numeric: tabular-nums;
+}
+
+.device-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+    gap: 0.8rem;
+}
+
+.device-card {
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 16px;
+    box-shadow: var(--card-shadow);
+    padding: 0.8rem 0.9rem;
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+}
+
+.device-card.offline {
+    opacity: 0.5;
+}
+
+.device-head {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    margin-bottom: 0.6rem;
+}
+
+.device-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #48bb78;
+    box-shadow: 0 0 8px rgba(72, 187, 120, 0.7);
+    flex: none;
+}
+
+.device-dot.offline {
+    background: #a0aec0;
+    box-shadow: none;
+}
+
+.device-name {
+    font-weight: 600;
+    font-size: 0.92rem;
+    letter-spacing: -0.01em;
+}
+
+.device-kind {
+    margin-left: auto;
+    font-size: 0.62rem;
+    opacity: 0.5;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+.metric-row {
+    display: grid;
+    grid-template-columns: 2rem 3.1rem 1fr;
+    align-items: center;
+    gap: 0.3rem;
+    margin-bottom: 0.3rem;
+}
+
+.metric-row .metric-label {
+    font-size: 0.66rem;
+    opacity: 0.55;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.metric-value {
+    font-size: 0.72rem;
+    font-variant-numeric: tabular-nums;
+}
+
+.metric-bar {
+    height: 4px;
+    border-radius: 999px;
+    background: var(--icon-bg);
+    overflow: hidden;
+}
+
+.metric-fill {
+    height: 100%;
+    border-radius: 999px;
+    background: var(--accent-color);
+    transition: width 0.5s ease;
+}
+
+.metric-extra {
+    grid-column: 1 / -1;
+    font-size: 0.62rem;
+    opacity: 0.45;
+    margin: -0.1rem 0 0.15rem;
+    font-variant-numeric: tabular-nums;
+}
+
+.device-foot {
+    font-size: 0.66rem;
+    opacity: 0.5;
+    margin-top: 0.3rem;
+    font-variant-numeric: tabular-nums;
+}
+
+.device-error {
+    font-size: 0.64rem;
+    color: #e53e3e;
+    margin-bottom: 0.35rem;
+    word-break: break-word;
+}
+
+.device-empty {
+    font-size: 0.8rem;
+    opacity: 0.55;
+    grid-column: 1 / -1;
+}
