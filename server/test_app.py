@@ -766,3 +766,139 @@ class AllToolsTest(FrontEndSourceTest):
             "bookmarksGridEl.addEventListener('auxclick', recordToolHit)", self.js
         )
         self.assertNotIn("fetch('/api/hit'", handler)
+
+
+class NetworkCardTest(FrontEndSourceTest):
+    """Ticket #45: kind averages, compact device rows and in-place polling.
+
+    Same stdlib constraint as the rest of this file: assert against the helper
+    that owns each rule rather than executing browser-only JavaScript.
+    """
+
+    def test_summary_reads_online_count_and_average_cpu(self):
+        body = function_body(self.js, "networkSummary")
+
+        self.assertIn("online + '/' + total + ' online", body)
+        self.assertIn("'% avg CPU'", body)
+        self.assertIn("Math.round", body)
+
+    def test_summary_average_uses_only_online_numeric_cpu_samples(self):
+        body = function_body(self.js, "averageSample")
+
+        self.assertIn("d.online", body)
+        self.assertIn("isNumericSample(d[field])", body)
+        self.assertIn("samples.length", body)
+
+        numeric = function_body(self.js, "isNumericSample")
+        self.assertIn("typeof value === 'number'", numeric)
+        self.assertIn("Number.isFinite", numeric)
+
+    def test_kind_chips_show_count_and_online_numeric_averages(self):
+        body = function_body(self.js, "kindChips")
+
+        self.assertIn("groupDevicesByKind(devices)", body)
+        self.assertIn("group.length", body)
+        self.assertIn("averageSample(group, 'cpu_pct')", body)
+        self.assertIn("averageSample(group, 'mem_pct')", body)
+        self.assertIn("' cpu · '", body)
+        self.assertIn("' ram</span>'", body)
+        # A missing sample renders an em dash rather than 0%.
+        self.assertIn("'—'", function_body(self.js, "avgText"))
+
+    def test_unknown_kinds_get_a_readable_label(self):
+        body = function_body(self.js, "kindLabel")
+
+        self.assertIn("KIND_LABELS[kind]", body)
+        self.assertIn("replace(/[-_]+/g, ' ')", body)
+        self.assertIn("toUpperCase", body)
+        self.assertIn("'Other'", body)
+
+    def test_metric_warning_threshold_is_eighty_percent_amber(self):
+        self.assertRegex(self.js, r"METRIC_WARN_PCT\s*=\s*80\b")
+
+        cell = function_body(self.js, "metricCell")
+        self.assertIn("value >= METRIC_WARN_PCT", cell)
+        self.assertIn('data-metric="', cell)
+        self.assertIn('class="metric-fill"', cell)
+
+        self.assertRegex(self.css, r"\.metric\.is-warn \.metric-value\s*\{[^}]*#ed8936")
+        self.assertRegex(self.css, r"\.metric\.is-warn \.metric-fill\s*\{[^}]*#ed8936")
+        self.assertRegex(self.css, r"\.metric-bar\s*\{[^}]*height:\s*3px")
+
+    def test_device_rows_show_status_dot_name_sub_and_three_metrics(self):
+        body = function_body(self.js, "deviceRow")
+
+        self.assertIn('class="device-dot', body)
+        self.assertIn("escapeHtml(d.name)", body)
+        self.assertIn("deviceSub(d)", body)
+        self.assertIn("metricCell('CPU', 'cpu'", body)
+        self.assertIn("metricCell('RAM', 'ram'", body)
+        self.assertIn("metricCell('DSK', 'disk'", body)
+
+    def test_offline_rows_show_last_seen_and_online_rows_show_uptime(self):
+        body = function_body(self.js, "deviceSub")
+
+        self.assertIn("!d.online", body)
+        self.assertIn("d.last_seen", body)
+        self.assertIn("fmtAgo(", body)
+        self.assertIn("d.uptime_s", body)
+        self.assertIn("fmtUptime(", body)
+
+    def test_device_error_is_rendered_inline(self):
+        body = function_body(self.js, "deviceRow")
+
+        self.assertIn('class="device-error"', body)
+        self.assertIn("escapeHtml(d.error || '')", body)
+        self.assertRegex(self.css, r"\.device-error\s*\{[^}]*#e53e3e")
+
+    def test_failed_poll_keeps_last_good_data_and_shows_a_stale_indicator(self):
+        body = function_body(self.js, "refreshDevices")
+
+        self.assertIn("setNetworkStale(true)", body)
+        self.assertIn("renderHealth(networkDevices", body)
+        # A failed poll must not clear the last good reading or the panel.
+        self.assertNotIn("networkDevices = []", body)
+        self.assertNotIn("renderNetwork([])", body)
+        self.assertNotIn("innerHTML = ''", body)
+
+        stale = function_body(self.js, "setNetworkStale")
+        self.assertIn("networkStaleEl.hidden", stale)
+        self.assertIn("classList.toggle('is-stale'", stale)
+
+        self.assertIn('id="network-stale"', self.html)
+        self.assertRegex(self.css, r"\.network-stale\s*\{")
+        self.assertRegex(self.css, r"\.device-grid\.is-stale\s*\{")
+
+    def test_poll_patches_metrics_in_place_without_rebuilding_the_rows(self):
+        patch = function_body(self.js, "patchNetwork")
+        self.assertNotIn("innerHTML", patch)
+        self.assertIn(".device-row", patch)
+        self.assertIn("querySelector", patch)
+        self.assertIn("textContent", patch)
+
+        metric = function_body(self.js, "patchMetric")
+        self.assertNotIn("innerHTML", metric)
+        self.assertIn("style.width", metric)
+        self.assertIn("classList.toggle('is-warn'", metric)
+
+        apply = function_body(self.js, "applyNetworkDevices")
+        self.assertIn("networkKey(devices)", apply)
+        self.assertIn("renderNetwork(", apply)
+        self.assertIn("patchNetwork(", apply)
+
+        self.assertIn("setInterval(refreshDevices, 10000)", self.js)
+
+    def test_updated_label_uses_hh_mm(self):
+        body = function_body(self.js, "updatedLabel")
+
+        self.assertIn("'updated '", body)
+        self.assertIn("hour: '2-digit'", body)
+        self.assertIn("minute: '2-digit'", body)
+
+    def test_kind_chips_and_compact_rows_fit_the_rail_without_page_scroll(self):
+        self.assertRegex(
+            self.css, r"\.kind-chips\s*\{[^}]*grid-template-columns:\s*1fr 1fr"
+        )
+        self.assertRegex(self.css, r"\.device-row\s*\{[^}]*padding:\s*5px 0")
+        self.assertRegex(self.css, r"\.device-row\s*\{[^}]*repeat\(3,\s*46px\)")
+        self.assertNotRegex(self.css, r"\.device-grid\s*\{[^}]*max-height")
