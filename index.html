@@ -20,39 +20,78 @@
         <div class="blob blob-3"></div>
     </div>
 
-    <div class="dashboard-layout">
-        <aside class="sidebar">
-            <div class="calendar-container">
-                <iframe
-                    src="https://calendar.google.com/calendar/embed?src=201e89a61ac47a7109df0877b72f13305e2f4402fc3d9637664e4e7172bb91b1%40group.calendar.google.com&ctz=Europe%2FLondon&mode=AGENDA"
-                    style="border: 0" width="100%" height="100%" frameborder="0" scrolling="no"></iframe>
+    <div class="workbench">
+        <header class="toolbar card">
+            <div class="toolbar-id">
+                <span id="date" class="toolbar-date"></span>
+                <time id="clock" class="clock" datetime="">00:00</time>
             </div>
-        </aside>
 
-        <main class="main-content">
-            <div class="app-container">
-                <header>
-                    <h1 id="greeting">Good Morning</h1>
-                    <div id="clock" class="clock">00:00</div>
-                </header>
+            <label class="search-field" for="search">
+                <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                    stroke-width="2" aria-hidden="true">
+                    <circle cx="11" cy="11" r="7"></circle>
+                    <path d="m20 20-3.5-3.5"></path>
+                </svg>
+                <input type="search" id="search" name="search" placeholder="Search all tools…"
+                    aria-label="Search all tools" autocomplete="off" spellcheck="false">
+                <kbd aria-hidden="true">/</kbd>
+            </label>
 
-                <section id="most-used" class="most-used" aria-label="Most used" hidden></section>
+            <div id="health" class="health" role="status" aria-live="polite">
+                <span id="health-dot" class="health-dot unknown" aria-hidden="true"></span>
+                <span id="health-text">Checking…</span>
+            </div>
+        </header>
 
-                <section class="network-panel">
-                    <div class="network-header">
-                        <h2 class="category-title">Network</h2>
+        <div class="body-grid">
+            <main class="main-column">
+                <div class="top-row">
+                    <section class="card usage-card" aria-labelledby="jump-back-in-title">
+                        <div class="card-head">
+                            <div class="card-title">
+                                <h2 id="jump-back-in-title" class="card-heading">Jump back in</h2>
+                                <span class="card-sub">Most used</span>
+                            </div>
+                        </div>
+                        <!-- #44 fills this region with the Most used rows. -->
+                        <div id="most-used" class="most-used" hidden></div>
+                    </section>
+
+                    <section class="card launchpad-card" aria-labelledby="launchpad-title">
+                        <div class="card-head">
+                            <h2 id="launchpad-title" class="card-heading">Launchpad</h2>
+                        </div>
+                        <!-- #43 fills this region with the pinned tool tiles. -->
+                        <div id="launchpad-grid" class="launchpad-grid"></div>
+                    </section>
+                </div>
+
+                <section class="card all-tools-card" aria-labelledby="all-tools-title">
+                    <div class="card-head">
+                        <h2 id="all-tools-title" class="card-heading">All tools</h2>
+                        <span id="result-count" class="card-sub"></span>
+                    </div>
+                    <!-- #42 replaces the category-card rendering with numbered rows. -->
+                    <div id="bookmarks-grid" class="bookmarks-grid">
+                        <!-- Bookmarks injected here -->
+                    </div>
+                </section>
+            </main>
+
+            <aside class="rail">
+                <section class="network-panel" aria-labelledby="network-title">
+                    <div class="network-header card-head">
+                        <h2 id="network-title" class="card-heading">Network</h2>
                         <span id="network-updated" class="network-updated"></span>
                     </div>
+                    <!-- #45 replaces the device cards with kind averages + compact rows. -->
                     <div id="device-grid" class="device-grid">
                         <div class="device-empty">Loading devices…</div>
                     </div>
                 </section>
-
-                <div id="bookmarks-grid" class="bookmarks-grid">
-                    <!-- Bookmarks injected here -->
-                </div>
-            </div>
-        </main>
+            </aside>
+        </div>
     </div>
 
     <div class="debug-wrapper">

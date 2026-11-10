@@ -11,55 +11,55 @@ const bookmarks = {
         {
             category: 'Google Workspace',
             items: [
-                { title: 'Gmail', desc: 'Email', icon: '📧', url: 'https://mail.google.com' },
-                { title: 'Google Calendar', desc: 'Meetings & scheduling', icon: '📅', url: 'https://calendar.google.com' },
-                { title: 'Google Sheets', desc: 'Spreadsheets & data', icon: '📊', url: 'https://docs.google.com/spreadsheets' },
-                { title: 'Google Docs', desc: 'Documents', icon: '📝', url: 'https://docs.google.com/document' },
-                { title: 'Google Forms', desc: 'Forms', icon: '📋', url: 'https://docs.google.com/forms' },
-                { title: 'Shared Drive', desc: 'Team storage', icon: '📁', url: 'https://drive.google.com/drive/u/0/folders/0AAZUVdPYQtvyUk9PVA' },
-                { title: 'Data Studio', desc: 'Dashboards & reporting', icon: '📈', url: 'https://lookerstudio.google.com' }
+                { title: 'Gmail', desc: 'Email', url: 'https://mail.google.com' },
+                { title: 'Google Calendar', desc: 'Meetings & scheduling', url: 'https://calendar.google.com' },
+                { title: 'Google Sheets', desc: 'Spreadsheets & data', url: 'https://docs.google.com/spreadsheets' },
+                { title: 'Google Docs', desc: 'Documents', url: 'https://docs.google.com/document' },
+                { title: 'Google Forms', desc: 'Forms', url: 'https://docs.google.com/forms' },
+                { title: 'Shared Drive', desc: 'Team storage', url: 'https://drive.google.com/drive/u/0/folders/0AAZUVdPYQtvyUk9PVA' },
+                { title: 'Data Studio', desc: 'Dashboards & reporting', url: 'https://lookerstudio.google.com' }
             ]
         },
         {
             category: 'Automation',
             items: [
-                { title: 'OpenAI API Dashboard', desc: 'AI & model management', icon: '🤖', url: 'https://platform.openai.com' },
-                { title: 'Ollama', desc: 'Usage & settings', icon: '🦙', url: 'https://ollama.com/settings' },
-                { title: 'Make.com', desc: 'Workflow automation', icon: '⚙️', url: 'https://www.make.com' },
-                { title: 'GitHub', desc: 'Code repository', icon: '🐙', url: 'https://github.com/jemini-pro' },
-                { title: 'Jules', desc: 'Internal link', icon: '🤖', url: 'https://jules.google.com' }
+                { title: 'OpenAI API Dashboard', desc: 'AI & model management', url: 'https://platform.openai.com' },
+                { title: 'Ollama', desc: 'Usage & settings', url: 'https://ollama.com/settings' },
+                { title: 'Make.com', desc: 'Workflow automation', url: 'https://www.make.com' },
+                { title: 'GitHub', desc: 'Code repository', url: 'https://github.com/jemini-pro' },
+                { title: 'Jules', desc: 'Internal link', url: 'https://jules.google.com' }
             ]
         },
         {
             category: 'Analytics & Collaboration',
             items: [
-                { title: 'Lucidchart', desc: 'Diagrams & flowcharts', icon: '📐', url: 'https://lucid.app' },
-                { title: 'AWS', desc: 'Cloud platform & login', icon: '☁️', url: 'https://d-9c67692c29.awsapps.com/start/' },
-                { title: 'Slack', desc: 'Team communication', icon: '💬', url: 'https://slack.com' },
-                { title: 'NIRA', desc: 'File storage', icon: '☁️', url: 'https://nira.com' }
+                { title: 'Lucidchart', desc: 'Diagrams & flowcharts', url: 'https://lucid.app' },
+                { title: 'AWS', desc: 'Cloud platform & login', url: 'https://d-9c67692c29.awsapps.com/start/' },
+                { title: 'Slack', desc: 'Team communication', url: 'https://slack.com' },
+                { title: 'NIRA', desc: 'File storage', url: 'https://nira.com' }
             ]
         },
         {
             category: 'Social Media',
             items: [
-                { title: 'Instagram', desc: 'Content & engagement', icon: '📸', url: 'https://www.instagram.com/surveyair/' },
-                { title: 'LinkedIn', desc: 'Networking', icon: '💼', url: 'https://www.linkedin.com/company/survey-air' },
-                { title: 'YouTube', desc: 'Video content', icon: '🎥', url: 'https://www.youtube.com/@surveyair' }
+                { title: 'Instagram', desc: 'Content & engagement', url: 'https://www.instagram.com/surveyair/' },
+                { title: 'LinkedIn', desc: 'Networking', url: 'https://www.linkedin.com/company/survey-air' },
+                { title: 'YouTube', desc: 'Video content', url: 'https://www.youtube.com/@surveyair' }
             ]
         },
         {
             category: 'Work Tools',
             items: [
-                { title: 'Portal', desc: 'Survey Air portal', icon: '🔑', url: 'https://clients.surveyair.co.uk/login/' },
-                { title: 'Website', desc: 'Survey Air website', icon: '🌐', url: 'https://surveyair.co.uk/' }
+                { title: 'Portal', desc: 'Survey Air portal', url: 'https://clients.surveyair.co.uk/login/' },
+                { title: 'Website', desc: 'Survey Air website', url: 'https://surveyair.co.uk/' }
             ]
         },
         {
             category: 'Homelab',
             items: [
-                { title: 'Proxmox', desc: 'Host UI', icon: '🖥️', url: 'https://pve.tail73491d.ts.net/' },
-                { title: 'T3 Code', desc: 'Agent console', icon: '🤖', url: 'https://pve.tail73491d.ts.net:8443/' },
-                { title: 'Tailscale', desc: 'Machines & ACLs', icon: '🔗', url: 'https://login.tailscale.com/admin/machines' }
+                { title: 'Proxmox', desc: 'Host UI', url: 'https://pve.tail73491d.ts.net/' },
+                { title: 'T3 Code', desc: 'Agent console', url: 'https://pve.tail73491d.ts.net:8443/' },
+                { title: 'Tailscale', desc: 'Machines & ACLs', url: 'https://login.tailscale.com/admin/machines' }
             ]
         }
     ],
@@ -67,32 +67,38 @@ const bookmarks = {
         {
             category: 'Entertainment',
             items: [
-                { title: 'YouTube', desc: 'Video streaming', url: 'https://youtube.com', icon: '📺' },
-                { title: 'Netflix', desc: 'Movies & TV', url: 'https://netflix.com', icon: '🍿' }
+                { title: 'YouTube', desc: 'Video streaming', url: 'https://youtube.com' },
+                { title: 'Netflix', desc: 'Movies & TV', url: 'https://netflix.com' }
             ]
         },
         {
             category: 'Social',
             items: [
-                { title: 'Reddit', desc: 'Community', url: 'https://reddit.com', icon: '👽' },
-                { title: 'Twitter', desc: 'News & updates', url: 'https://twitter.com', icon: '🐦' },
-                { title: 'GitHub', desc: 'Personal projects', url: 'https://github.com/jem-cell', icon: '🐙' }
+                { title: 'Reddit', desc: 'Community', url: 'https://reddit.com' },
+                { title: 'Twitter', desc: 'News & updates', url: 'https://twitter.com' },
+                { title: 'GitHub', desc: 'Personal projects', url: 'https://github.com/jem-cell' }
             ]
         },
         {
             category: 'Tools',
             items: [
-                { title: 'Spotify', desc: 'Music', url: 'https://spotify.com', icon: '🎵' },
-                { title: 'Amazon', desc: 'Shopping', url: 'https://amazon.com', icon: '🛒' }
+                { title: 'Spotify', desc: 'Music', url: 'https://spotify.com' },
+                { title: 'Amazon', desc: 'Shopping', url: 'https://amazon.com' }
             ]
         }
     ]
 };
 
 const clockEl = document.getElementById('clock');
-const greetingEl = document.getElementById('greeting');
+const dateEl = document.getElementById('date');
+const searchInput = document.getElementById('search');
+const healthDotEl = document.getElementById('health-dot');
+const healthTextEl = document.getElementById('health-text');
 const bookmarksGridEl = document.getElementById('bookmarks-grid');
 const mostUsedEl = document.getElementById('most-used');
+const launchpadGridEl = document.getElementById('launchpad-grid');
+const deviceGridEl = document.getElementById('device-grid');
+const networkUpdatedEl = document.getElementById('network-updated');
 const debugTimeInput = document.getElementById('debug-time');
 const resetTimeBtn = document.getElementById('reset-time');
 const debugMenuBtn = document.getElementById('debug-menu-btn');
@@ -101,6 +107,10 @@ const debugControls = document.getElementById('debug-controls');
 let debugTimeOffset = null;
 let currentTheme = null;
 let bookmarksRendered = false;
+// Embedded copy paints first; /api/bookmarks replaces it when the server is up.
+let bookmarkStore = bookmarks.work;
+let networkDevices = [];
+let searchQuery = '';
 
 // Debug Menu Toggle
 debugMenuBtn.addEventListener('click', (e) => {
@@ -128,44 +138,58 @@ function updateDashboard() {
     const hours = now.getHours();
     const minutes = now.getMinutes();
 
-    // Update Clock
+    // Update the toolbar clock and date.
     const timeString = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
-    if (clockEl.textContent !== timeString) {
-        clockEl.textContent = timeString;
-    }
+    if (clockEl.textContent !== timeString) clockEl.textContent = timeString;
+    if (clockEl.dateTime !== timeString) clockEl.dateTime = timeString;
 
-    // Determine Theme based on specified hours
+    const dateString = now.toLocaleDateString('en-GB', {
+        weekday: 'short', day: 'numeric', month: 'short'
+    });
+    if (dateEl.textContent !== dateString) dateEl.textContent = dateString;
+
+    // Determine theme: work 09:00-17:00, personal otherwise.
     const isWorkHours = hours >= WORK_START_HOUR && hours < WORK_END_HOUR;
     const newTheme = isWorkHours ? 'work' : 'personal';
 
-    // Update Theme only when changed
     if (newTheme !== currentTheme) {
         currentTheme = newTheme;
         if (isWorkHours) {
             document.documentElement.removeAttribute('data-theme');
-            greetingEl.textContent = 'Time to Focus';
         } else {
             document.documentElement.setAttribute('data-theme', 'personal');
-            greetingEl.textContent = 'Time to Relax';
         }
     }
 
-    // Work bookmarks are the main bookmarks all the time
     if (!bookmarksRendered) {
-        renderBookmarks(bookmarks.work);   // instant paint from the embedded copy…
         bookmarksRendered = true;
-        loadBookmarks();                   // …then replace it from the server store
+        renderAllTools(bookmarkStore);        // instant paint from the embedded copy…
+        renderLaunchpad(bookmarkStore);
+        loadBookmarks();                      // …then replace it from the server store
         startDevicePolling();
     }
 }
 
+function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, (c) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+}
+
+// Icons are monograms only: no emoji and no third-party icon requests.
+function monogram(item) {
+    const title = String((item && item.title) || '').trim();
+    const initial = title ? title.charAt(0).toUpperCase() : '?';
+    return '<span class="monogram" aria-hidden="true">' + escapeHtml(initial) + '</span>';
+}
+
 function bookmarkCard(item) {
     return `
-        <a href="${item.url}" class="bookmark-card" target="_blank">
-            <div class="bookmark-icon-text">${item.icon}</div>
+        <a href="${escapeHtml(item.url)}" class="bookmark-card" target="_blank" rel="noreferrer">
+            <div class="bookmark-icon-text">${monogram(item)}</div>
             <div class="bookmark-details">
-                <div class="bookmark-title">${item.title}</div>
-                <div class="bookmark-desc">${item.desc || ''}</div>
+                <div class="bookmark-title">${escapeHtml(item.title)}</div>
+                <div class="bookmark-desc">${escapeHtml(item.desc || '')}</div>
             </div>
         </a>
     `;
@@ -176,12 +200,23 @@ function bookmarkCard(item) {
 function categorySection(title, items) {
     return `
         <div class="category-section">
-            <h2 class="category-title">${title}</h2>
+            <h2 class="category-title">${escapeHtml(title)}</h2>
             <div class="items-grid">
                 ${items.map(item => bookmarkCard(item)).join('')}
             </div>
         </div>
     `;
+}
+
+// All tools render hook. #42 replaces this with numbered, searchable rows; the
+// shell keeps the shared card renderer so the embedded copy still paints.
+function renderAllTools(categories) {
+    renderBookmarks(categories);
+}
+
+// Launchpad render hook. #43 fills this with the pinned tool tiles.
+function renderLaunchpad(categories) {
+    launchpadGridEl.innerHTML = '<div class="card-empty">Pinned tools appear here</div>';
 }
 
 function renderBookmarks(categories) {
@@ -212,6 +247,8 @@ function selectMostUsed(categories) {
         .map(entry => entry.item);
 }
 
+// Jump back in render hook. #44 replaces the card grid with the compact
+// Most used rows and the quiet "No usage yet" empty state.
 function renderMostUsed(categories) {
     const items = selectMostUsed(categories);
     if (!items.length) {
@@ -240,6 +277,43 @@ bookmarksGridEl.addEventListener('auxclick', recordBookmarkHit);
 mostUsedEl.addEventListener('click', recordBookmarkHit);
 mostUsedEl.addEventListener('auxclick', recordBookmarkHit);
 
+// ---------- search ----------
+
+function isTypingTarget(target) {
+    if (!target) return false;
+    const tag = target.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !!target.isContentEditable;
+}
+
+// #42 owns the All tools filtering. The shell exposes the seam the field writes
+// to and leaves the full list visible until then.
+function applySearchFilter(query) {
+    searchQuery = query;
+    renderAllTools(bookmarkStore);
+}
+
+// "/" focuses search from anywhere outside a field. The caret keys are
+// deliberately left alone so they keep moving the caret while the user types.
+document.addEventListener('keydown', (e) => {
+    if (e.key !== '/') return;
+    if (isTypingTarget(e.target) || e.metaKey || e.ctrlKey || e.altKey) return;
+    e.preventDefault();
+    searchInput.focus();
+});
+
+searchInput.addEventListener('input', (e) => {
+    applySearchFilter(e.target.value);
+});
+
+// Esc clears and leaves the field.
+searchInput.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    e.preventDefault();
+    searchInput.value = '';
+    applySearchFilter('');
+    searchInput.blur();
+});
+
 // Debug Controls
 debugTimeInput.addEventListener('change', (e) => {
     if (!e.target.value) return;
@@ -263,8 +337,6 @@ updateDashboard();
 setInterval(updateDashboard, 1000);
 
 // ---------- server data ----------
-const deviceGridEl = document.getElementById('device-grid');
-const networkUpdatedEl = document.getElementById('network-updated');
 
 async function loadBookmarks() {
     try {
@@ -272,7 +344,9 @@ async function loadBookmarks() {
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
         if (data && Array.isArray(data.work) && data.work.length) {
-            renderBookmarks(data.work);
+            bookmarkStore = data.work;
+            renderAllTools(bookmarkStore);
+            renderLaunchpad(bookmarkStore);
             renderMostUsed(data.work);
         }
     } catch (e) {
@@ -317,15 +391,33 @@ function deviceCard(d) {
     return '<div class="device-card ' + state + '">' +
         '<div class="device-head">' +
         '<span class="device-dot ' + state + '"></span>' +
-        '<span class="device-name">' + d.name + '</span>' +
-        '<span class="device-kind">' + sub + '</span>' +
+        '<span class="device-name">' + escapeHtml(d.name) + '</span>' +
+        '<span class="device-kind">' + escapeHtml(sub) + '</span>' +
         '</div>' +
-        (d.error ? '<div class="device-error">' + d.error + '</div>' : '') +
+        (d.error ? '<div class="device-error">' + escapeHtml(d.error) + '</div>' : '') +
         metricRow('CPU', d.cpu_pct) +
         metricRow('RAM', d.mem_pct, d.mem_total ? fmtBytes(d.mem_used) + ' / ' + fmtBytes(d.mem_total) : '') +
         ((d.disk_pct === null || d.disk_pct === undefined) ? '' : metricRow('Disk', d.disk_pct)) +
         '<div class="device-foot">up ' + fmtUptime(d.uptime_s) + '</div>' +
         '</div>';
+}
+
+// Network render hook. #45 replaces the device cards with kind averages and
+// compact rows.
+function renderNetwork(devices) {
+    deviceGridEl.innerHTML = devices.length
+        ? devices.map(deviceCard).join('')
+        : '<div class="device-empty">No devices reporting</div>';
+}
+
+// Health is the toolbar's dot plus "n/m online". Amber whenever anything is
+// offline; green only when every device is online.
+function renderHealth(devices) {
+    const total = devices.length;
+    const online = devices.filter((d) => d.online).length;
+    const status = total === 0 ? 'unknown' : (online === total ? 'online' : 'warn');
+    healthDotEl.className = 'health-dot ' + status;
+    healthTextEl.textContent = total ? online + '/' + total + ' online' : 'no devices';
 }
 
 async function refreshDevices() {
@@ -334,17 +426,16 @@ async function refreshDevices() {
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
         const order = { host: 0, lxc: 1, 'lxc-guest': 2, pc: 3, mac: 4 };
-        const devices = (data.devices || []).slice()
+        networkDevices = (data.devices || []).slice()
             .sort((a, b) => (order[a.kind] === undefined ? 9 : order[a.kind]) - (order[b.kind] === undefined ? 9 : order[b.kind]));
-        deviceGridEl.innerHTML = devices.length
-            ? devices.map(deviceCard).join('')
-            : '<div class="device-empty">No devices reporting</div>';
         networkUpdatedEl.textContent = 'updated ' + new Date(data.generated * 1000).toLocaleTimeString();
+        renderNetwork(networkDevices);
+        renderHealth(networkDevices);
     } catch (e) {
-        // No API (e.g. the repo served as plain static files): hide the panel
-        // rather than show a permanent error card.
-        const panel = document.querySelector('.network-panel');
-        if (panel) panel.style.display = 'none';
+        // Keep the last good reading: a failed poll must not erase the panel or
+        // report a false all-clear. #45 adds the stale indicator.
+        console.warn('stats unreachable, keeping the last good reading', e);
+        renderHealth(networkDevices);
     }
 }
 
