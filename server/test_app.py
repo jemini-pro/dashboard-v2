@@ -63,9 +63,15 @@ class ApiTestCase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.data = Path(self._tmp.name)
-        self._old_data, self._old_hits = app.DATA, app.HITS_FILE
+        self._old_data, self._old_hits, self._old_static = app.DATA, app.HITS_FILE, app.STATIC
         app.DATA = self.data
         app.HITS_FILE = self.data / "hits.json"
+        self.static = self.data / "static"
+        self.static.mkdir()
+        (self.static / "index.html").write_text(
+            '<script id="bookmarks-data" type="application/json">__BOOKMARKS_JSON__</script>'
+        )
+        app.STATIC = self.static
         self.write_bookmarks(WORK_BOOKMARKS)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), QuietHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -76,7 +82,7 @@ class ApiTestCase(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
-        app.DATA, app.HITS_FILE = self._old_data, self._old_hits
+        app.DATA, app.HITS_FILE, app.STATIC = self._old_data, self._old_hits, self._old_static
         self._tmp.cleanup()
 
     def write_bookmarks(self, store):
@@ -213,6 +219,25 @@ class HitEndpointTest(ApiTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(data.get("work"), [])
 
+    def test_index_injects_scored_bookmarks_and_revalidates(self):
+        with frozen_time():
+            self.post_hit("https://mail.example.com")
+            with urllib.request.urlopen(self.base + "/", timeout=5) as resp:
+                html = resp.read().decode()
+                etag = resp.headers.get("ETag")
+                cache = resp.headers.get("Cache-Control")
+
+            self.assertEqual(cache, "no-cache")
+            self.assertNotIn("__BOOKMARKS_JSON__", html)
+            self.assertIn('id="bookmarks-data"', html)
+            self.assertIn("https://mail.example.com", html)
+            self.assertIn('"score": 1.0', html)
+
+            req = urllib.request.Request(self.base + "/", headers={"If-None-Match": etag})
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(req, timeout=5)
+            self.assertEqual(caught.exception.code, 304)
+
     def test_concurrent_hits_are_all_recorded(self):
         url = "https://mail.example.com"
 
@@ -280,23 +305,27 @@ class MostUsedStripTest(FrontEndSourceTest):
         self.assertRegex(body, r"sort\(\s*\(a,\s*b\)\s*=>\s*b\.score\s*-\s*a\.score\s*\)")
         self.assertRegex(body, r"slice\(\s*0,\s*MOST_USED_LIMIT\s*\)")
 
-    def test_strip_is_populated_only_after_the_scored_api_payload_arrives(self):
+    def test_strip_is_populated_from_the_injected_payload_or_the_api_fallback(self):
         load = function_body(self.js, "loadBookmarks")
         render = function_body(self.js, "renderMostUsed")
+        update = function_body(self.js, "updateDashboard")
+        injected = function_body(self.js, "injectedBookmarks")
 
         self.assertIn("renderMostUsed(data.work)", load)
         self.assertIn("hidden = true", render)
         self.assertIn("hidden = false", render)
 
-        # The scoreless embedded copy is painted by renderBookmarks, and that
-        # path must never populate the strip.
+        # The server injects the scored store into index.html, so the first
+        # paint can populate the strip without a second request.
+        self.assertIn("renderMostUsed(inline.work)", update)
+        self.assertIn("renderBookmarks(inline.work)", update)
+        self.assertIn("loadBookmarks()", update)
+        self.assertIn("bookmarks-data", injected)
+        self.assertIn("JSON.parse", injected)
+
+        # The shared renderer stays single-purpose; the strip is populated by
+        # its caller, never as a side effect of rendering the categories.
         self.assertNotIn("renderMostUsed", function_body(self.js, "renderBookmarks"))
-        self.assertNotIn("renderMostUsed", function_body(self.js, "updateDashboard"))
-
-    def test_embedded_first_paint_bookmarks_carry_no_scores(self):
-        embedded = self.js[self.js.index("const bookmarks = {"):self.js.index("const clockEl")]
-
-        self.assertNotIn("score", embedded)
 
     def test_category_contents_and_order_are_never_sorted(self):
         body = function_body(self.js, "renderBookmarks")

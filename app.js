@@ -6,89 +6,6 @@ const WORK_END_HOUR = 17;
 const MOST_USED_MIN_SCORE = 0.5;
 const MOST_USED_LIMIT = 6;
 
-const bookmarks = {
-    work: [
-        {
-            category: 'Google Workspace',
-            items: [
-                { title: 'Gmail', desc: 'Email', icon: '📧', url: 'https://mail.google.com' },
-                { title: 'Google Calendar', desc: 'Meetings & scheduling', icon: '📅', url: 'https://calendar.google.com' },
-                { title: 'Google Sheets', desc: 'Spreadsheets & data', icon: '📊', url: 'https://docs.google.com/spreadsheets' },
-                { title: 'Google Docs', desc: 'Documents', icon: '📝', url: 'https://docs.google.com/document' },
-                { title: 'Google Forms', desc: 'Forms', icon: '📋', url: 'https://docs.google.com/forms' },
-                { title: 'Shared Drive', desc: 'Team storage', icon: '📁', url: 'https://drive.google.com/drive/u/0/folders/0AAZUVdPYQtvyUk9PVA' },
-                { title: 'Data Studio', desc: 'Dashboards & reporting', icon: '📈', url: 'https://lookerstudio.google.com' }
-            ]
-        },
-        {
-            category: 'Automation',
-            items: [
-                { title: 'OpenAI API Dashboard', desc: 'AI & model management', icon: '🤖', url: 'https://platform.openai.com' },
-                { title: 'Ollama', desc: 'Usage & settings', icon: '🦙', url: 'https://ollama.com/settings' },
-                { title: 'Make.com', desc: 'Workflow automation', icon: '⚙️', url: 'https://www.make.com' },
-                { title: 'GitHub', desc: 'Code repository', icon: '🐙', url: 'https://github.com/jemini-pro' },
-                { title: 'Jules', desc: 'Internal link', icon: '🤖', url: 'https://jules.google.com' }
-            ]
-        },
-        {
-            category: 'Analytics & Collaboration',
-            items: [
-                { title: 'Lucidchart', desc: 'Diagrams & flowcharts', icon: '📐', url: 'https://lucid.app' },
-                { title: 'AWS', desc: 'Cloud platform & login', icon: '☁️', url: 'https://d-9c67692c29.awsapps.com/start/' },
-                { title: 'Slack', desc: 'Team communication', icon: '💬', url: 'https://slack.com' },
-                { title: 'NIRA', desc: 'File storage', icon: '☁️', url: 'https://nira.com' }
-            ]
-        },
-        {
-            category: 'Social Media',
-            items: [
-                { title: 'Instagram', desc: 'Content & engagement', icon: '📸', url: 'https://www.instagram.com/surveyair/' },
-                { title: 'LinkedIn', desc: 'Networking', icon: '💼', url: 'https://www.linkedin.com/company/survey-air' },
-                { title: 'YouTube', desc: 'Video content', icon: '🎥', url: 'https://www.youtube.com/@surveyair' }
-            ]
-        },
-        {
-            category: 'Work Tools',
-            items: [
-                { title: 'Portal', desc: 'Survey Air portal', icon: '🔑', url: 'https://clients.surveyair.co.uk/login/' },
-                { title: 'Website', desc: 'Survey Air website', icon: '🌐', url: 'https://surveyair.co.uk/' }
-            ]
-        },
-        {
-            category: 'Homelab',
-            items: [
-                { title: 'Proxmox', desc: 'Host UI', icon: '🖥️', url: 'https://pve.tail73491d.ts.net/' },
-                { title: 'T3 Code', desc: 'Agent console', icon: '🤖', url: 'https://pve.tail73491d.ts.net:8443/' },
-                { title: 'Tailscale', desc: 'Machines & ACLs', icon: '🔗', url: 'https://login.tailscale.com/admin/machines' }
-            ]
-        }
-    ],
-    personal: [
-        {
-            category: 'Entertainment',
-            items: [
-                { title: 'YouTube', desc: 'Video streaming', url: 'https://youtube.com', icon: '📺' },
-                { title: 'Netflix', desc: 'Movies & TV', url: 'https://netflix.com', icon: '🍿' }
-            ]
-        },
-        {
-            category: 'Social',
-            items: [
-                { title: 'Reddit', desc: 'Community', url: 'https://reddit.com', icon: '👽' },
-                { title: 'Twitter', desc: 'News & updates', url: 'https://twitter.com', icon: '🐦' },
-                { title: 'GitHub', desc: 'Personal projects', url: 'https://github.com/jem-cell', icon: '🐙' }
-            ]
-        },
-        {
-            category: 'Tools',
-            items: [
-                { title: 'Spotify', desc: 'Music', url: 'https://spotify.com', icon: '🎵' },
-                { title: 'Amazon', desc: 'Shopping', url: 'https://amazon.com', icon: '🛒' }
-            ]
-        }
-    ]
-};
-
 const clockEl = document.getElementById('clock');
 const greetingEl = document.getElementById('greeting');
 const bookmarksGridEl = document.getElementById('bookmarks-grid');
@@ -101,6 +18,10 @@ const debugControls = document.getElementById('debug-controls');
 let debugTimeOffset = null;
 let currentTheme = null;
 let bookmarksRendered = false;
+let lastDevices = null;
+let statsFailures = 0;
+let refreshTimer = null;
+let pollingStarted = false;
 
 // Debug Menu Toggle
 debugMenuBtn.addEventListener('click', (e) => {
@@ -121,6 +42,20 @@ function getCurrentTime() {
         return new Date(Date.now() + debugTimeOffset);
     }
     return new Date();
+}
+
+// The server injects the scored bookmark store into index.html, so the first
+// paint needs no second request. Static-only hosting leaves the placeholder
+// behind; then this returns null and the fetch fallback takes over.
+function injectedBookmarks() {
+    const el = document.getElementById('bookmarks-data');
+    if (!el) return null;
+    try {
+        const data = JSON.parse(el.textContent);
+        return (data && Array.isArray(data.work) && data.work.length) ? data : null;
+    } catch (e) {
+        return null;
+    }
 }
 
 function updateDashboard() {
@@ -152,9 +87,14 @@ function updateDashboard() {
 
     // Work bookmarks are the main bookmarks all the time
     if (!bookmarksRendered) {
-        renderBookmarks(bookmarks.work);   // instant paint from the embedded copy…
         bookmarksRendered = true;
-        loadBookmarks();                   // …then replace it from the server store
+        const inline = injectedBookmarks();
+        if (inline) {
+            renderBookmarks(inline.work);
+            renderMostUsed(inline.work);
+        } else {
+            loadBookmarks();
+        }
         startDevicePolling();
     }
 }
@@ -196,8 +136,7 @@ function renderBookmarks(categories) {
 }
 
 // The Most used strip draws from the decayed `score` the server adds to each
-// item; the scoreless embedded copy used for the first paint never qualifies.
-// This picks copies for the strip and leaves the category order untouched.
+// item. This picks copies for the strip and leaves the category order untouched.
 function selectMostUsed(categories) {
     const scored = [];
     (categories || []).forEach(cat => {
@@ -265,18 +204,24 @@ setInterval(updateDashboard, 1000);
 // ---------- server data ----------
 const deviceGridEl = document.getElementById('device-grid');
 const networkUpdatedEl = document.getElementById('network-updated');
+const KIND_ORDER = { host: 0, lxc: 1, 'lxc-guest': 2, pc: 3, mac: 4 };
 
 async function loadBookmarks() {
     try {
-        const res = await fetch('/api/bookmarks', { cache: 'no-store' });
+        const res = await fetch('/api/bookmarks');
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
         if (data && Array.isArray(data.work) && data.work.length) {
             renderBookmarks(data.work);
             renderMostUsed(data.work);
+            return;
         }
+        throw new Error('empty bookmark store');
     } catch (e) {
-        console.warn('bookmark store unreachable, keeping the embedded copy', e);
+        console.warn('bookmark store unreachable', e);
+        bookmarksGridEl.innerHTML = '<div class="device-empty">Bookmarks unavailable — check the server store.</div>';
+        mostUsedEl.hidden = true;
+        mostUsedEl.innerHTML = '';
     }
 }
 
@@ -301,54 +246,159 @@ function fmtAgo(ts) {
     return Math.floor(s / 3600) + 'h ago';
 }
 
-function metricRow(label, pct, extra) {
-    const v = (pct === null || pct === undefined) ? null : Math.max(0, Math.min(100, pct));
-    return '<div class="metric-row">' +
-        '<span class="metric-label">' + label + '</span>' +
-        '<span class="metric-value">' + (v === null ? '—' : v.toFixed(1) + '%') + '</span>' +
-        '<div class="metric-bar"><div class="metric-fill" style="width:' + (v === null ? 0 : v) + '%"></div></div>' +
-        '<span class="metric-extra">' + (extra || '') + '</span>' +
-        '</div>';
+function metricRowEl(label, metric) {
+    const row = document.createElement('div');
+    row.className = 'metric-row';
+    row.dataset.metric = metric;
+    row.innerHTML =
+        '<span class="metric-label"></span>' +
+        '<span class="metric-value">—</span>' +
+        '<div class="metric-bar"><div class="metric-fill"></div></div>' +
+        '<span class="metric-extra"></span>';
+    row.querySelector('.metric-label').textContent = label;
+    return row;
 }
 
-function deviceCard(d) {
-    const state = d.online ? 'online' : 'offline';
-    const sub = (d.source === 'agent' && d.last_seen) ? fmtAgo(d.last_seen) : (d.kind || '');
-    return '<div class="device-card ' + state + '">' +
+function setMetric(card, name, pct, extra) {
+    const row = card.querySelector('[data-metric="' + name + '"]');
+    if (!row) return;
+    if (pct === null || pct === undefined) {
+        if (name === 'disk') {
+            row.hidden = true;
+        } else {
+            row.hidden = false;
+            row.querySelector('.metric-value').textContent = '—';
+            row.querySelector('.metric-fill').style.width = '0%';
+            row.querySelector('.metric-extra').textContent = extra || '';
+        }
+        return;
+    }
+    const v = Math.max(0, Math.min(100, pct));
+    row.hidden = false;
+    row.querySelector('.metric-value').textContent = v.toFixed(1) + '%';
+    row.querySelector('.metric-fill').style.width = v + '%';
+    row.querySelector('.metric-extra').textContent = extra || '';
+}
+
+function createDeviceCard(d) {
+    const card = document.createElement('div');
+    card.className = 'device-card';
+    card.dataset.deviceId = d.id;
+    card.innerHTML =
         '<div class="device-head">' +
-        '<span class="device-dot ' + state + '"></span>' +
-        '<span class="device-name">' + d.name + '</span>' +
-        '<span class="device-kind">' + sub + '</span>' +
+        '<span class="device-dot"></span>' +
+        '<span class="device-name"></span>' +
+        '<span class="device-kind"></span>' +
         '</div>' +
-        (d.error ? '<div class="device-error">' + d.error + '</div>' : '') +
-        metricRow('CPU', d.cpu_pct) +
-        metricRow('RAM', d.mem_pct, d.mem_total ? fmtBytes(d.mem_used) + ' / ' + fmtBytes(d.mem_total) : '') +
-        ((d.disk_pct === null || d.disk_pct === undefined) ? '' : metricRow('Disk', d.disk_pct)) +
-        '<div class="device-foot">up ' + fmtUptime(d.uptime_s) + '</div>' +
-        '</div>';
+        '<div class="device-error" hidden></div>';
+    card.appendChild(metricRowEl('CPU', 'cpu'));
+    card.appendChild(metricRowEl('RAM', 'ram'));
+    card.appendChild(metricRowEl('Disk', 'disk'));
+    const foot = document.createElement('div');
+    foot.className = 'device-foot';
+    card.appendChild(foot);
+    updateDeviceCard(card, d);
+    return card;
+}
+
+function updateDeviceCard(card, d) {
+    card.classList.toggle('online', !!d.online);
+    card.classList.toggle('offline', !d.online);
+    const dot = card.querySelector('.device-dot');
+    dot.classList.toggle('online', !!d.online);
+    dot.classList.toggle('offline', !d.online);
+    card.querySelector('.device-name').textContent = d.name || '';
+    card.querySelector('.device-kind').textContent =
+        (d.source === 'agent' && d.last_seen) ? fmtAgo(d.last_seen) : (d.kind || '');
+    const error = card.querySelector('.device-error');
+    if (d.error) {
+        error.hidden = false;
+        error.textContent = d.error;
+    } else {
+        error.hidden = true;
+        error.textContent = '';
+    }
+    setMetric(card, 'cpu', d.cpu_pct);
+    setMetric(card, 'ram', d.mem_pct, d.mem_total ? fmtBytes(d.mem_used) + ' / ' + fmtBytes(d.mem_total) : '');
+    setMetric(card, 'disk', d.disk_pct);
+    card.querySelector('.device-foot').textContent = 'up ' + fmtUptime(d.uptime_s);
+}
+
+function renderDevices(devices) {
+    const wanted = new Set(devices.map(d => d.id));
+    for (const card of [...deviceGridEl.querySelectorAll('.device-card')]) {
+        if (!wanted.has(card.dataset.deviceId)) card.remove();
+    }
+    const empty = deviceGridEl.querySelector('.device-empty');
+    if (!devices.length) {
+        if (empty) empty.textContent = 'No devices reporting';
+        else deviceGridEl.innerHTML = '<div class="device-empty">No devices reporting</div>';
+        return;
+    }
+    if (empty) empty.remove();
+    for (const d of devices) {
+        let card = deviceGridEl.querySelector(
+            '.device-card[data-device-id="' + CSS.escape(d.id) + '"]'
+        );
+        if (card) updateDeviceCard(card, d);
+        else card = createDeviceCard(d);
+        deviceGridEl.appendChild(card); // preserve the server's order
+    }
 }
 
 async function refreshDevices() {
     try {
-        const res = await fetch('/api/stats', { cache: 'no-store' });
+        const res = await fetch('/api/stats');
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
-        const order = { host: 0, lxc: 1, 'lxc-guest': 2, pc: 3, mac: 4 };
-        const devices = (data.devices || []).slice()
-            .sort((a, b) => (order[a.kind] === undefined ? 9 : order[a.kind]) - (order[b.kind] === undefined ? 9 : order[b.kind]));
-        deviceGridEl.innerHTML = devices.length
-            ? devices.map(deviceCard).join('')
-            : '<div class="device-empty">No devices reporting</div>';
-        networkUpdatedEl.textContent = 'updated ' + new Date(data.generated * 1000).toLocaleTimeString();
+        const devices = (data.devices || []).slice().sort(
+            (a, b) => (KIND_ORDER[a.kind] === undefined ? 9 : KIND_ORDER[a.kind])
+                - (KIND_ORDER[b.kind] === undefined ? 9 : KIND_ORDER[b.kind])
+        );
+        renderDevices(devices);
+        lastDevices = devices;
+        statsFailures = 0;
+        const generated = data.generated || Math.floor(Date.now() / 1000);
+        networkUpdatedEl.textContent = 'updated ' + new Date(generated * 1000).toLocaleTimeString();
+        networkUpdatedEl.classList.remove('stale');
+        return true;
     } catch (e) {
-        // No API (e.g. the repo served as plain static files): hide the panel
-        // rather than show a permanent error card.
-        const panel = document.querySelector('.network-panel');
-        if (panel) panel.style.display = 'none';
+        statsFailures += 1;
+        if (!lastDevices) {
+            deviceGridEl.innerHTML = '<div class="device-empty">Telemetry unavailable — retrying…</div>';
+        }
+        networkUpdatedEl.textContent = 'stale — retrying';
+        networkUpdatedEl.classList.add('stale');
+        return false;
     }
 }
 
-function startDevicePolling() {
-    refreshDevices();
-    setInterval(refreshDevices, 10000);
+function scheduleRefresh(delay) {
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(async () => {
+        if (document.hidden) {
+            refreshTimer = null;
+            return;
+        }
+        const ok = await refreshDevices();
+        const next = ok
+            ? 10000
+            : Math.min(60000, 10000 * 2 ** Math.min(statsFailures, 3));
+        scheduleRefresh(next);
+    }, delay);
 }
+
+function startDevicePolling() {
+    if (pollingStarted) return;
+    pollingStarted = true;
+    scheduleRefresh(0);
+}
+
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        clearTimeout(refreshTimer);
+        refreshTimer = null;
+    } else if (pollingStarted && !refreshTimer) {
+        scheduleRefresh(0);
+    }
+});
