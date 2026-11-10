@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Black-box acceptance check for click history and decayed bookmark scores.
-# Spec #16, ticket #37.
+# Black-box acceptance check for click history, decayed bookmark scores and
+# Workbench deployment documentation. Spec #16 ticket #37; spec #40 ticket #46.
 #
 # Dependencies: bash, curl, coreutils, and python3 (stdlib only -- the server is
 # stdlib Python as well). No docker, node or pip. Starts the real server on a
@@ -400,5 +400,16 @@ ok "compose paths are overridable, defaults match /opt/stack, and README documen
 grep -Fq '"pinned": true' "$README" \
     || fail "README does not document the pinned bookmark flag"
 ok "README documents the pinned: true bookmark flag"
+
+# 12. README documents the Workbench UI, its breakpoints and the checks.
+grep -Fq '## Workbench UI' "$README" \
+    || fail "README does not document the Workbench UI"
+grep -Fq '1280×800' "$README" \
+    || fail "README does not document the one-screen viewport checks"
+grep -Fq '1180px' "$README" \
+    || fail "README does not document the responsive breakpoints"
+grep -Fq 'python3 -m unittest discover -s server' "$README" \
+    || fail "README does not document the stdlib test command"
+ok "README documents the Workbench UI, breakpoints and checks"
 
 echo "all $COUNT checks passed"

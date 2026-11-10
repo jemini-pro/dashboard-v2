@@ -1077,6 +1077,10 @@ input:focus-visible {
 @media (max-width: 1180px) {
     .body-grid {
         grid-template-columns: minmax(0, 1fr);
+        /* The grid owns the scroll now: size rows to their content, or the
+           fixed-height track squeezes All tools to zero and the rail overlaps
+           the main column. */
+        grid-auto-rows: max-content;
         overflow-y: auto;
     }
 
@@ -1084,9 +1088,10 @@ input:focus-visible {
         overflow: visible;
     }
 
+    /* Agenda is gone, so the rail is one column with Network below main. */
     .rail {
         display: grid;
-        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        grid-template-columns: minmax(0, 1fr);
         align-items: start;
         overflow: visible;
     }
@@ -1122,5 +1127,12 @@ input:focus-visible {
 
     .bookmarks-grid {
         columns: 1;
+    }
+
+    /* Four tiles per row at any phone width: a quarter-width minimum minus the
+       three 8px gaps fits exactly four tracks; auto-fit drops empty ones when
+       fewer tools are pinned. */
+    .launchpad-grid {
+        grid-template-columns: repeat(auto-fit, minmax(calc(25% - 6px), 1fr));
     }
 }
