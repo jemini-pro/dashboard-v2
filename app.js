@@ -1,5 +1,8 @@
 const WORK_START_HOUR = 9;
 const WORK_END_HOUR = 17;
+// One fresh click scores 1.0 (a single exp(0) term), so any clicked link already
+// clears this 0.5 bar. The spec's "~3 clicks" wording describes typical use, not
+// a gate: the threshold and 14-day half-life are the actual rule.
 const MOST_USED_MIN_SCORE = 0.5;
 const MOST_USED_LIMIT = 6;
 
@@ -168,36 +171,44 @@ function bookmarkCard(item) {
     `;
 }
 
+// One section skeleton for both the bookmark categories and the Most used strip,
+// so the two grids can never drift apart in markup.
+function categorySection(title, items) {
+    return `
+        <div class="category-section">
+            <h2 class="category-title">${title}</h2>
+            <div class="items-grid">
+                ${items.map(item => bookmarkCard(item)).join('')}
+            </div>
+        </div>
+    `;
+}
+
 function renderBookmarks(categories) {
     // If the data is flat (old personal array structure fallback), wrap it
     if (categories.length > 0 && !categories[0].category) {
         categories = [{ category: 'Bookmarks', items: categories }];
     }
 
-    bookmarksGridEl.innerHTML = categories.map(cat => `
-        <div class="category-section">
-            <h2 class="category-title">${cat.category}</h2>
-            <div class="items-grid">
-                ${cat.items.map(item => bookmarkCard(item)).join('')}
-            </div>
-        </div>
-    `).join('');
+    bookmarksGridEl.innerHTML = categories.map(
+        cat => categorySection(cat.category, cat.items)
+    ).join('');
 }
 
 // The Most used strip draws from the decayed `score` the server adds to each
 // item; the scoreless embedded copy used for the first paint never qualifies.
 // This picks copies for the strip and leaves the category order untouched.
-function selectMostUsed(categories, minScore = MOST_USED_MIN_SCORE, limit = MOST_USED_LIMIT) {
+function selectMostUsed(categories) {
     const scored = [];
     (categories || []).forEach(cat => {
         (cat.items || []).forEach(item => {
             const score = Number(item.score) || 0;
-            if (score > minScore) scored.push({ item, score });
+            if (score > MOST_USED_MIN_SCORE) scored.push({ item, score });
         });
     });
     return scored
         .sort((a, b) => b.score - a.score)
-        .slice(0, limit)
+        .slice(0, MOST_USED_LIMIT)
         .map(entry => entry.item);
 }
 
@@ -208,12 +219,7 @@ function renderMostUsed(categories) {
         mostUsedEl.innerHTML = '';
         return;
     }
-    mostUsedEl.innerHTML = `
-        <h2 class="category-title">Most used</h2>
-        <div class="items-grid">
-            ${items.map(item => bookmarkCard(item)).join('')}
-        </div>
-    `;
+    mostUsedEl.innerHTML = categorySection('Most used', items);
     mostUsedEl.hidden = false;
 }
 

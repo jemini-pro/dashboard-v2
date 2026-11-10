@@ -8,6 +8,7 @@ a stdlib Python API, a Caddy entry point, and one-shot agents that push device m
 | Path | What |
 |---|---|
 | `server/app.py` | the whole API, stdlib only, no pip, no build step |
+| `server/test_app.py` | stdlib `unittest` coverage for the API and front-end wiring |
 | `server/docker-compose.yml` | `caddy` (only published port) + `dash` |
 | `server/Caddyfile` | `:8448` → `dash:8000`, plain HTTP behind Tailscale |
 | `server/check_api.sh` | dependency-free black-box acceptance check |
@@ -30,7 +31,22 @@ a stdlib Python API, a Caddy entry point, and one-shot agents that push device m
 | `/api/push/<name>` | POST | agent heartbeat, needs `X-Dash-Token` |
 
 Reads are open on the tailnet. Only pushes are authenticated — a leaked token can fake
-a metric, nothing more. `/api/hit` accepts any URL, including one no longer in the store.
+a metric, nothing more. `/api/hit` accepts any non-empty URL string, including one no
+longer in the store; missing, non-string and empty/whitespace values get a 4xx.
+
+## Most used strip
+
+Click history is keyed by URL in `data/hits.json`. The server scores **every URL in the
+store**: `score = sum(exp(-age_days / 14))`, rounded to 2 dp, with hits older than 90 days
+trimmed. `/api/bookmarks` stamps that score on every item it returns.
+
+The browser strip is narrower than the scoring: `selectMostUsed()` only looks at the
+rendered `work` list, keeps items scoring above `0.5`, and shows at most six. A click on
+a personal link is still recorded and scored, but can never appear in the strip.
+
+One fresh click scores `1.0` (a single `exp(0)` term), so a single click already clears the
+`0.5` threshold; the spec's "~3 clicks" wording describes typical use, not a gating rule.
+The threshold and the 14-day half-life are the actual rule.
 
 ## Running it
 
@@ -50,6 +66,10 @@ cd /opt/stack
 cp dash/.env.example dash/.env   # if absent; fill DASH_TOKEN
 docker compose up -d
 ```
+
+`/opt/stack/dash/data/bookmarks.json` is the single source of truth for bookmarks, and is
+read per request: edit it, reload the page, no restart. `/api/bookmarks` returns that
+store with the decayed `score` stamped on every item.
 
 ### From this repo
 
