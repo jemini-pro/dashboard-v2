@@ -356,21 +356,21 @@ grep -q "Set-Cookie" "$APP" && fail "server sets a cookie"
 grep -q "document.cookie" "$REPO/app.js" && fail "front end touches document.cookie"
 grep -Fq "navigator.sendBeacon('/api/hit'" "$REPO/app.js" \
     || fail "click handler does not beacon to the same-origin /api/hit"
-grep -Fq "mostUsedEl.addEventListener('click', recordBookmarkHit)" "$REPO/app.js" \
-    || fail "Most used strip is missing its click listener"
-grep -Fq "mostUsedEl.addEventListener('auxclick', recordBookmarkHit)" "$REPO/app.js" \
-    || fail "Most used strip is missing its auxclick listener"
+grep -Fq "document.addEventListener('click', recordHit)" "$REPO/app.js" \
+    || fail "link clicks are not delegated to one beacon handler"
+grep -Fq "document.addEventListener('auxclick', recordHit)" "$REPO/app.js" \
+    || fail "middle-clicks are not delegated to one beacon handler"
 awk '/# ---------- click history ----------/{f=1; next} /# ---------- http ----------/{f=0} f' "$APP" \
     | grep -Eq 'https?://|urlopen|urllib' \
     && fail "click-history code makes an outbound request"
-# The shared card/section renderers and the strip selection must stay same-origin
-# too: no hard-coded external URL, no fetch/XHR, no cookie access.
+# The shared hit handler and the strip selection must stay same-origin too: no
+# hard-coded external URL, no fetch/XHR, no cookie access.
 awk '
-    /^function (recordBookmarkHit|bookmarkCard|categorySection|selectMostUsed|renderMostUsed)\(/ {f=1}
+    /^function (recordHit|selectMostUsed|renderMostUsed)\(/ {f=1}
     f {print}
     f && /^}/ {f=0}
 ' "$REPO/app.js" > "$TMP/strip-functions.js"
-for fn in recordBookmarkHit bookmarkCard categorySection selectMostUsed renderMostUsed; do
+for fn in recordHit selectMostUsed renderMostUsed; do
     grep -q "^function $fn(" "$TMP/strip-functions.js" \
         || fail "static check could not find function $fn in app.js"
 done

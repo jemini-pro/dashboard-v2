@@ -17,8 +17,23 @@ const PINNED_FALLBACK_TITLES = [
 // Network metrics turn amber at this percentage. Status is carried by the
 // number as well as the colour, so the value is never colour-only.
 const METRIC_WARN_PCT = 80;
-const KIND_LABELS = { host: 'Hosts', lxc: 'LXC', 'lxc-guest': 'LXC guests', pc: 'PC', mac: 'Mac' };
-const KIND_ORDER = ['host', 'lxc', 'lxc-guest', 'pc', 'mac'];
+// One definition drives both the labels and the ordering, so adding a kind
+// means editing one list rather than two constants that can drift apart.
+const KIND_DEFS = [
+    { key: 'host', label: 'Hosts' },
+    { key: 'lxc', label: 'LXC' },
+    { key: 'lxc-guest', label: 'LXC guests' },
+    { key: 'pc', label: 'PC' },
+    { key: 'mac', label: 'Mac' }
+];
+const KIND_LABELS = Object.fromEntries(KIND_DEFS.map((kind) => [kind.key, kind.label]));
+const KIND_ORDER = KIND_DEFS.map((kind) => kind.key);
+// One metric definition drives both the row markup and the in-place poll patch.
+const DEVICE_METRICS = [
+    { label: 'CPU', key: 'cpu', field: 'cpu_pct' },
+    { label: 'RAM', key: 'ram', field: 'mem_pct' },
+    { label: 'DSK', key: 'disk', field: 'disk_pct' }
+];
 
 const bookmarks = {
     work: [
@@ -187,6 +202,9 @@ function updateDashboard() {
         bookmarksRendered = true;
         renderAllTools(bookmarkStore);        // instant paint from the embedded copy…
         renderLaunchpad(bookmarkStore);
+        // The embedded copy carries no scores, so this paints the quiet
+        // "No usage yet" state rather than waiting on the network.
+        renderMostUsed(bookmarkStore);
         loadBookmarks();                      // …then replace it from the server store
         startDevicePolling();
     }
@@ -203,31 +221,6 @@ function monogram(item) {
     const title = String((item && item.title) || '').trim();
     const initial = title ? title.charAt(0).toUpperCase() : '?';
     return '<span class="monogram" aria-hidden="true">' + escapeHtml(initial) + '</span>';
-}
-
-function bookmarkCard(item) {
-    return `
-        <a href="${escapeHtml(item.url)}" class="bookmark-card" target="_blank" rel="noreferrer">
-            <div class="bookmark-icon-text">${monogram(item)}</div>
-            <div class="bookmark-details">
-                <div class="bookmark-title">${escapeHtml(item.title)}</div>
-                <div class="bookmark-desc">${escapeHtml(item.desc || '')}</div>
-            </div>
-        </a>
-    `;
-}
-
-// Category grid skeleton for All tools. The Jump back in card has its own
-// compact row renderer below, so the two layouts stay independent.
-function categorySection(title, items) {
-    return `
-        <div class="category-section">
-            <h2 class="category-title">${escapeHtml(title)}</h2>
-            <div class="items-grid">
-                ${items.map(item => bookmarkCard(item)).join('')}
-            </div>
-        </div>
-    `;
 }
 
 // ---------- All tools ----------
@@ -285,11 +278,11 @@ function allToolsEmptyText(query) {
 }
 
 // While filtering, report how many of the store's tools survived. With no
-// query, the same slot shows the full count and group count.
-function resultCountText(shown, total, groups, query) {
+// query the slot stays empty; the spec only asks for the count while filtering.
+function resultCountText(shown, total, query) {
     return String(query || '').trim()
         ? shown + ' of ' + total + ' tools'
-        : total + ' tools · ' + groups + ' groups';
+        : '';
 }
 
 function renderAllTools(categories) {
@@ -299,7 +292,7 @@ function renderAllTools(categories) {
     const total = countToolItems(all);
 
     if (resultCountEl) {
-        resultCountEl.textContent = resultCountText(shown, total, all.length, searchQuery);
+        resultCountEl.textContent = resultCountText(shown, total, searchQuery);
     }
 
     bookmarksGridEl.innerHTML = filtered.length
@@ -308,8 +301,9 @@ function renderAllTools(categories) {
 }
 
 // Launchpad selection. A store item opts in with `pinned: true`; only when
-// nothing opts in do the fallback titles stand in. Either way the store order
-// is preserved and the result is capped, independent of the embedded copy size.
+// nothing opts in do the fallback titles stand in, walked in the listed order
+// and skipping titles the store does not carry. The pinned path keeps store
+// order. Either way the result is capped at eight.
 function selectLaunchpad(categories) {
     const items = [];
     (categories || []).forEach(cat => {
@@ -317,8 +311,9 @@ function selectLaunchpad(categories) {
     });
     const pinned = items.filter(item => item && item.pinned === true);
     if (!pinned.length) {
-        return items
-            .filter(item => item && PINNED_FALLBACK_TITLES.includes(item.title))
+        return PINNED_FALLBACK_TITLES
+            .map((title) => items.find((item) => item && item.title === title))
+            .filter(Boolean)
             .slice(0, PINNED_LIMIT);
     }
     return pinned.slice(0, PINNED_LIMIT);
@@ -342,17 +337,6 @@ function launchpadTile(item) {
         '<span class="launchpad-icon">' + monogram(item) + '</span>' +
         '<span class="launchpad-tile-label">' + title + '</span>' +
         '</a>';
-}
-
-function renderBookmarks(categories) {
-    // If the data is flat (old personal array structure fallback), wrap it
-    if (categories.length > 0 && !categories[0].category) {
-        categories = [{ category: 'Bookmarks', items: categories }];
-    }
-
-    bookmarksGridEl.innerHTML = categories.map(
-        cat => categorySection(cat.category, cat.items)
-    ).join('');
 }
 
 // Jump back in draws from the decayed `score` the server adds to each item;
@@ -407,50 +391,23 @@ function renderMostUsed(categories) {
     mostUsedEl.innerHTML = entries.map(entry => usageRow(entry, maxScore)).join('');
 }
 
-// Record bookmark activation server-side, for both All tools cards and Jump
-// back in rows. sendBeacon survives the navigation that a plain fetch would
-// cancel; auxclick covers middle-click, while plain and ctrl/cmd clicks arrive
-// as click.
-function recordBookmarkHit(event) {
+// Record link activation server-side for every card: All tools rows, Jump back
+// in rows and Launchpad tiles. One document-level pair of listeners means a
+// click is recorded exactly once whichever container rendered the link, and
+// re-rendering never needs per-row listeners. sendBeacon survives the
+// navigation that a plain fetch would cancel; auxclick covers middle-click,
+// while plain and ctrl/cmd clicks arrive as click.
+function recordHit(event) {
     if (event.type === 'auxclick' && event.button !== 1) return;
-    const card = event.target.closest('.bookmark-card, .usage-row');
-    if (!card) return;
-    const url = card.getAttribute('href');
-    if (!url) return;
-    navigator.sendBeacon('/api/hit', JSON.stringify({ url }));
-}
-
-// All tools rows use the same beacon path as every other bookmark link. This
-// is delegated from the list container so re-rendering after a search does not
-// need to re-attach per-row listeners.
-function recordToolHit(event) {
-    if (event.type === 'auxclick' && event.button !== 1) return;
-    const link = event.target.closest('.tool-link');
+    const link = event.target.closest('.usage-row, .tool-link, .launchpad-tile');
     if (!link) return;
     const url = link.getAttribute('href');
     if (!url) return;
     navigator.sendBeacon('/api/hit', JSON.stringify({ url }));
 }
 
-bookmarksGridEl.addEventListener('click', recordBookmarkHit);
-bookmarksGridEl.addEventListener('auxclick', recordBookmarkHit);
-bookmarksGridEl.addEventListener('click', recordToolHit);
-bookmarksGridEl.addEventListener('auxclick', recordToolHit);
-mostUsedEl.addEventListener('click', recordBookmarkHit);
-mostUsedEl.addEventListener('auxclick', recordBookmarkHit);
-
-// Launchpad tiles share the same beacon contract as bookmark cards.
-function recordLaunchpadHit(event) {
-    if (event.type === 'auxclick' && event.button !== 1) return;
-    const tile = event.target.closest('.launchpad-tile');
-    if (!tile) return;
-    const url = tile.getAttribute('href');
-    if (!url) return;
-    navigator.sendBeacon('/api/hit', JSON.stringify({ url }));
-}
-
-launchpadGridEl.addEventListener('click', recordLaunchpadHit);
-launchpadGridEl.addEventListener('auxclick', recordLaunchpadHit);
+document.addEventListener('click', recordHit);
+document.addEventListener('auxclick', recordHit);
 
 // ---------- search ----------
 
@@ -460,8 +417,8 @@ function isTypingTarget(target) {
     return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !!target.isContentEditable;
 }
 
-// #42 owns the All tools filtering. The shell exposes the seam the field writes
-// to and leaves the full list visible until then.
+// The search field filters All tools in place; every other card reflects the
+// store as loaded.
 function applySearchFilter(query) {
     searchQuery = query;
     renderAllTools(bookmarkStore);
@@ -526,6 +483,9 @@ async function loadBookmarks() {
         }
     } catch (e) {
         console.warn('bookmark store unreachable, keeping the embedded copy', e);
+        // Keep the quiet empty state (or the last scored rows) instead of
+        // leaving the card blank after a failed fetch.
+        renderMostUsed(bookmarkStore);
     }
 }
 
@@ -601,13 +561,26 @@ function avgText(value) {
     return value === null ? '—' : Math.round(value) + '%';
 }
 
-function networkSummary(devices) {
+// One count feeds both the Network summary and the toolbar health text.
+function deviceCounts(devices) {
     const total = devices.length;
-    if (!total) return 'no device data';
     const online = devices.filter((d) => d.online).length;
-    const cpu = averageSample(devices, 'cpu_pct');
+    return { online, total };
+}
+
+function networkSummary(devices) {
+    const { online, total } = deviceCounts(devices);
+    if (!total) return 'no device data';
+    // The avg CPU part is always present; a missing sample reads as an em dash.
     return online + '/' + total + ' online · ' +
-        (cpu === null ? '—' : Math.round(cpu) + '% avg CPU');
+        avgText(averageSample(devices, 'cpu_pct')) + ' avg CPU';
+}
+
+// One helper owns the "cpu · ram" chip meta for both the full render and the
+// in-place poll patch.
+function chipMeta(group) {
+    return avgText(averageSample(group, 'cpu_pct')) + ' cpu · ' +
+        avgText(averageSample(group, 'mem_pct')) + ' ram';
 }
 
 function kindChips(devices) {
@@ -619,46 +592,53 @@ function kindChips(devices) {
             return '<div class="kind-chip" data-kind="' + escapeHtml(key) + '">' +
                 '<span class="kind-name">' + escapeHtml(kindLabel(key)) + '</span>' +
                 '<span class="kind-count">' + group.length + '</span>' +
-                '<span class="kind-meta">' + avgText(averageSample(group, 'cpu_pct')) + ' cpu · ' +
-                avgText(averageSample(group, 'mem_pct')) + ' ram</span>' +
+                '<span class="kind-meta">' + chipMeta(group) + '</span>' +
                 '</div>';
         })
         .join('');
 }
 
+// 24-hour HH:MM, independent of the browser locale (a 12-hour locale must not
+// turn 14:05 into 2:05 PM).
 function updatedLabel(timestamp) {
     if (!timestamp) return '';
-    return 'updated ' + new Date(timestamp * 1000).toLocaleTimeString([], {
-        hour: '2-digit', minute: '2-digit'
-    });
+    const date = new Date(timestamp * 1000);
+    return 'updated ' + String(date.getHours()).padStart(2, '0') + ':' +
+        String(date.getMinutes()).padStart(2, '0');
 }
 
-function metricCell(label, key, raw) {
+function metricCell(metric, raw) {
     const value = clampPct(raw);
     const warn = value !== null && value >= METRIC_WARN_PCT ? ' is-warn' : '';
-    return '<span class="metric' + warn + '" data-metric="' + key + '">' +
-        '<span class="metric-label">' + label + '</span>' +
+    return '<span class="metric' + warn + '" data-metric="' + metric.key + '">' +
+        '<span class="metric-label">' + metric.label + '</span>' +
         '<span class="metric-value">' + (value === null ? '—' : Math.round(value) + '%') + '</span>' +
         '<span class="metric-bar"><i class="metric-fill" style="width:' + (value === null ? 0 : value) + '%"></i></span>' +
         '</span>';
 }
 
-// Online rows read "kind · up 3d 4h"; offline rows keep their last-seen time
-// so a missing heartbeat is legible without opening anything.
+// Online rows read "kind · up 3d 4h · online"; offline rows keep their
+// last-seen time and say "offline". The status is text as well as the dot, so
+// assistive tech does not depend on colour.
 function deviceSub(d) {
     if (!d.online) {
-        return d.last_seen ? fmtAgo(d.last_seen) : kindLabel(d.kind);
+        return (d.last_seen ? fmtAgo(d.last_seen) : kindLabel(d.kind)) + ' · offline';
     }
     const kind = kindLabel(d.kind);
-    return d.uptime_s === null || d.uptime_s === undefined
+    const detail = d.uptime_s === null || d.uptime_s === undefined
         ? kind
         : kind + ' · up ' + fmtUptime(d.uptime_s);
+    return detail + ' · online';
+}
+
+function deviceKey(d) {
+    return d.id || d.name;
 }
 
 function deviceRow(d) {
     const online = !!d.online;
     const state = online ? 'online' : 'offline';
-    return '<div class="device-row ' + state + '" data-device-id="' + escapeHtml(d.id || d.name) + '">' +
+    return '<div class="device-row ' + state + '" data-device-id="' + escapeHtml(deviceKey(d)) + '">' +
         '<div class="device-id">' +
         '<span class="device-dot ' + state + '" aria-hidden="true"></span>' +
         '<span class="device-text">' +
@@ -667,17 +647,14 @@ function deviceRow(d) {
         '<span class="device-error"' + (d.error ? '' : ' hidden') + '>' + escapeHtml(d.error || '') + '</span>' +
         '</span>' +
         '</div>' +
-        metricCell('CPU', 'cpu', d.cpu_pct) +
-        metricCell('RAM', 'ram', d.mem_pct) +
-        metricCell('DSK', 'disk', d.disk_pct) +
+        DEVICE_METRICS.map((metric) => metricCell(metric, d[metric.field])).join('') +
         '</div>';
 }
 
+// Order only by kind: devices inside a kind keep the order the server sent.
+// Array.prototype.sort is stable, so equal ranks never move.
 function sortNetworkDevices(devices) {
-    return devices.slice().sort((a, b) =>
-        kindRank(a.kind) - kindRank(b.kind) ||
-        String(a.name || '').localeCompare(String(b.name || ''))
-    );
+    return devices.slice().sort((a, b) => kindRank(a.kind) - kindRank(b.kind));
 }
 
 // Full render happens once and whenever the device set itself changes.
@@ -691,7 +668,7 @@ function renderNetwork(devices) {
 }
 
 function networkKey(devices) {
-    return devices.map((d) => (d.id || d.name) + ':' + (d.kind || '')).join('|');
+    return devices.map((d) => deviceKey(d) + ':' + (d.kind || '')).join('|');
 }
 
 function patchMetric(cell, raw) {
@@ -720,18 +697,16 @@ function patchNetwork(devices) {
         const errorEl = row.querySelector('.device-error');
         errorEl.textContent = d.error || '';
         errorEl.hidden = !d.error;
-        patchMetric(row.querySelector('[data-metric="cpu"]'), d.cpu_pct);
-        patchMetric(row.querySelector('[data-metric="ram"]'), d.mem_pct);
-        patchMetric(row.querySelector('[data-metric="disk"]'), d.disk_pct);
+        DEVICE_METRICS.forEach((metric) => {
+            patchMetric(row.querySelector('[data-metric="' + metric.key + '"]'), d[metric.field]);
+        });
     });
 
     const groups = groupDevicesByKind(devices);
     kindChipsEl.querySelectorAll('.kind-chip').forEach((chip) => {
         const group = groups[chip.getAttribute('data-kind')] || [];
         chip.querySelector('.kind-count').textContent = String(group.length);
-        chip.querySelector('.kind-meta').textContent =
-            avgText(averageSample(group, 'cpu_pct')) + ' cpu · ' +
-            avgText(averageSample(group, 'mem_pct')) + ' ram';
+        chip.querySelector('.kind-meta').textContent = chipMeta(group);
     });
 }
 
@@ -751,8 +726,7 @@ function setNetworkStale(stale) {
 // Health is the toolbar's dot plus "n/m online". Amber whenever anything is
 // offline; green only when every device is online.
 function renderHealth(devices) {
-    const total = devices.length;
-    const online = devices.filter((d) => d.online).length;
+    const { online, total } = deviceCounts(devices);
     const status = total === 0 ? 'unknown' : (online === total ? 'online' : 'warn');
     healthDotEl.className = 'health-dot ' + status;
     healthTextEl.textContent = total ? online + '/' + total + ' online' : 'no devices';
