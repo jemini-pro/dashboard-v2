@@ -1,0 +1,44 @@
+{
+	admin off
+}
+
+# current production shape: default encode, Python static, no-store, HTTP/1.0 upstream
+:18080 {
+	encode zstd gzip
+	reverse_proxy current:8000
+}
+
+# caching + HTTP/1.1 keep-alive + tuned compression, same page
+:18081 {
+	encode {
+		gzip 9
+		zstd
+	}
+	reverse_proxy cached:8000
+}
+
+# caching + lean page: no calendar iframe, no Google Fonts
+:18082 {
+	encode {
+		gzip 9
+		zstd
+	}
+	reverse_proxy lean:8000
+}
+
+# static served by Caddy, API proxied to the cached app
+:18083 {
+	encode {
+		gzip 9
+		zstd
+	}
+	@api path /api/*
+	handle @api {
+		reverse_proxy cached:8000
+	}
+	handle {
+		root * /srv/lean
+		header Cache-Control "public, max-age=0, must-revalidate"
+		file_server
+	}
+}

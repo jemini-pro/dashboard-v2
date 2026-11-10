@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Mac agent. No secret in this file: the token lives in ~/dash/.token (600).
+
+  Setup:
+    mkdir -p ~/dash
+    curl -fsSL https://pve.tail73491d.ts.net:8448/agents/dash-agent.py -o ~/dash/dash-agent.py
+    printf '%s' '<token>' > ~/dash/.token && chmod 600 ~/dash/.token
+    curl -fsSL https://pve.tail73491d.ts.net:8448/agents/com.jem.dashagent.plist \
+      -o ~/Library/LaunchAgents/com.jem.dashagent.plist
+    sed -i '' "s|/Users/YOURNAME/|$HOME/|" ~/Library/LaunchAgents/com.jem.dashagent.plist
+    plutil -lint ~/Library/LaunchAgents/com.jem.dashagent.plist
+    launchctl load -w ~/Library/LaunchAgents/com.jem.dashagent.plist
+
+  Check:   launchctl list | grep dashagent
+  Log:     tail -f /tmp/dash-agent.log
+  Remove:  launchctl unload -w ~/Library/LaunchAgents/com.jem.dashagent.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jem.dashagent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/YOURNAME/dash/dash-agent.py</string>
+        <string>--loop</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DASH_URL</key>
+        <string>https://pve.tail73491d.ts.net:8448</string>
+        <key>DASH_KIND</key>
+        <string>mac</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/dash-agent.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/dash-agent.log</string>
+</dict>
+</plist>

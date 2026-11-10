@@ -1,0 +1,75 @@
+name: lab
+
+# Throwaway benchmark stack. Never exposed on the tailnet; ports 18080-18083
+# are LAN-only and the whole project is removed after the run.
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: lab-caddy
+    restart: "no"
+    ports:
+      - "18080:18080"
+      - "18081:18081"
+      - "18082:18082"
+      - "18083:18083"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./variants/lean/static:/srv/lean:ro
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 128
+    depends_on:
+      - current
+      - cached
+      - lean
+
+  current:
+    image: python:3.13-alpine
+    container_name: lab-current
+    restart: "no"
+    working_dir: /app
+    command: ["python", "-u", "app.py"]
+    volumes:
+      - ./server/app_current.py:/app/app.py:ro
+      - ./variants/current/static:/app/static:ro
+      - ./data/current:/app/data
+    mem_limit: 96m
+    cpus: 0.5
+    pids_limit: 64
+    environment:
+      DASH_PORT: "8000"
+      DASH_TOKEN: ""
+
+  cached:
+    image: python:3.13-alpine
+    container_name: lab-cached
+    restart: "no"
+    working_dir: /app
+    command: ["python", "-u", "app.py"]
+    volumes:
+      - ./server/app_cached.py:/app/app.py:ro
+      - ./variants/cached/static:/app/static:ro
+      - ./data/cached:/app/data
+    mem_limit: 96m
+    cpus: 0.5
+    pids_limit: 64
+    environment:
+      DASH_PORT: "8000"
+      DASH_TOKEN: ""
+
+  lean:
+    image: python:3.13-alpine
+    container_name: lab-lean
+    restart: "no"
+    working_dir: /app
+    command: ["python", "-u", "app.py"]
+    volumes:
+      - ./server/app_cached.py:/app/app.py:ro
+      - ./variants/lean/static:/app/static:ro
+      - ./data/lean:/app/data
+    mem_limit: 96m
+    cpus: 0.5
+    pids_limit: 64
+    environment:
+      DASH_PORT: "8000"
+      DASH_TOKEN: ""
