@@ -273,21 +273,30 @@ class FrontEndSourceTest(unittest.TestCase):
         self.css = (APP_JS.parent / "style.css").read_text()
 
 
-class MostUsedStripTest(FrontEndSourceTest):
-    """Source-level assertions over the strip helpers and the markup they render.
+class MostUsedCardTest(FrontEndSourceTest):
+    """Ticket #44: the Jump back in card is driven by server-stamped scores.
 
-    Manual check in a browser: serve the dashboard, click one link, reload, and
-    confirm the strip appears above Network.
+    There is no JS runtime here, so these assert the seams the card exposes:
+    selection, normalisation, row markup, the empty state and beacon
+    delegation. Manual check: click a link, reload, and confirm it rises in
+    the card beside the Launchpad.
     """
 
-    def test_strip_sits_directly_above_the_network_panel_and_starts_hidden(self):
-        strip = self.html.index('id="most-used"')
-        panel = self.html.index('class="network-panel"')
-        self.assertLess(strip, panel)
+    def _usage_card(self):
+        start = self.html.index('class="card usage-card"')
+        end = self.html.index('class="card launchpad-card"', start)
+        return self.html[start:end]
 
-        tag_start = self.html.rindex("<", 0, strip)
-        tag_end = self.html.index(">", strip)
-        self.assertIn(" hidden", self.html[tag_start:tag_end])
+    def test_card_sits_beside_launchpad_without_tab_chrome_and_keeps_an_empty_list(self):
+        card = self._usage_card()
+
+        self.assertIn("Jump back in", card)
+        self.assertIn('id="most-used"', card)
+        self.assertIn('class="usage-list"', card)
+        self.assertNotIn("hidden", card)
+        self.assertNotIn('role="tab', card)
+        self.assertNotIn("data-usage-tab", card)
+        self.assertNotIn("Recent", card)
 
     def test_selection_keeps_scores_above_half_sorted_desc_capped_at_six(self):
         self.assertRegex(self.js, r"MOST_USED_MIN_SCORE\s*=\s*0\.5\b")
@@ -299,65 +308,86 @@ class MostUsedStripTest(FrontEndSourceTest):
         self.assertRegex(body, r"sort\(\s*\(a,\s*b\)\s*=>\s*b\.score\s*-\s*a\.score\s*\)")
         self.assertRegex(body, r"slice\(\s*0,\s*MOST_USED_LIMIT\s*\)")
 
-    def test_strip_is_populated_only_after_the_scored_api_payload_arrives(self):
-        load = function_body(self.js, "loadBookmarks")
+    def test_score_bar_is_normalised_against_the_highest_visible_score(self):
+        render = function_body(self.js, "renderMostUsed")
+        row = function_body(self.js, "usageRow")
+        percent = function_body(self.js, "usageBarPercent")
+
+        self.assertIn("entries[0].score", render)
+        self.assertIn("usageRow(entry, maxScore)", render)
+        self.assertIn("usageBarPercent(entry.score, maxScore)", row)
+        self.assertIn("(score / maxScore) * 100", percent)
+        self.assertIn("Math.round", percent)
+        self.assertIn("Math.max(0,", percent)
+        self.assertIn("Math.min(100,", percent)
+
+    def test_rows_show_monogram_title_description_and_bar_without_the_raw_score(self):
+        row = function_body(self.js, "usageRow")
+
+        self.assertIn("const item = entry.item", row)
+        self.assertIn("monogram(item)", row)
+        self.assertIn('class="usage-row"', row)
+        self.assertIn("escapeHtml(item.title)", row)
+        self.assertIn("escapeHtml(item.desc || '')", row)
+        self.assertIn('target="_blank"', row)
+        self.assertIn('class="usage-bar"', row)
+        self.assertIn("width:", row)
+        self.assertNotIn("${entry.score}", row)
+        self.assertNotIn("usage-score", row)
+        self.assertNotIn("usage-count", row)
+
+    def test_empty_state_keeps_the_card_and_shows_no_usage_yet(self):
         render = function_body(self.js, "renderMostUsed")
 
-        self.assertIn("renderMostUsed(data.work)", load)
-        self.assertIn("hidden = true", render)
+        self.assertIn("No usage yet", render)
         self.assertIn("hidden = false", render)
+        self.assertNotIn("hidden = true", render)
 
-        # The scoreless embedded copy is painted by renderBookmarks, and that
-        # path must never populate the strip.
+    def test_only_the_scored_api_payload_populates_the_card(self):
+        load = function_body(self.js, "loadBookmarks")
+
+        self.assertIn("renderMostUsed(data.work)", load)
+
+        # The scoreless embedded copy paints the grids for first paint; it must
+        # never populate the usage card.
         self.assertNotIn("renderMostUsed", function_body(self.js, "renderBookmarks"))
         self.assertNotIn("renderMostUsed", function_body(self.js, "updateDashboard"))
 
-    def test_embedded_first_paint_bookmarks_carry_no_scores(self):
         embedded = self.js[self.js.index("const bookmarks = {"):self.js.index("const clockEl")]
-
         self.assertNotIn("score", embedded)
 
-    def test_category_contents_and_order_are_never_sorted(self):
+    def test_category_order_and_contents_are_never_sorted_by_usage(self):
         body = function_body(self.js, "renderBookmarks")
-        section = function_body(self.js, "categorySection")
 
         self.assertNotIn(".sort(", body)
-        self.assertNotIn(".sort(", section)
         self.assertRegex(
             body,
             r"categories\.map\(\s*cat\s*=>\s*categorySection\(cat\.category,\s*cat\.items\)",
         )
-        self.assertRegex(section, r"items\.map\(item\s*=>\s*bookmarkCard\(item\)\)")
 
-    def test_bookmarks_and_strip_share_one_category_section_renderer(self):
-        self.assertIn(
-            "categorySection(cat.category, cat.items)",
-            function_body(self.js, "renderBookmarks"),
-        )
-        self.assertIn(
-            "categorySection('Most used', items)",
-            function_body(self.js, "renderMostUsed"),
-        )
-        section = function_body(self.js, "categorySection")
-        self.assertIn('class="category-section"', section)
-        self.assertIn('class="category-title"', section)
-        self.assertIn('class="items-grid"', section)
+    def test_click_and_auxclick_send_a_beacon_delegated_from_the_card(self):
+        hit = function_body(self.js, "recordBookmarkHit")
 
-    def test_strip_tiles_reuse_bookmark_card_markup_and_open_like_tiles(self):
-        render = function_body(self.js, "renderMostUsed")
-        section = function_body(self.js, "categorySection")
-        card = function_body(self.js, "bookmarkCard")
+        self.assertIn("mostUsedEl.addEventListener('click', recordBookmarkHit)", self.source)
+        self.assertIn("mostUsedEl.addEventListener('auxclick', recordBookmarkHit)", self.source)
+        self.assertIn(".usage-row", hit)
+        self.assertIn("closest(", hit)
+        self.assertIn("event.type === 'auxclick' && event.button !== 1", hit)
+        self.assertIn("navigator.sendBeacon('/api/hit', JSON.stringify({ url }))", hit)
 
-        self.assertIn("categorySection('Most used', items)", render)
-        self.assertIn("bookmarkCard(", section)
-        self.assertIn('class="bookmark-card"', card)
-        self.assertIn('target="_blank"', card)
+    def test_old_most_used_strip_is_gone(self):
+        self.assertNotIn('class="most-used', self.html)
+        self.assertNotIn(".most-used", self.css)
+        self.assertNotIn("categorySection('Most used'", self.js)
 
-    def test_strip_is_hidden_by_style_and_survives_the_mobile_breakpoint(self):
-        self.assertIn(".most-used[hidden]", self.css)
-        self.assertNotRegex(
+    def test_usage_rows_have_their_own_compact_styles(self):
+        self.assertRegex(self.css, r"\.usage-list\s*\{[^}]*list-style:\s*none")
+        self.assertRegex(self.css, r"\.usage-row\s*\{[^}]*display:\s*grid")
+        self.assertRegex(self.css, r"\.usage-row\s*\{[^}]*grid-template-columns:")
+        self.assertRegex(self.css, r"\.usage-bar\s*\{[^}]*height:\s*3px")
+        self.assertRegex(
             self.css,
-            r"\.most-used\s*\{[^}]*display\s*:\s*(block|flex|grid)",
+            r"\.usage-bar > span\s*\{[^}]*background:\s*var\(--accent-color\)",
         )
 
 
