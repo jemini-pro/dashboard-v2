@@ -204,6 +204,18 @@ h1 {
     width: 100%;
 }
 
+/* ---------- Most used strip ---------- */
+
+.most-used {
+    text-align: left;
+    margin-bottom: 2.5rem;
+}
+
+/* The strip renders no heading and no box until scored history exists. */
+.most-used[hidden] {
+    display: none;
+}
+
 .category-section {
     width: 100%;
     text-align: left;
@@ -451,6 +463,10 @@ h1 {
 
     .bookmarks-grid {
         gap: 2rem;
+    }
+
+    .most-used {
+        margin-bottom: 1.5rem;
     }
 
     .items-grid {

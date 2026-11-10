@@ -1,5 +1,7 @@
 const WORK_START_HOUR = 9;
 const WORK_END_HOUR = 17;
+const MOST_USED_MIN_SCORE = 0.5;
+const MOST_USED_LIMIT = 6;
 
 const bookmarks = {
     work: [
@@ -87,6 +89,7 @@ const bookmarks = {
 const clockEl = document.getElementById('clock');
 const greetingEl = document.getElementById('greeting');
 const bookmarksGridEl = document.getElementById('bookmarks-grid');
+const mostUsedEl = document.getElementById('most-used');
 const debugTimeInput = document.getElementById('debug-time');
 const resetTimeBtn = document.getElementById('reset-time');
 const debugMenuBtn = document.getElementById('debug-menu-btn');
@@ -153,6 +156,18 @@ function updateDashboard() {
     }
 }
 
+function bookmarkCard(item) {
+    return `
+        <a href="${item.url}" class="bookmark-card" target="_blank">
+            <div class="bookmark-icon-text">${item.icon}</div>
+            <div class="bookmark-details">
+                <div class="bookmark-title">${item.title}</div>
+                <div class="bookmark-desc">${item.desc || ''}</div>
+            </div>
+        </a>
+    `;
+}
+
 function renderBookmarks(categories) {
     // If the data is flat (old personal array structure fallback), wrap it
     if (categories.length > 0 && !categories[0].category) {
@@ -163,18 +178,43 @@ function renderBookmarks(categories) {
         <div class="category-section">
             <h2 class="category-title">${cat.category}</h2>
             <div class="items-grid">
-                ${cat.items.map(item => `
-                    <a href="${item.url}" class="bookmark-card" target="_blank">
-                        <div class="bookmark-icon-text">${item.icon}</div>
-                        <div class="bookmark-details">
-                            <div class="bookmark-title">${item.title}</div>
-                            <div class="bookmark-desc">${item.desc || ''}</div>
-                        </div>
-                    </a>
-                `).join('')}
+                ${cat.items.map(item => bookmarkCard(item)).join('')}
             </div>
         </div>
     `).join('');
+}
+
+// The Most used strip draws from the decayed `score` the server adds to each
+// item; the scoreless embedded copy used for the first paint never qualifies.
+// This picks copies for the strip and leaves the category order untouched.
+function selectMostUsed(categories, minScore = MOST_USED_MIN_SCORE, limit = MOST_USED_LIMIT) {
+    const scored = [];
+    (categories || []).forEach(cat => {
+        (cat.items || []).forEach(item => {
+            const score = Number(item.score) || 0;
+            if (score > minScore) scored.push({ item, score });
+        });
+    });
+    return scored
+        .sort((a, b) => b.score - a.score)
+        .slice(0, limit)
+        .map(entry => entry.item);
+}
+
+function renderMostUsed(categories) {
+    const items = selectMostUsed(categories);
+    if (!items.length) {
+        mostUsedEl.hidden = true;
+        mostUsedEl.innerHTML = '';
+        return;
+    }
+    mostUsedEl.innerHTML = `
+        <h2 class="category-title">Most used</h2>
+        <div class="items-grid">
+            ${items.map(item => bookmarkCard(item)).join('')}
+        </div>
+    `;
+    mostUsedEl.hidden = false;
 }
 
 // Record bookmark activation server-side. sendBeacon survives the navigation
@@ -191,6 +231,8 @@ function recordBookmarkHit(event) {
 
 bookmarksGridEl.addEventListener('click', recordBookmarkHit);
 bookmarksGridEl.addEventListener('auxclick', recordBookmarkHit);
+mostUsedEl.addEventListener('click', recordBookmarkHit);
+mostUsedEl.addEventListener('auxclick', recordBookmarkHit);
 
 // Debug Controls
 debugTimeInput.addEventListener('change', (e) => {
@@ -223,7 +265,10 @@ async function loadBookmarks() {
         const res = await fetch('/api/bookmarks', { cache: 'no-store' });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
-        if (data && Array.isArray(data.work) && data.work.length) renderBookmarks(data.work);
+        if (data && Array.isArray(data.work) && data.work.length) {
+            renderBookmarks(data.work);
+            renderMostUsed(data.work);
+        }
     } catch (e) {
         console.warn('bookmark store unreachable, keeping the embedded copy', e);
     }
