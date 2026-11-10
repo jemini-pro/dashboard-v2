@@ -77,6 +77,14 @@ if [ ! -f "$STACK/dash/data/bookmarks.json" ]; then
 fi
 chown -R 1000:1000 "$STACK/dash/data"
 
+# Third-party references belong to the front-end source, not the rendered page:
+# the rendered page embeds the live bookmark store, and a bookmark may point
+# anywhere, including calendar.google.com.
+if grep -RqsE 'calendar\.google\.com|fonts\.googleapis\.com|fonts\.gstatic\.com' \
+        "$STACK/dash/static/index.html" "$STACK/dash/static/app.js" "$STACK/dash/static/style.css"; then
+    die "third-party references remain in the installed front end"
+fi
+
 say "up"
 ( cd "$STACK" && DASH_BIND=10.10.10.20 docker compose up -d --remove-orphans )
 
@@ -99,7 +107,6 @@ import urllib.request
 html = urllib.request.urlopen("http://127.0.0.1:8000/").read().decode()
 assert "__BOOKMARKS_JSON__" not in html, "bookmark placeholder was not replaced"
 assert 'id="bookmarks-data"' in html, "bookmark data script is missing"
-assert "calendar.google.com" not in html, "calendar reference survived"
 print("page ok")
 PY
     die "page render check failed; rollback: tar -xzf $BACKUP -C $STACK && (cd $STACK && docker compose up -d)"
@@ -107,6 +114,16 @@ PY
 CODE="$(curl -s -o /dev/null -w '%{http_code}' http://10.10.10.20:8448/ || true)"
 if [ "$CODE" != "401" ]; then
     die "Caddy answered $CODE without credentials, expected 401; rollback: tar -xzf $BACKUP -C $STACK && (cd $STACK && docker compose up -d)"
+fi
+
+# A mangled hash also answers 401 to everything, so compare what .env says with
+# what the container actually received. Compose interpolation silently truncates
+# a bcrypt hash unless env_file uses format: raw.
+say "auth"
+WANT_HASH="$(sed -n 's/^DASH_AUTH_HASH=//p' "$STACK/dash/.env" | head -1)"
+GOT_HASH="$(docker compose -f "$STACK/docker-compose.yml" exec -T caddy printenv DASH_AUTH_HASH | tr -d '\r\n' || true)"
+if [ "$WANT_HASH" != "$GOT_HASH" ]; then
+    die "caddy holds a ${#GOT_HASH}-byte hash, .env holds ${#WANT_HASH} bytes; env_file interpolation truncated it, so no password can match. Keep format: raw. rollback: tar -xzf $BACKUP -C $STACK && (cd $STACK && docker compose up -d)"
 fi
 
 say "done"

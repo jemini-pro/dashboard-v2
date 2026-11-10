@@ -19,7 +19,11 @@ services:
       - "${DASH_BIND:-0.0.0.0}:8448:8448"
     env_file:
       # Holds DASH_AUTH_HASH for this file. Live: /opt/stack/dash/.env.
-      - ${DASH_ENV_FILE:-./dash/.env}
+      # format: raw stops compose interpolating the value. A bcrypt hash is
+      # mostly "$" segments, and interpolation silently truncates it, which
+      # leaves Caddy hashing nothing and every request answering 401.
+      - path: ${DASH_ENV_FILE:-./dash/.env}
+        format: raw
     volumes:
       # Defaults are the live /opt/stack layout. Running from this repo
       # (server/) overrides CADDYFILE=./Caddyfile.
@@ -54,7 +58,10 @@ services:
     cgroup: host
     env_file:
       # Live: /opt/stack/dash/.env. Repo: DASH_ENV_FILE=./.env from server/.
-      - ${DASH_ENV_FILE:-./dash/.env}
+      # raw: DASH_TOKEN and the auth hash contain "$" and must reach the
+      # process byte for byte, not interpolated.
+      - path: ${DASH_ENV_FILE:-./dash/.env}
+        format: raw
     volumes:
       # The code mount is readable; data is a separate writable mount so the
       # bookmark store and click history survive recreating this container.
