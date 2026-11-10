@@ -8,7 +8,9 @@ services:
     ports:
       - "8448:8448"
     volumes:
-      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Defaults are the live /opt/stack layout. Running from this repo
+      # (server/) overrides CADDYFILE=./Caddyfile.
+      - ${CADDYFILE:-./caddy/Caddyfile}:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
@@ -26,9 +28,14 @@ services:
     # the box, not one 12 MB process inside it.
     cgroup: host
     env_file:
-      - ./dash/.env
+      # Live: /opt/stack/dash/.env. Repo: DASH_ENV_FILE=./.env from server/.
+      - ${DASH_ENV_FILE:-./dash/.env}
     volumes:
-      - ./dash:/app
+      # The whole dashboard directory is bind-mounted. In the live stack the
+      # host side is /opt/stack/dash, so data/ (bookmarks.json, hits.json,
+      # agents.json) lives at /opt/stack/dash/data/ and survives recreating
+      # this container. Repo: DASH_DIR=. from server/ (with static/ copied in).
+      - ${DASH_DIR:-./dash}:/app
 
 volumes:
   caddy_data:
