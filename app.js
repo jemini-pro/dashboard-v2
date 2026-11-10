@@ -195,8 +195,8 @@ function bookmarkCard(item) {
     `;
 }
 
-// One section skeleton for both the bookmark categories and the Most used strip,
-// so the two grids can never drift apart in markup.
+// Category grid skeleton for All tools. The Jump back in card has its own
+// compact row renderer below, so the two layouts stay independent.
 function categorySection(title, items) {
     return `
         <div class="category-section">
@@ -230,9 +230,9 @@ function renderBookmarks(categories) {
     ).join('');
 }
 
-// The Most used strip draws from the decayed `score` the server adds to each
-// item; the scoreless embedded copy used for the first paint never qualifies.
-// This picks copies for the strip and leaves the category order untouched.
+// Jump back in draws from the decayed `score` the server adds to each item;
+// the scoreless embedded copy used for the first paint never qualifies. This
+// picks copies for the card and leaves the category order untouched.
 function selectMostUsed(categories) {
     const scored = [];
     (categories || []).forEach(cat => {
@@ -243,29 +243,52 @@ function selectMostUsed(categories) {
     });
     return scored
         .sort((a, b) => b.score - a.score)
-        .slice(0, MOST_USED_LIMIT)
-        .map(entry => entry.item);
+        .slice(0, MOST_USED_LIMIT);
 }
 
-// Jump back in render hook. #44 replaces the card grid with the compact
-// Most used rows and the quiet "No usage yet" empty state.
+// The bar compares each row with the highest score currently on show, so the
+// top row always fills it. Callers never render the raw score as a number.
+function usageBarPercent(score, maxScore) {
+    if (!maxScore || maxScore <= 0) return 0;
+    return Math.max(0, Math.min(100, Math.round((score / maxScore) * 100)));
+}
+
+function usageRow(entry, maxScore) {
+    const item = entry.item;
+    const pct = usageBarPercent(entry.score, maxScore);
+    return `
+        <li>
+            <a href="${escapeHtml(item.url)}" class="usage-row" target="_blank" rel="noreferrer">
+                <span class="usage-icon">${monogram(item)}</span>
+                <span class="usage-main">
+                    <span class="usage-title">${escapeHtml(item.title)}</span>
+                    <span class="usage-desc">${escapeHtml(item.desc || '')}</span>
+                </span>
+                <span class="usage-bar" aria-hidden="true"><span style="width:${pct}%"></span></span>
+            </a>
+        </li>
+    `;
+}
+
+// The card stays visible when nothing qualifies, with a quiet empty row.
 function renderMostUsed(categories) {
-    const items = selectMostUsed(categories);
-    if (!items.length) {
-        mostUsedEl.hidden = true;
-        mostUsedEl.innerHTML = '';
+    const entries = selectMostUsed(categories);
+    mostUsedEl.hidden = false;
+    if (!entries.length) {
+        mostUsedEl.innerHTML = '<li class="usage-empty">No usage yet</li>';
         return;
     }
-    mostUsedEl.innerHTML = categorySection('Most used', items);
-    mostUsedEl.hidden = false;
+    const maxScore = entries[0].score;
+    mostUsedEl.innerHTML = entries.map(entry => usageRow(entry, maxScore)).join('');
 }
 
-// Record bookmark activation server-side. sendBeacon survives the navigation
-// that a plain fetch would cancel; auxclick covers middle-click, while plain
-// and ctrl/cmd clicks arrive as click.
+// Record bookmark activation server-side, for both All tools cards and Jump
+// back in rows. sendBeacon survives the navigation that a plain fetch would
+// cancel; auxclick covers middle-click, while plain and ctrl/cmd clicks arrive
+// as click.
 function recordBookmarkHit(event) {
     if (event.type === 'auxclick' && event.button !== 1) return;
-    const card = event.target.closest('.bookmark-card');
+    const card = event.target.closest('.bookmark-card, .usage-row');
     if (!card) return;
     const url = card.getAttribute('href');
     if (!url) return;
