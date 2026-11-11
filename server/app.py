@@ -46,18 +46,37 @@ TOKEN = os.environ.get("DASH_TOKEN", "").strip()
 SAMPLE_SECONDS = max(5, int(os.environ.get("DASH_SAMPLE_SECONDS", "60")))
 HISTORY_DAYS = max(1, int(os.environ.get("DASH_HISTORY_DAYS", "30")))
 HISTORY_SECONDS = HISTORY_DAYS * 86400
+# Two pre-aggregated tiers keep long windows from scanning raw rows: 5-minute
+# buckets for the 7d/30d ranges and hourly buckets for 90d/1y. They are
+# recomputed by the sampler from the current bucket, not by a separate job.
+ROLLUP_5M_SECONDS = 300
+ROLLUP_1H_SECONDS = 3600
+ROLLUP_5M_RETENTION = max(
+    1, int(os.environ.get("DASH_ROLLUP_5M_DAYS", "30"))
+) * 86400
+ROLLUP_1H_RETENTION = max(
+    1, int(os.environ.get("DASH_ROLLUP_1H_DAYS", "366"))
+) * 86400
+RAW_MAX_WINDOW = 86400
+ROLLUP_5M_MAX_WINDOW = 30 * 86400
 PRUNE_INTERVAL = 3600
+SUMMARY_CACHE_SECONDS = 30
 METRIC_WINDOWS = {
     "1h": 3600,
     "6h": 6 * 3600,
     "24h": 86400,
     "7d": 7 * 86400,
     "30d": 30 * 86400,
+    "90d": 90 * 86400,
+    "1y": 365 * 86400,
 }
 DEFAULT_WINDOW = "24h"
 # Each default lands at or below MAX_POINTS so a chart never gets a payload it
 # cannot draw. An explicit ?step= is clamped the same way.
-DEFAULT_STEPS = {"1h": 60, "6h": 300, "24h": 300, "7d": 1800, "30d": 7200}
+DEFAULT_STEPS = {
+    "1h": 60, "6h": 300, "24h": 300, "7d": 1800, "30d": 7200,
+    "90d": 21600, "1y": 86400,
+}
 MAX_POINTS = 400
 
 _lock = threading.Lock()
@@ -67,7 +86,18 @@ _db_lock = threading.Lock()
 _cache = {"at": 0.0, "body": None}
 _prev_cpu = {"usec": None, "at": None}
 _availability_cache = {"at": 0.0, "by_id": {}}
+_summary_cache = {"at": 0.0, "window": None, "body": None}
 _last_prune = {"at": 0.0}
+
+
+def _invalidate_summary():
+    """A write changes what the fleet summary would say; drop its cache.
+
+    Called after the write lock is released: stats() holds _lock and then
+    takes _db_lock, so invalidating while holding _db_lock could deadlock.
+    """
+    with _lock:
+        _summary_cache.update(at=0.0, window=None, body=None)
 
 
 # ---------- local machine ----------
@@ -236,6 +266,33 @@ def save_agents(agents):
 # a thousand mounts; the page has no room for them anyway.
 MAX_DISKS = 16
 
+# Extra signals use one generic table and one allowlist, so adding a metric
+# needs no schema migration. Unknown keys are dropped, never stored.
+EXTRA_METRICS = (
+    "load_1", "load_5", "load_15",
+    "swap_used", "swap_total",
+    "net_rx_bps", "net_tx_bps",
+    "cpu_iowait", "cpu_steal",
+)
+PERCENT_METRICS = {"cpu_iowait", "cpu_steal"}
+# A compact strip does not need a year of history; cap the series query.
+SIGNAL_WINDOW_S = 86400
+
+ANNOTATION_KINDS = ("deploy", "restart", "backup", "note")
+MAX_ANNOTATION_TEXT = 200
+MAX_ANNOTATIONS = 200
+# A flapping device can restart every sample. Markers are for humans, so only
+# the most recent auto restarts are sent; the Events rail keeps its own limit.
+MAX_AUTO_ANNOTATIONS = 20
+
+# Curated warning thresholds. Each warning has a warning and a derived
+# critical level; the env vars move the warning line, not the whole rule.
+WARN_DISK_PCT = float(os.environ.get("DASH_WARN_DISK_PCT", "85"))
+WARN_DAYS_TO_90 = float(os.environ.get("DASH_WARN_DAYS_TO_90", "14"))
+WARN_GROWTH = float(os.environ.get("DASH_WARN_GROWTH", "1.0"))
+WARN_OFFLINE_S = int(os.environ.get("DASH_WARN_OFFLINE_S", "600"))
+WARN_MEM_PCT = float(os.environ.get("DASH_WARN_MEM_PCT", "90"))
+
 
 def _finite(value):
     """Return a real number or None. JSON can carry NaN/Infinity, and bools
@@ -313,6 +370,8 @@ def agent_devices():
             "disk_pct": worst_disk_pct(disks, rec.get("disk_pct")),
             "disks": disks,
             "uptime_s": rec.get("uptime_s"),
+            **{metric: rec.get(metric) for metric in EXTRA_METRICS
+               if metric in rec},
             "online": age < 150,  # agents push every 60 s; allow two misses
             "last_seen": int(rec.get("last_seen", 0)),
         })
@@ -347,6 +406,128 @@ CREATE TABLE IF NOT EXISTS samples (
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS samples_ts ON samples (ts);
+
+-- One row per device per mount per bucket. The aggregate disk_pct on
+-- samples keeps its old shape; this table is what makes "which volume is
+-- filling up?" answerable. A repeat inside a bucket replaces the bucket's
+-- rows for that device, so history never double-counts a heartbeat.
+CREATE TABLE IF NOT EXISTS disk_samples (
+    device_id TEXT NOT NULL,
+    mount     TEXT NOT NULL,
+    ts        INTEGER NOT NULL,
+    label     TEXT,
+    total     INTEGER,
+    used      INTEGER,
+    pct       REAL,
+    PRIMARY KEY (device_id, mount, ts)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS disk_samples_ts ON disk_samples (ts);
+
+-- Pre-aggregated tiers. The sampler recomputes the current bucket after each
+-- write, so these are ordinary derived tables: deleting them and restarting
+-- loses long history but never corrupts the live path. Averages are stored
+-- with their sample count so a coarser step can be re-weighted exactly.
+CREATE TABLE IF NOT EXISTS rollup_5m (
+    device_id      TEXT NOT NULL,
+    ts             INTEGER NOT NULL,
+    samples        INTEGER NOT NULL,
+    online_samples INTEGER NOT NULL,
+    cpu_avg        REAL,
+    cpu_min        REAL,
+    cpu_max        REAL,
+    mem_avg        REAL,
+    mem_min        REAL,
+    mem_max        REAL,
+    disk_avg       REAL,
+    disk_min       REAL,
+    disk_max       REAL,
+    uptime_first   INTEGER,
+    uptime_last    INTEGER,
+    uptime_min     INTEGER,
+    PRIMARY KEY (device_id, ts)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS rollup_5m_ts ON rollup_5m (ts);
+
+CREATE TABLE IF NOT EXISTS rollup_1h (
+    device_id      TEXT NOT NULL,
+    ts             INTEGER NOT NULL,
+    samples        INTEGER NOT NULL,
+    online_samples INTEGER NOT NULL,
+    cpu_avg        REAL,
+    cpu_min        REAL,
+    cpu_max        REAL,
+    mem_avg        REAL,
+    mem_min        REAL,
+    mem_max        REAL,
+    disk_avg       REAL,
+    disk_min       REAL,
+    disk_max       REAL,
+    uptime_first   INTEGER,
+    uptime_last    INTEGER,
+    uptime_min     INTEGER,
+    PRIMARY KEY (device_id, ts)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS rollup_1h_ts ON rollup_1h (ts);
+
+CREATE TABLE IF NOT EXISTS disk_rollup_5m (
+    device_id TEXT NOT NULL,
+    mount     TEXT NOT NULL,
+    ts        INTEGER NOT NULL,
+    samples   INTEGER NOT NULL,
+    pct_avg   REAL,
+    pct_min   REAL,
+    pct_max   REAL,
+    label     TEXT,
+    total     INTEGER,
+    used      INTEGER,
+    PRIMARY KEY (device_id, mount, ts)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS disk_rollup_5m_ts ON disk_rollup_5m (ts);
+
+CREATE TABLE IF NOT EXISTS disk_rollup_1h (
+    device_id TEXT NOT NULL,
+    mount     TEXT NOT NULL,
+    ts        INTEGER NOT NULL,
+    samples   INTEGER NOT NULL,
+    pct_avg   REAL,
+    pct_min   REAL,
+    pct_max   REAL,
+    label     TEXT,
+    total     INTEGER,
+    used      INTEGER,
+    PRIMARY KEY (device_id, mount, ts)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS disk_rollup_1h_ts ON disk_rollup_1h (ts);
+
+-- Generic extra signals (load, swap bytes, network rates, CPU pressure).
+-- The allowlist lives in EXTRA_METRICS; an existing agent that sends none of
+-- these simply has no rows and the API omits the signal rather than zeroing it.
+CREATE TABLE IF NOT EXISTS metric_samples (
+    device_id TEXT NOT NULL,
+    metric    TEXT NOT NULL,
+    ts        INTEGER NOT NULL,
+    value     REAL,
+    PRIMARY KEY (device_id, metric, ts)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS metric_samples_ts ON metric_samples (ts);
+
+-- Manual deploy/restart/backup/note annotations. device_id = '' means
+-- fleet-wide, so a deploy note appears on every device chart.
+CREATE TABLE IF NOT EXISTS annotations (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id TEXT NOT NULL,
+    ts        INTEGER NOT NULL,
+    kind      TEXT NOT NULL,
+    text      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS annotations_ts ON annotations (ts);
 """
 
 
@@ -368,6 +549,17 @@ def _metric_number(value, cast=float):
     if not math.isfinite(value):
         return None
     return cast(value)
+
+
+def _extra_metric_value(metric, value):
+    """Validate one generic signal. Negative rates/loads are meaningless, and
+    a CPU percentage above 100 is clamped rather than stored as-is."""
+    value = _metric_number(value)
+    if value is None or value < 0:
+        return None
+    if metric in PERCENT_METRICS:
+        value = min(value, 100.0)
+    return value
 
 
 def _device_identity(device):
@@ -414,10 +606,55 @@ def record_samples(devices, now=None):
                         online,
                     ),
                 )
+                # Per-volume history shares the bucket timestamp and the same
+                # transaction, so a volume set can never be half-written. The
+                # delete makes a heartbeat the source of truth for its bucket:
+                # a mount that vanished does not linger, and a repeat replaces
+                # rather than appends. clean_disks already caps and validates.
+                con.execute(
+                    "DELETE FROM disk_samples WHERE device_id = ? AND ts = ?",
+                    (device_id, ts),
+                )
+                for disk in clean_disks(device.get("disks")):
+                    con.execute(
+                        "INSERT INTO disk_samples "
+                        "(device_id, mount, ts, label, total, used, pct) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (device_id, disk["mount"], ts, disk["label"],
+                         disk["total"], disk["used"], disk["pct"]),
+                    )
+                # Generic signals share the bucket and the replacement rule.
+                # Only present, valid values are written; an absent metric is
+                # omitted from the API rather than rendered as zero.
+                con.execute(
+                    "DELETE FROM metric_samples WHERE device_id = ? AND ts = ?",
+                    (device_id, ts),
+                )
+                signals = {
+                    metric: _extra_metric_value(metric, device.get(metric))
+                    for metric in EXTRA_METRICS
+                }
+                if (signals.get("swap_used") is not None
+                        and signals.get("swap_total") is not None):
+                    signals["swap_used"] = min(
+                        signals["swap_used"], signals["swap_total"]
+                    )
+                for metric, value in signals.items():
+                    if value is not None:
+                        con.execute(
+                            "INSERT INTO metric_samples (device_id, metric, ts, value) "
+                            "VALUES (?, ?, ?, ?)",
+                            (device_id, metric, ts, value),
+                        )
+                # Recompute only the buckets this heartbeat touches. Later
+                # heartbeats in the same bucket replace the row rather than
+                # appending, so a rollup is always a pure function of raw rows.
+                _refresh_rollups(con, device_id, ts)
                 wrote += 1
             con.commit()
         finally:
             con.close()
+    _invalidate_summary()
     prune_metrics(now)
     return wrote
 
@@ -440,12 +677,231 @@ def prune_metrics(now=None):
         # Keep the delete on the same single-writer path as the sampler.
         con = _connect_metrics()
         try:
-            cur = con.execute("DELETE FROM samples WHERE ts < ?",
-                              (int(now) - HISTORY_SECONDS,))
+            removed = 0
+            for table, retention in (
+                ("samples", HISTORY_SECONDS),
+                ("disk_samples", HISTORY_SECONDS),
+                ("metric_samples", HISTORY_SECONDS),
+                ("rollup_5m", ROLLUP_5M_RETENTION),
+                ("rollup_1h", ROLLUP_1H_RETENTION),
+                ("disk_rollup_5m", ROLLUP_5M_RETENTION),
+                ("disk_rollup_1h", ROLLUP_1H_RETENTION),
+            ):
+                cur = con.execute(
+                    f"DELETE FROM {table} WHERE ts < ?",  # fixed internal names
+                    (int(now) - retention,),
+                )
+                removed += cur.rowcount
             con.commit()
-            return cur.rowcount
+            return removed
         finally:
             con.close()
+
+
+# ---------- rollups ----------
+# A rollup row is a pure function of the raw rows in its bucket, so the
+# sampler deletes and rewrites just the touched bucket. No background job, no
+# incremental drift: re-running it is always safe.
+
+def _bucket_start(ts, size):
+    return int(ts) - (int(ts) % size)
+
+
+def _weighted(pairs):
+    """Weighted mean of (value, weight) pairs, ignoring missing values."""
+    pairs = [(value, weight) for value, weight in pairs if value is not None]
+    total = sum(weight for _value, weight in pairs)
+    if not total:
+        return None
+    return sum(value * weight for value, weight in pairs) / total
+
+
+def _bounds(values):
+    values = [value for value in values if value is not None]
+    return (min(values), max(values)) if values else (None, None)
+
+
+def _raw_aggregate_parts(rows):
+    return [{
+        "samples": 1,
+        "online_samples": 1 if online else 0,
+        "cpu_avg": cpu, "cpu_min": cpu, "cpu_max": cpu,
+        "mem_avg": mem, "mem_min": mem, "mem_max": mem,
+        "disk_avg": disk, "disk_min": disk, "disk_max": disk,
+        "uptime_first": uptime, "uptime_last": uptime, "uptime_min": uptime,
+    } for _ts, cpu, mem, disk, uptime, online in rows]
+
+
+def _rollup_aggregate_parts(rows):
+    return [{
+        "samples": samples,
+        "online_samples": online_samples,
+        "cpu_avg": cpu_avg, "cpu_min": cpu_min, "cpu_max": cpu_max,
+        "mem_avg": mem_avg, "mem_min": mem_min, "mem_max": mem_max,
+        "disk_avg": disk_avg, "disk_min": disk_min, "disk_max": disk_max,
+        "uptime_first": uptime_first, "uptime_last": uptime_last,
+        "uptime_min": uptime_min,
+    } for (samples, online_samples, cpu_avg, cpu_min, cpu_max,
+           mem_avg, mem_min, mem_max, disk_avg, disk_min, disk_max,
+           uptime_first, uptime_last, uptime_min) in rows]
+
+
+def _merge_aggregate(parts):
+    """Fold ordered parts into one aggregate row."""
+    return {
+        "samples": sum(part["samples"] for part in parts),
+        "online_samples": sum(part["online_samples"] for part in parts),
+        "cpu_avg": _weighted((part["cpu_avg"], part["samples"]) for part in parts),
+        "cpu_min": _bounds(part["cpu_min"] for part in parts)[0],
+        "cpu_max": _bounds(part["cpu_max"] for part in parts)[1],
+        "mem_avg": _weighted((part["mem_avg"], part["samples"]) for part in parts),
+        "mem_min": _bounds(part["mem_min"] for part in parts)[0],
+        "mem_max": _bounds(part["mem_max"] for part in parts)[1],
+        "disk_avg": _weighted((part["disk_avg"], part["samples"]) for part in parts),
+        "disk_min": _bounds(part["disk_min"] for part in parts)[0],
+        "disk_max": _bounds(part["disk_max"] for part in parts)[1],
+        "uptime_first": next(
+            (part["uptime_first"] for part in parts
+             if part["uptime_first"] is not None), None),
+        "uptime_last": next(
+            (part["uptime_last"] for part in reversed(parts)
+             if part["uptime_last"] is not None), None),
+        "uptime_min": min(
+            (part["uptime_min"] for part in parts
+             if part["uptime_min"] is not None), default=None),
+    }
+
+
+def _merge_disk(parts):
+    return {
+        "samples": sum(part["samples"] for part in parts),
+        "pct_avg": _weighted((part["pct_avg"], part["samples"]) for part in parts),
+        "pct_min": _bounds(part["pct_min"] for part in parts)[0],
+        "pct_max": _bounds(part["pct_max"] for part in parts)[1],
+        "label": next(
+            (part["label"] for part in reversed(parts) if part["label"]), ""),
+        "total": next(
+            (part["total"] for part in reversed(parts)
+             if part["total"] is not None), None),
+        "used": next(
+            (part["used"] for part in reversed(parts)
+             if part["used"] is not None), None),
+    }
+
+
+_AGGREGATE_COLUMNS = (
+    "device_id, ts, samples, online_samples, cpu_avg, cpu_min, cpu_max, "
+    "mem_avg, mem_min, mem_max, disk_avg, disk_min, disk_max, "
+    "uptime_first, uptime_last, uptime_min"
+)
+
+
+def _write_aggregate(con, table, device_id, ts, merged):
+    con.execute(
+        f"INSERT INTO {table} ({_AGGREGATE_COLUMNS}) VALUES "
+        "(" + ",".join("?" * 16) + ") "
+        "ON CONFLICT(device_id, ts) DO UPDATE SET "
+        "samples=excluded.samples, online_samples=excluded.online_samples, "
+        "cpu_avg=excluded.cpu_avg, cpu_min=excluded.cpu_min, "
+        "cpu_max=excluded.cpu_max, mem_avg=excluded.mem_avg, "
+        "mem_min=excluded.mem_min, mem_max=excluded.mem_max, "
+        "disk_avg=excluded.disk_avg, disk_min=excluded.disk_min, "
+        "disk_max=excluded.disk_max, uptime_first=excluded.uptime_first, "
+        "uptime_last=excluded.uptime_last, uptime_min=excluded.uptime_min",
+        (device_id, int(ts), merged["samples"], merged["online_samples"],
+         merged["cpu_avg"], merged["cpu_min"], merged["cpu_max"],
+         merged["mem_avg"], merged["mem_min"], merged["mem_max"],
+         merged["disk_avg"], merged["disk_min"], merged["disk_max"],
+         merged["uptime_first"], merged["uptime_last"], merged["uptime_min"]),
+    )
+
+
+_DISK_COLUMNS = (
+    "device_id, mount, ts, samples, pct_avg, pct_min, pct_max, label, total, used"
+)
+
+
+def _write_disk(con, table, device_id, mount, ts, merged):
+    con.execute(
+        f"INSERT INTO {table} ({_DISK_COLUMNS}) VALUES "
+        "(" + ",".join("?" * 10) + ") "
+        "ON CONFLICT(device_id, mount, ts) DO UPDATE SET "
+        "samples=excluded.samples, pct_avg=excluded.pct_avg, "
+        "pct_min=excluded.pct_min, pct_max=excluded.pct_max, "
+        "label=excluded.label, total=excluded.total, used=excluded.used",
+        (device_id, mount, int(ts), merged["samples"], merged["pct_avg"],
+         merged["pct_min"], merged["pct_max"], merged["label"],
+         merged["total"], merged["used"]),
+    )
+
+
+def _refresh_rollups(con, device_id, ts):
+    """Recompute the 5-minute and hourly buckets that contain `ts`."""
+    five = _bucket_start(ts, ROLLUP_5M_SECONDS)
+    raw = con.execute(
+        "SELECT ts, cpu_pct, mem_pct, disk_pct, uptime_s, online FROM samples "
+        "WHERE device_id = ? AND ts >= ? AND ts < ? ORDER BY ts",
+        (device_id, five, five + ROLLUP_5M_SECONDS),
+    ).fetchall()
+    con.execute("DELETE FROM rollup_5m WHERE device_id = ? AND ts = ?",
+                (device_id, five))
+    if raw:
+        _write_aggregate(con, "rollup_5m", device_id, five,
+                         _merge_aggregate(_raw_aggregate_parts(raw)))
+
+    hour = _bucket_start(ts, ROLLUP_1H_SECONDS)
+    parts = con.execute(
+        "SELECT samples, online_samples, cpu_avg, cpu_min, cpu_max, "
+        "mem_avg, mem_min, mem_max, disk_avg, disk_min, disk_max, "
+        "uptime_first, uptime_last, uptime_min FROM rollup_5m "
+        "WHERE device_id = ? AND ts >= ? AND ts < ? ORDER BY ts",
+        (device_id, hour, hour + ROLLUP_1H_SECONDS),
+    ).fetchall()
+    con.execute("DELETE FROM rollup_1h WHERE device_id = ? AND ts = ?",
+                (device_id, hour))
+    if parts:
+        _write_aggregate(con, "rollup_1h", device_id, hour,
+                         _merge_aggregate(_rollup_aggregate_parts(parts)))
+
+    # Volume rollups are online-only, matching the per-volume series. Offline
+    # agents keep stale disks in agents.json and must not enter a trend.
+    disk_rows = con.execute(
+        "SELECT d.ts, d.mount, d.label, d.total, d.used, d.pct "
+        "FROM disk_samples d "
+        "JOIN samples s ON s.device_id = d.device_id AND s.ts = d.ts "
+        "WHERE d.device_id = ? AND d.ts >= ? AND d.ts < ? AND s.online = 1 "
+        "ORDER BY d.ts",
+        (device_id, five, five + ROLLUP_5M_SECONDS),
+    ).fetchall()
+    by_mount = {}
+    for _ts, mount, label, total, used, pct in disk_rows:
+        by_mount.setdefault(mount, []).append({
+            "samples": 1, "pct_avg": pct, "pct_min": pct, "pct_max": pct,
+            "label": label, "total": total, "used": used,
+        })
+    con.execute("DELETE FROM disk_rollup_5m WHERE device_id = ? AND ts = ?",
+                (device_id, five))
+    for mount, parts in by_mount.items():
+        _write_disk(con, "disk_rollup_5m", device_id, mount, five,
+                    _merge_disk(parts))
+
+    sub = con.execute(
+        "SELECT ts, mount, samples, pct_avg, pct_min, pct_max, label, total, used "
+        "FROM disk_rollup_5m WHERE device_id = ? AND ts >= ? AND ts < ? "
+        "ORDER BY ts",
+        (device_id, hour, hour + ROLLUP_1H_SECONDS),
+    ).fetchall()
+    by_mount = {}
+    for _ts, mount, samples, pct_avg, pct_min, pct_max, label, total, used in sub:
+        by_mount.setdefault(mount, []).append({
+            "samples": samples, "pct_avg": pct_avg, "pct_min": pct_min,
+            "pct_max": pct_max, "label": label, "total": total, "used": used,
+        })
+    con.execute("DELETE FROM disk_rollup_1h WHERE device_id = ? AND ts = ?",
+                (device_id, hour))
+    for mount, parts in by_mount.items():
+        _write_disk(con, "disk_rollup_1h", device_id, mount, hour,
+                    _merge_disk(parts))
 
 
 def monitor_loop(interval=None):
@@ -546,10 +1002,14 @@ def _events(rows, limit=None):
     return events[:limit] if limit else events
 
 
-def _disk_growth_per_day(rows):
-    """Least-squares disk slope in percentage points per day, online only."""
-    points = [(ts, disk) for ts, _cpu, _mem, disk, _uptime, online in rows
-              if online and disk is not None]
+def _trend_per_day(points):
+    """Least-squares slope in units per day from (ts, value) pairs.
+
+    Fewer than three points is noise, not a trend, so it reports None rather
+    than a line through two points. The same rule serves the aggregate disk
+    series and each per-volume series.
+    """
+    points = [(ts, value) for ts, value in points if value is not None]
     if len(points) < 3:
         return None
     t0 = points[0][0]
@@ -565,16 +1025,131 @@ def _disk_growth_per_day(rows):
     return slope * 86400
 
 
+def _days_to_90(pct_now, growth):
+    """Project when pct reaches 90 at the current trend, or None.
+
+    A flat or falling volume never fills, and a volume already at or over 90
+    has no meaningful countdown. This is the rule the aggregate disk gauge has
+    always used; per-volume projections reuse it exactly.
+    """
+    if growth is None or growth <= 0.01 or pct_now is None or pct_now >= 90:
+        return None
+    return round((90.0 - pct_now) / growth, 1)
+
+
+def _disk_growth_per_day(rows):
+    """Least-squares disk slope in percentage points per day, online only."""
+    return _trend_per_day([
+        (ts, disk) for ts, _cpu, _mem, disk, _uptime, online in rows
+        if online and disk is not None
+    ])
+
+
+def _high_warning(value, warning_at, critical_at):
+    if value is None:
+        return None
+    if value >= critical_at:
+        return "critical"
+    return "warning" if value >= warning_at else None
+
+
+def _low_warning(value, warning_at, critical_at):
+    if value is None:
+        return None
+    if value <= critical_at:
+        return "critical"
+    return "warning" if value <= warning_at else None
+
+
+def _duration_label(seconds):
+    seconds = max(0, int(seconds))
+    if seconds >= 3600:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+    return f"{max(1, seconds // 60)}m"
+
+
+def evaluate_warnings(device, now):
+    """Curated per-device warnings from the summary fields.
+
+    The same rule runs for the metrics page and the fleet summary. The rail
+    uses `live_warnings`, which feeds only the cheap live fields and therefore
+    skips the history-derived days-to-90/growth checks.
+    """
+    warnings = []
+
+    disk = _finite(device.get("disk_pct"))
+    level = _high_warning(disk, WARN_DISK_PCT,
+                          min(99.0, WARN_DISK_PCT + 10))
+    if level:
+        warnings.append({
+            "code": "disk", "level": level, "value": round(disk, 1),
+            "threshold": WARN_DISK_PCT, "text": f"Disk {disk:.0f}% full",
+        })
+
+    days = _finite(device.get("days_to_90"))
+    level = _low_warning(days, WARN_DAYS_TO_90,
+                         max(1.0, WARN_DAYS_TO_90 / 4))
+    if level:
+        warnings.append({
+            "code": "days_to_90", "level": level, "value": days,
+            "threshold": WARN_DAYS_TO_90, "text": f"About {days:g}d to 90%",
+        })
+
+    growth = _finite(device.get("disk_growth_per_day"))
+    level = _high_warning(growth, WARN_GROWTH, WARN_GROWTH * 5)
+    if level:
+        warnings.append({
+            "code": "growth", "level": level, "value": growth,
+            "threshold": WARN_GROWTH,
+            "text": f"Disk growing {growth:g}%/day",
+        })
+
+    mem = _finite(device.get("mem_pct"))
+    level = _high_warning(mem, WARN_MEM_PCT, min(99.0, WARN_MEM_PCT + 7))
+    if level:
+        warnings.append({
+            "code": "mem", "level": level, "value": round(mem, 1),
+            "threshold": WARN_MEM_PCT, "text": f"RAM {mem:.0f}%",
+        })
+
+    if not device.get("online", True):
+        last_seen = _finite(device.get("last_seen"))
+        offline = max(0, int(now) - int(last_seen)) if last_seen is not None else 0
+        level = _high_warning(offline, WARN_OFFLINE_S, WARN_OFFLINE_S * 6)
+        if level:
+            warnings.append({
+                "code": "offline", "level": level, "value": offline,
+                "threshold": WARN_OFFLINE_S,
+                "text": f"Offline for {_duration_label(offline)}",
+            })
+
+    return warnings
+
+
+def live_warnings(device, now):
+    """The cheap dashboard-rail subset: live disk, RAM and offline duration."""
+    return evaluate_warnings({
+        "disk_pct": device.get("disk_pct"),
+        "mem_pct": device.get("mem_pct"),
+        "online": device.get("online", True),
+        "last_seen": device.get("last_seen"),
+    }, now)
+
+
+def _empty_summary():
+    return {
+        "samples": 0, "availability_pct": None, "downtime_s": 0,
+        "offline_events": 0, "last_offline": None, "restarts": 0,
+        "cpu_avg": None, "cpu_max": None, "mem_avg": None,
+        "disk_pct": None, "disk_growth_per_day": None, "days_to_90": None,
+    }
+
+
 def _derive_summary(rows, until):
     """Availability, averages, offline events and disk trend for one window."""
     count = len(rows)
     if not count:
-        return {
-            "samples": 0, "availability_pct": None, "downtime_s": 0,
-            "offline_events": 0, "last_offline": None, "restarts": 0,
-            "cpu_avg": None, "cpu_max": None, "mem_avg": None,
-            "disk_pct": None, "disk_growth_per_day": None, "days_to_90": None,
-        }
+        return _empty_summary()
     online_rows = [row for row in rows if row[5]]
     cpu_values = [row[1] for row in online_rows if row[1] is not None]
     mem_values = [row[2] for row in online_rows if row[2] is not None]
@@ -597,9 +1172,7 @@ def _derive_summary(rows, until):
     latest = rows[-1]
     disk_now = latest[3]
     growth = _disk_growth_per_day(rows)
-    days_to_90 = None
-    if growth is not None and growth > 0.01 and disk_now is not None and disk_now < 90:
-        days_to_90 = round((90.0 - disk_now) / growth, 1)
+    days_to_90 = _days_to_90(disk_now, growth)
 
     return {
         "samples": count,
@@ -619,6 +1192,103 @@ def _derive_summary(rows, until):
     }
 
 
+def _events_from_rollups(rows):
+    """Offline/recovery/restart transitions at bucket resolution.
+
+    A rollup row knows how many of its samples were online and the first,
+    last and minimum uptime, so the same transitions the raw path detects can
+    be recovered without keeping every raw row forever. A bucket that is only
+    partly online is treated as offline for transition purposes, matching the
+    raw MIN(online) rule.
+    """
+    events = []
+    prev_online = None
+    offline_since = None
+    prev_uptime_last = None
+    for row in rows:
+        ts, samples, online_samples = row[0], row[1], row[2]
+        uptime_first, uptime_last = row[7], row[8]
+        online = samples > 0 and online_samples >= samples
+        if prev_online is True and not online:
+            offline_since = ts
+            events.append({"ts": int(ts), "type": "offline"})
+        elif prev_online is False and online:
+            events.append({
+                "ts": int(ts), "type": "online",
+                "down_s": int(ts - offline_since) if offline_since is not None else None,
+            })
+            offline_since = None
+        elif prev_online is None and not online:
+            offline_since = ts
+
+        restart = False
+        if online and uptime_last is not None:
+            if prev_uptime_last is not None and uptime_last < prev_uptime_last - 60:
+                restart = True
+            if uptime_first is not None and uptime_last < uptime_first - 60:
+                restart = True
+        if restart:
+            events.append({"ts": int(ts), "type": "restart"})
+        if uptime_last is not None:
+            prev_uptime_last = uptime_last
+        prev_online = online
+
+    events.sort(key=lambda event: event["ts"], reverse=True)
+    return events
+
+
+def _summary_rows(con, source, device_id, since, until):
+    table = "rollup_5m" if source == "5m" else "rollup_1h"
+    return con.execute(
+        "SELECT ts, samples, online_samples, cpu_avg, cpu_max, mem_avg, "
+        "disk_avg, uptime_first, uptime_last "
+        f"FROM {table} WHERE device_id = ? AND ts >= ? AND ts <= ? ORDER BY ts",
+        (device_id, int(since), int(until)),
+    ).fetchall()
+
+
+def _derive_summary_rollup(rows, bucket_s):
+    """The long-window summary, computed without touching raw rows."""
+    if not rows:
+        return _empty_summary()
+    samples = sum(row[1] for row in rows)
+    online_samples = sum(row[2] for row in rows)
+    cpu_avg = _weighted((row[3], row[1]) for row in rows)
+    cpu_max = _bounds(row[4] for row in rows)[1]
+    mem_avg = _weighted((row[5], row[1]) for row in rows)
+    disk_now = next((row[6] for row in reversed(rows) if row[6] is not None), None)
+    growth = _trend_per_day([
+        (row[0], row[6]) for row in rows
+        if row[2] > 0 and row[6] is not None
+    ])
+    events = _events_from_rollups(rows)
+    offline_events = [event for event in events if event["type"] == "offline"]
+    # Each rollup row covers bucket_s of wall time, so an offline share of the
+    # bucket is the best downtime estimate that survives raw pruning.
+    downtime = sum(
+        bucket_s * (row[1] - row[2]) / row[1]
+        for row in rows if row[1]
+    )
+    latest = rows[-1]
+    return {
+        "samples": samples,
+        "availability_pct": round(100.0 * online_samples / samples, 1)
+        if samples else None,
+        "downtime_s": int(round(downtime)),
+        "offline_events": len(offline_events),
+        "last_offline": int(offline_events[0]["ts"]) if offline_events else None,
+        "restarts": sum(1 for event in events if event["type"] == "restart"),
+        "cpu_pct": round(float(latest[3]), 1) if latest[3] is not None else None,
+        "cpu_avg": round(cpu_avg, 1) if cpu_avg is not None else None,
+        "cpu_max": round(cpu_max, 1) if cpu_max is not None else None,
+        "mem_pct": round(float(latest[5]), 1) if latest[5] is not None else None,
+        "mem_avg": round(mem_avg, 1) if mem_avg is not None else None,
+        "disk_pct": round(float(disk_now), 1) if disk_now is not None else None,
+        "disk_growth_per_day": round(growth, 2) if growth is not None else None,
+        "days_to_90": _days_to_90(disk_now, growth),
+    }
+
+
 def _spark(rows, now, minutes=60, buckets=12):
     """Small CPU sparkline for the rail: one value per 5-minute bucket."""
     since = now - minutes * 60
@@ -633,6 +1303,201 @@ def _spark(rows, now, minutes=60, buckets=12):
         totals[index] += cpu
         counts[index] += 1
     return [round(totals[i] / counts[i], 1) if counts[i] else None for i in range(buckets)]
+
+
+def _volume_series(con, device_id, since, until, step, source="raw"):
+    """Per-volume bucketed pct series, latest size and a growth trend.
+
+    Online-only, matching the aggregate disk gauge: an agent that stopped
+    pushing keeps its last values in agents.json, but those stale values must
+    not look like fresh volume history. The raw path joins samples for the
+    online flag; the rollup tables were written online-only, so they need no
+    join. Long windows route here too, otherwise the 90d/1y ranges would show
+    no volume history once raw rows age out.
+    """
+    if source == "raw":
+        rows = con.execute(
+            "SELECT d.mount, d.ts - (d.ts % ?) AS bucket, ROUND(AVG(d.pct), 1) "
+            "FROM disk_samples d "
+            "JOIN samples s ON s.device_id = d.device_id AND s.ts = d.ts "
+            "WHERE d.device_id = ? AND d.ts >= ? AND d.ts <= ? AND s.online = 1 "
+            "GROUP BY d.mount, bucket ORDER BY d.mount, bucket",
+            (step, device_id, int(since), int(until)),
+        ).fetchall()
+        latest = con.execute(
+            "SELECT d.mount, d.label, d.total, d.used, d.pct "
+            "FROM disk_samples d "
+            "JOIN samples s ON s.device_id = d.device_id AND s.ts = d.ts "
+            "WHERE d.device_id = ? AND d.ts >= ? AND d.ts <= ? AND s.online = 1 "
+            "AND d.ts = ("
+            "  SELECT MAX(d2.ts) FROM disk_samples d2 "
+            "  JOIN samples s2 ON s2.device_id = d2.device_id AND s2.ts = d2.ts "
+            "  WHERE d2.device_id = d.device_id AND d2.mount = d.mount "
+            "    AND d2.ts >= ? AND d2.ts <= ? AND s2.online = 1) "
+            "ORDER BY d.mount",
+            (device_id, int(since), int(until), int(since), int(until)),
+        ).fetchall()
+    else:
+        table = "disk_rollup_5m" if source == "5m" else "disk_rollup_1h"
+        rows = con.execute(
+            "SELECT mount, ts - (ts % ?) AS bucket, "
+            "ROUND(SUM(pct_avg * samples) / NULLIF(SUM(samples), 0), 1) "
+            f"FROM {table} WHERE device_id = ? AND ts >= ? AND ts <= ? "
+            "GROUP BY mount, bucket ORDER BY mount, bucket",
+            (step, device_id, int(since), int(until)),
+        ).fetchall()
+        latest = con.execute(
+            "SELECT d.mount, d.label, d.total, d.used, d.pct_avg "
+            f"FROM {table} d "
+            "WHERE d.device_id = ? AND d.ts >= ? AND d.ts <= ? "
+            "AND d.ts = ("
+            f"  SELECT MAX(d2.ts) FROM {table} d2 "
+            "  WHERE d2.device_id = d.device_id AND d2.mount = d.mount "
+            "    AND d2.ts >= ? AND d2.ts <= ?) "
+            "ORDER BY d.mount",
+            (device_id, int(since), int(until), int(since), int(until)),
+        ).fetchall()
+
+    series = {}
+    for mount, bucket, value in rows:
+        series.setdefault(mount, []).append([int(bucket), value])
+
+    volumes = []
+    for mount, label, total, used, pct in latest:
+        points = series.get(mount, [])
+        growth = _trend_per_day(points)
+        volumes.append({
+            "mount": mount,
+            "label": label or "",
+            "total": total,
+            "used": used,
+            "pct": round(float(pct), 1) if pct is not None else None,
+            "growth_per_day": round(growth, 2) if growth is not None else None,
+            "days_to_90": _days_to_90(pct, growth),
+            "points": points,
+        })
+    # Fullest first; a missing pct sorts last. Mount breaks ties so the order
+    # is stable across requests.
+    volumes.sort(key=lambda volume: (
+        volume["pct"] is None, -(volume["pct"] or 0.0), volume["mount"],
+    ))
+    return volumes
+
+
+def _volume_summary(volumes):
+    """The compact per-device volume summary: count and the fullest volume.
+
+    The fullest volume is the one the aggregate DSK gauge already reports, so
+    this is the mount worth projecting days-to-90 for without shipping every
+    series in the fleet summary.
+    """
+    if not volumes:
+        return {"count": 0, "fullest": None}
+    fullest = volumes[0]
+    return {
+        "count": len(volumes),
+        "fullest": {
+            "mount": fullest["mount"],
+            "label": fullest["label"],
+            "pct": fullest["pct"],
+            "total": fullest["total"],
+            "used": fullest["used"],
+            "growth_per_day": fullest["growth_per_day"],
+            "days_to_90": fullest["days_to_90"],
+        },
+    }
+
+
+def _signal_series(con, device_id, now, window_s):
+    """Recent extra-signal series for the compact strip.
+
+    Signals are raw-only and the query is capped at SIGNAL_WINDOW_S, so a 90d
+    or 1y range never turns into a large scan just to draw a sparkline. Missing
+    metrics are omitted entirely; they are never synthesised as zero.
+    """
+    window_s = min(window_s, SIGNAL_WINDOW_S)
+    step = _step_for(window_s, None)
+    rows = con.execute(
+        "SELECT metric, ts - (ts % ?) AS bucket, ROUND(AVG(value), 2) "
+        "FROM metric_samples WHERE device_id = ? AND ts >= ? AND ts <= ? "
+        "GROUP BY metric, bucket ORDER BY metric, bucket",
+        (step, device_id, int(now - window_s), int(now)),
+    ).fetchall()
+    series = {}
+    for metric, bucket, value in rows:
+        series.setdefault(metric, []).append([int(bucket), value])
+
+    signals = {}
+    for metric in ("load_1", "load_5", "load_15", "net_rx_bps",
+                   "net_tx_bps", "cpu_iowait", "cpu_steal"):
+        points = series.get(metric)
+        if points:
+            signals[metric] = {"value": points[-1][1], "points": points}
+
+    used = dict(series.get("swap_used", []))
+    total = dict(series.get("swap_total", []))
+    swap_points = []
+    for bucket in sorted(set(used) & set(total)):
+        if total[bucket] and total[bucket] > 0:
+            swap_points.append([
+                bucket,
+                round(100.0 * min(used[bucket], total[bucket]) / total[bucket], 1),
+            ])
+    if swap_points:
+        latest = swap_points[-1][0]
+        signals["swap"] = {
+            "used": used[latest],
+            "total": total[latest],
+            "pct": swap_points[-1][1],
+            "points": swap_points,
+        }
+    return signals
+
+
+def _latest_signals(con, device_id):
+    """Latest value per extra metric, for the compact fleet summary."""
+    rows = con.execute(
+        "SELECT m.metric, m.value FROM metric_samples m "
+        "WHERE m.device_id = ? AND m.ts = ("
+        "  SELECT MAX(m2.ts) FROM metric_samples m2 "
+        "  WHERE m2.device_id = m.device_id AND m2.metric = m.metric)",
+        (device_id,),
+    ).fetchall()
+    values = {metric: value for metric, value in rows}
+    signals = {}
+    for metric in ("load_1", "load_5", "load_15", "net_rx_bps",
+                   "net_tx_bps", "cpu_iowait", "cpu_steal"):
+        if values.get(metric) is not None:
+            signals[metric] = round(float(values[metric]), 2)
+    used, total = values.get("swap_used"), values.get("swap_total")
+    if used is not None and total and total > 0:
+        signals["swap_pct"] = round(100.0 * min(used, total) / total, 1)
+    return signals
+
+
+def _stored_annotations(con, device_id, since, until):
+    """Device-specific plus fleet-wide annotations inside the window."""
+    rows = con.execute(
+        "SELECT id, device_id, ts, kind, text FROM annotations "
+        "WHERE ts >= ? AND ts <= ? AND (device_id = ? OR device_id = '') "
+        "ORDER BY ts DESC LIMIT ?",
+        (int(since), int(until), device_id, MAX_ANNOTATIONS),
+    ).fetchall()
+    # The limit keeps the newest notes; restore chronological order for markers.
+    rows = rows[::-1]
+    return [{
+        "id": row[0], "device": row[1], "ts": int(row[2]),
+        "kind": row[3], "text": row[4], "auto": False,
+    } for row in rows]
+
+
+def _window_source(window_s):
+    """Which store answers this window: raw, 5-minute or hourly rollups."""
+    if window_s <= RAW_MAX_WINDOW:
+        return "raw"
+    if window_s <= ROLLUP_5M_MAX_WINDOW:
+        return "5m"
+    return "1h"
 
 
 def _window_seconds(window):
@@ -650,6 +1515,53 @@ def _step_for(window_s, requested):
     return step
 
 
+def _series_query(con, device_id, since, until, step, source):
+    """Bucketed points plus a min/max band per series.
+
+    Raw rows average per bucket directly. Rollup rows are re-weighted by their
+    sample count and their stored minima/maxima are folded with MIN/MAX, so a
+    coarse `?step=` stays exact without loading every raw row.
+    """
+    if source == "raw":
+        rows = con.execute(
+            "SELECT ts - (ts % ?) AS bucket, "
+            "ROUND(AVG(cpu_pct), 1), ROUND(AVG(mem_pct), 1), "
+            "ROUND(AVG(disk_pct), 1), MIN(online), "
+            "ROUND(MIN(cpu_pct), 1), ROUND(MAX(cpu_pct), 1), "
+            "ROUND(MIN(mem_pct), 1), ROUND(MAX(mem_pct), 1), "
+            "ROUND(MIN(disk_pct), 1), ROUND(MAX(disk_pct), 1) "
+            "FROM samples WHERE device_id = ? AND ts >= ? AND ts <= ? "
+            "GROUP BY bucket ORDER BY bucket",
+            (step, device_id, int(since), int(until)),
+        ).fetchall()
+    else:
+        table = "rollup_5m" if source == "5m" else "rollup_1h"
+        rows = con.execute(
+            "SELECT ts - (ts % ?) AS bucket, "
+            "ROUND(SUM(cpu_avg * samples) / NULLIF(SUM(CASE WHEN cpu_avg "
+            "IS NOT NULL THEN samples ELSE 0 END), 0), 1), "
+            "ROUND(SUM(mem_avg * samples) / NULLIF(SUM(CASE WHEN mem_avg "
+            "IS NOT NULL THEN samples ELSE 0 END), 0), 1), "
+            "ROUND(SUM(disk_avg * samples) / NULLIF(SUM(CASE WHEN disk_avg "
+            "IS NOT NULL THEN samples ELSE 0 END), 0), 1), "
+            "MIN(CASE WHEN online_samples = samples THEN 1 ELSE 0 END), "
+            "ROUND(MIN(cpu_min), 1), ROUND(MAX(cpu_max), 1), "
+            "ROUND(MIN(mem_min), 1), ROUND(MAX(mem_max), 1), "
+            "ROUND(MIN(disk_min), 1), ROUND(MAX(disk_max), 1) "
+            f"FROM {table} WHERE device_id = ? AND ts >= ? AND ts <= ? "
+            "GROUP BY bucket ORDER BY bucket",
+            (step, device_id, int(since), int(until)),
+        ).fetchall()
+
+    points = [[row[0], row[1], row[2], row[3], row[4]] for row in rows]
+    bands = {
+        "cpu": [[row[0], row[5], row[6]] for row in rows],
+        "mem": [[row[0], row[7], row[8]] for row in rows],
+        "disk": [[row[0], row[9], row[10]] for row in rows],
+    }
+    return points, bands
+
+
 def _known_devices(con):
     return con.execute(
         "SELECT id, name, kind, first_seen, last_seen FROM devices ORDER BY kind, name"
@@ -657,45 +1569,86 @@ def _known_devices(con):
 
 
 def metrics_summary(window=DEFAULT_WINDOW, now=None):
-    """Every known device with its derived window summary and a CPU sparkline."""
+    """Every known device with its derived window summary and a CPU sparkline.
+
+    Long windows are answered from rollups, not by scanning every raw row per
+    device. Live requests are also cached for SUMMARY_CACHE_SECONDS: the page
+    polls once a minute, so one shared scan serves every open tab. Explicit
+    `now` (tests, backfills) bypasses the cache and stays deterministic.
+    """
+    live_request = now is None
     now = time.time() if now is None else now
     window_s = _window_seconds(window) or METRIC_WINDOWS[DEFAULT_WINDOW]
+    if live_request:
+        with _lock:
+            if (_summary_cache["body"] is not None
+                    and _summary_cache["window"] == window
+                    and now - _summary_cache["at"] < SUMMARY_CACHE_SECONDS):
+                return _summary_cache["body"]
     since = now - window_s
+    source = _window_source(window_s)
+    bucket_s = ROLLUP_5M_SECONDS if source == "5m" else ROLLUP_1H_SECONDS
     payload = {"generated": int(now), "window": window, "window_s": window_s,
-               "devices": [], "topology": stack_topology([])}
+               "source": source, "devices": [], "topology": stack_topology([])}
     if not METRICS_FILE.exists():
         return payload
     live = _live_state(now)
+    volume_step = _step_for(window_s, None)
     con = _connect_metrics()
     try:
         for device_id, name, kind, _first, last_seen in _known_devices(con):
-            rows = _history_rows(con, device_id, since, now)
-            summary = _derive_summary(rows, now)
+            # The sparkline is always the last hour, so it stays a cheap raw
+            # query regardless of which store answers the window.
+            spark = _spark(_history_rows(con, device_id, now - 3600, now), now)
+            if source == "raw":
+                rows = _history_rows(con, device_id, since, now)
+                summary = _derive_summary(rows, now)
+                online = bool(rows[-1][5]) if rows else False
+            else:
+                rollup_rows = _summary_rows(con, source, device_id, since, now)
+                summary = _derive_summary_rollup(rollup_rows, bucket_s)
+                online = bool(rollup_rows[-1][2] >= rollup_rows[-1][1]) \
+                    if rollup_rows else False
             state = live.get(device_id, {})
-            payload["devices"].append({
+            entry = {
                 "id": device_id,
                 "name": name,
                 "kind": kind,
-                "online": state.get("online", bool(rows[-1][5]) if rows else False),
+                "online": state.get("online", online),
                 "last_seen": state.get("last_seen", int(last_seen)),
-                "spark": _spark(rows, now),
+                "spark": spark,
+                "volumes": _volume_summary(
+                    _volume_series(con, device_id, since, now, volume_step, source)
+                ),
+                "signals": _latest_signals(con, device_id),
                 **summary,
-            })
+                "source": source,
+            }
+            entry["warnings"] = evaluate_warnings(entry, now)
+            payload["devices"].append(entry)
     finally:
         con.close()
     payload["topology"] = stack_topology(payload["devices"])
+    if live_request:
+        with _lock:
+            _summary_cache.update(at=now, window=window, body=payload)
     return payload
 
 
 def metrics_series(device_id, window=DEFAULT_WINDOW, requested_step=None, now=None):
-    """One device's bucketed time series, derived summary and events."""
+    """One device's bucketed time series, min/max bands, summary and events."""
     now = time.time() if now is None else now
     window_s = _window_seconds(window) or METRIC_WINDOWS[DEFAULT_WINDOW]
     step = _step_for(window_s, requested_step)
     since = now - window_s
+    source = _window_source(window_s)
+    bucket_s = ROLLUP_5M_SECONDS if source == "5m" else ROLLUP_1H_SECONDS
     payload = {
-        "generated": int(now), "window": window, "window_s": window_s, "step": step,
-        "device": None, "summary": _derive_summary([], now), "points": [], "events": [],
+        "generated": int(now), "window": window, "window_s": window_s,
+        "step": step, "source": source,
+        "device": None, "summary": _derive_summary([], now), "points": [],
+        "bands": {"cpu": [], "mem": [], "disk": []}, "volumes": [],
+        "signals": {}, "annotations": [], "warnings": [], "events": [],
     }
     if not METRICS_FILE.exists():
         return None if device_id else payload
@@ -707,26 +1660,57 @@ def metrics_series(device_id, window=DEFAULT_WINDOW, requested_step=None, now=No
         ).fetchone()
         if meta is None:
             return None
-        rows = _history_rows(con, device_id, since, now)
-        points = con.execute(
-            "SELECT ts - (ts % ?) AS bucket, "
-            "ROUND(AVG(cpu_pct), 1), ROUND(AVG(mem_pct), 1), "
-            "ROUND(AVG(disk_pct), 1), MIN(online) "
-            "FROM samples WHERE device_id = ? AND ts >= ? AND ts <= ? "
-            "GROUP BY bucket ORDER BY bucket",
-            (step, device_id, int(since), int(now)),
-        ).fetchall()
+        points, bands = _series_query(
+            con, device_id, since, now, step, source
+        )
+        if source == "raw":
+            rows = _history_rows(con, device_id, since, now)
+            summary = _derive_summary(rows, now)
+            events = _events(rows)
+            online = bool(rows[-1][5]) if rows else False
+        else:
+            rollup_rows = _summary_rows(con, source, device_id, since, now)
+            summary = _derive_summary_rollup(rollup_rows, bucket_s)
+            events = _events_from_rollups(rollup_rows)
+            online = bool(rollup_rows[-1][2] >= rollup_rows[-1][1]) \
+                if rollup_rows else False
+        volumes = _volume_series(con, device_id, since, now, step, source)
+        signals = _signal_series(con, device_id, now, window_s)
+        stored = _stored_annotations(con, device_id, since, now)
     finally:
         con.close()
     state = live.get(device_id, {})
     payload["device"] = {
         "id": meta[0], "name": meta[1], "kind": meta[2],
-        "online": state.get("online", bool(rows[-1][5]) if rows else False),
+        "online": state.get("online", online),
         "last_seen": state.get("last_seen", int(meta[3])),
     }
-    payload["summary"] = _derive_summary(rows, now)
-    payload["points"] = [list(point) for point in points]
-    payload["events"] = _events(rows, limit=20)
+    # Annotations are chart markers; manual ones also become Events rows.
+    events = events + [
+        {"ts": annotation["ts"], "type": "annotation",
+         "kind": annotation["kind"], "text": annotation["text"]}
+        for annotation in stored
+    ]
+    events.sort(key=lambda event: event["ts"], reverse=True)
+    annotations = stored + [
+        {"id": None, "device": device_id, "ts": event["ts"],
+         "kind": "restart", "text": "Restart detected", "auto": True}
+        for event in events if event["type"] == "restart"
+    ][:MAX_AUTO_ANNOTATIONS]
+    annotations.sort(key=lambda annotation: annotation["ts"])
+
+    payload["summary"] = summary
+    payload["points"] = points
+    payload["bands"] = bands
+    payload["volumes"] = volumes
+    payload["signals"] = signals
+    payload["annotations"] = annotations
+    payload["events"] = events[:20]
+    payload["warnings"] = evaluate_warnings({
+        **summary,
+        "online": payload["device"]["online"],
+        "last_seen": payload["device"]["last_seen"],
+    }, now)
     return payload
 
 
@@ -743,6 +1727,14 @@ def stats():
     availability = availability_24h(now)
     for device in devices:
         device["availability_24h"] = availability.get(device["id"])
+        # The rail indicator is deliberately the cheap live subset: no history
+        # scan on a 5 s poll. The metrics page carries the full warning set.
+        warnings = live_warnings(device, now)
+        device["warning_count"] = len(warnings)
+        device["warning_level"] = (
+            "critical" if any(warning["level"] == "critical" for warning in warnings)
+            else ("warning" if warnings else None)
+        )
     body = {
         "generated": int(now),
         "devices": devices,
@@ -994,6 +1986,52 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "missing or empty url"}, 400)
             record_hit(url)
             return self._send(204, b"")
+        if path == "/api/annotations":
+            sent = self.headers.get("X-Dash-Token", "")
+            if TOKEN and not hmac.compare_digest(sent.encode(), TOKEN.encode()):
+                return self._json({"error": "bad token"}, 401)
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length > 4096:
+                    return self._json({"error": "payload too large"}, 413)
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except Exception as exc:  # noqa: BLE001
+                return self._json({"error": f"bad payload: {exc}"}, 400)
+            if not isinstance(payload, dict):
+                return self._json({"error": "bad payload"}, 400)
+            kind = payload.get("kind", "note")
+            if kind not in ANNOTATION_KINDS:
+                return self._json({"error": "bad kind"}, 400)
+            text = payload.get("text")
+            if not isinstance(text, str) or not text.strip():
+                return self._json({"error": "missing text"}, 400)
+            text = text.strip()[:MAX_ANNOTATION_TEXT]
+            device_id = payload.get("device", "")
+            if device_id is None:
+                device_id = ""
+            if not isinstance(device_id, str):
+                return self._json({"error": "bad device"}, 400)
+            device_id = device_id.strip()[:80]
+            raw_ts = payload.get("ts")
+            if raw_ts is None:
+                ts = int(time.time())
+            else:
+                ts = _metric_number(raw_ts, int)
+                if ts is None:
+                    return self._json({"error": "bad ts"}, 400)
+            with _db_lock:
+                con = _connect_metrics()
+                try:
+                    cur = con.execute(
+                        "INSERT INTO annotations (device_id, ts, kind, text) "
+                        "VALUES (?, ?, ?, ?)",
+                        (device_id, ts, kind, text),
+                    )
+                    con.commit()
+                    annotation_id = cur.lastrowid
+                finally:
+                    con.close()
+            return self._json({"ok": True, "id": annotation_id}, 201)
         if not path.startswith("/api/push/"):
             return self._send(404, "not found", "text/plain; charset=utf-8")
         sent = self.headers.get("X-Dash-Token", "")
@@ -1014,12 +2052,14 @@ class Handler(BaseHTTPRequestHandler):
             rec = dict(agents.get(name, {}))
             rec.update({k: payload[k] for k in (
                 "cpu_pct", "mem_pct", "mem_used", "mem_total",
-                "disk_pct", "uptime_s", "kind", "name") if k in payload})
+                "disk_pct", "uptime_s", "kind", "name") + EXTRA_METRICS
+                if k in payload})
             if "disks" in payload:
                 rec["disks"] = clean_disks(payload["disks"])
             rec["last_seen"] = int(time.time())
             agents[name] = rec
             save_agents(agents)
+        _invalidate_summary()
         return self._json({"ok": True, "stored": name})
 
 if __name__ == "__main__":

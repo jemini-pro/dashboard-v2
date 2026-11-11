@@ -30,6 +30,8 @@
                 <button type="button" role="tab" data-range="24h" aria-selected="true">24h</button>
                 <button type="button" role="tab" data-range="7d" aria-selected="false">7d</button>
                 <button type="button" role="tab" data-range="30d" aria-selected="false">30d</button>
+                <button type="button" role="tab" data-range="90d" aria-selected="false">90d</button>
+                <button type="button" role="tab" data-range="1y" aria-selected="false">1y</button>
             </div>
 
             <div id="health" class="health" role="status" aria-live="polite">
@@ -41,6 +43,8 @@
         <div class="metrics-body">
             <main class="metrics-main">
                 <section id="stat-grid" class="stat-grid" aria-label="Fleet summary"></section>
+
+                <section id="warning-banner" class="card warning-banner" aria-live="polite" aria-label="Warnings" hidden></section>
 
                 <section class="card chart-card" aria-labelledby="chart-title">
                     <div class="card-head chart-head">
@@ -64,8 +68,38 @@
                         History starts collecting on the server. The first sample appears within a minute.
                     </div>
 
+                    <section id="signal-strip" class="signal-strip" aria-label="Recent signals" hidden>
+                        <div class="signal-head">
+                            <h3 class="volume-heading">Signals</h3>
+                            <span id="signal-sub" class="card-sub"></span>
+                        </div>
+                        <div id="signal-tiles" class="signal-tiles"></div>
+                    </section>
+
+                    <section id="volume-section" class="volume-section" aria-labelledby="volume-title" hidden>
+                        <div class="volume-head">
+                            <h3 id="volume-title" class="volume-heading">Volumes</h3>
+                            <span id="volume-sub" class="card-sub"></span>
+                        </div>
+                        <div class="volume-scroll">
+                            <table id="volume-table" class="volume-table">
+                                <thead>
+                                    <tr>
+                                        <th scope="col">Volume</th>
+                                        <th scope="col">Mount</th>
+                                        <th scope="col">Used</th>
+                                        <th scope="col">Size</th>
+                                        <th scope="col">Growth/day</th>
+                                        <th scope="col">Full in</th>
+                                    </tr>
+                                </thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+                    </section>
+
                     <details id="table-view" class="table-view">
-                        <summary>Table view</summary>
+                        <summary>Table view · min–avg–max</summary>
                         <div class="table-scroll">
                             <table id="chart-table">
                                 <thead>
@@ -75,6 +109,18 @@
                                         <th scope="col">RAM</th>
                                         <th scope="col">Disk</th>
                                         <th scope="col">Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+                        <div class="table-scroll">
+                            <table id="chart-volume-table" class="volume-table" aria-label="Per-volume samples">
+                                <thead>
+                                    <tr>
+                                        <th scope="col">Time</th>
+                                        <th scope="col">Volume</th>
+                                        <th scope="col">Used</th>
                                     </tr>
                                 </thead>
                                 <tbody></tbody>

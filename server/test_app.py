@@ -73,6 +73,7 @@ class ApiTestCase(unittest.TestCase):
         app.METRICS_FILE = self.data / "metrics.db"
         app._cache.update(at=0.0, body=None)
         app._availability_cache.update(at=0.0, by_id={})
+        app._summary_cache.update(at=0.0, window=None, body=None)
         app._last_prune["at"] = 0.0
         self.static = self.data / "static"
         self.static.mkdir()
@@ -94,6 +95,7 @@ class ApiTestCase(unittest.TestCase):
         app.AGENTS_FILE, app.METRICS_FILE = self._old_agents, self._old_metrics
         app._cache.update(at=0.0, body=None)
         app._availability_cache.update(at=0.0, by_id={})
+        app._summary_cache.update(at=0.0, window=None, body=None)
         app._last_prune["at"] = 0.0
         self._tmp.cleanup()
 
@@ -393,6 +395,18 @@ class PushTokenTest(ApiTestCase):
         with mock.patch("app.hmac.compare_digest", wraps=hmac.compare_digest) as spy:
             self.assertEqual(self.push(self.TOKEN)[0], 200)
         self.assertTrue(spy.called, "push token is compared with a plain ==")
+
+    def test_the_annotation_endpoint_uses_the_same_token(self):
+        payload = json.dumps({"kind": "deploy", "text": "v1.2"}).encode()
+        self.assertEqual(self.post(payload, path="/api/annotations")[0], 401)
+        self.assertEqual(
+            self.post(payload, path="/api/annotations",
+                      headers={"X-Dash-Token": "wrong"})[0], 401
+        )
+        self.assertEqual(
+            self.post(payload, path="/api/annotations",
+                      headers={"X-Dash-Token": self.TOKEN})[0], 201
+        )
 
     def test_every_volume_is_stored_and_the_fullest_drives_the_summary(self):
         status, _ = self.push_payload({
@@ -1558,6 +1572,600 @@ class MetricsHistoryTest(ApiTestCase):
         )
         self.assertEqual(app.metrics_series("docker01", "24h", None, now=self.BASE), None)
 
+    # ---------- per-volume history ----------
+
+    def stored_disk_samples(self):
+        con = app._connect_metrics()
+        try:
+            return con.execute(
+                "SELECT device_id, mount, ts, label, total, used, pct "
+                "FROM disk_samples ORDER BY ts, mount"
+            ).fetchall()
+        finally:
+            con.close()
+
+    def volume(self, mount, pct, label="", total=1000, used=None):
+        return {
+            "mount": mount,
+            "label": label,
+            "total": total,
+            "used": int(total * pct / 100.0) if used is None else used,
+            "pct": pct,
+        }
+
+    def test_a_push_with_disks_writes_a_row_per_volume(self):
+        body = {
+            "name": "volpc", "kind": "pc", "cpu_pct": 5.0, "mem_pct": 20.0,
+            "mem_used": 1, "mem_total": 2, "disk_pct": 91.0, "uptime_s": 10,
+            "disks": [
+                self.volume("/", 10.0, "System", 1000, 100),
+                self.volume("/mnt/data", 91.0, "Data", 2000, 1820),
+            ],
+        }
+        status, _ = self.post(json.dumps(body).encode(), path="/api/push/volpc")
+        self.assertEqual(status, 200)
+
+        app.record_samples(app.agent_devices(), now=self.BASE)
+
+        rows = self.stored_disk_samples()
+        self.assertEqual(
+            [(row[0], row[1], row[3], row[4], row[5], row[6]) for row in rows],
+            [
+                ("agent:volpc", "/", "System", 1000, 100, 10.0),
+                ("agent:volpc", "/mnt/data", "Data", 2000, 1820, 91.0),
+            ],
+        )
+
+    def test_a_repeat_in_the_same_bucket_replaces_that_bucket_s_volumes(self):
+        self.sample([self.device(disks=[
+            self.volume("/", 10.0, "System"),
+            self.volume("/mnt/data", 91.0, "Data"),
+        ])], now=self.BASE)
+        self.sample([self.device(disks=[self.volume("/", 40.0, "System")])],
+                    now=self.BASE + 10)
+
+        rows = self.stored_disk_samples()
+        self.assertEqual([(row[1], row[6]) for row in rows], [("/", 40.0)])
+
+    def test_malformed_volume_entries_are_dropped(self):
+        self.sample([self.device(disks=[
+            self.volume("/", 10.0, "System"),
+            {"mount": "", "total": 100, "used": 1, "pct": 1.0},
+            {"mount": "/bad-total", "total": 0, "used": 0, "pct": 0.0},
+            {"mount": "/bad-pct", "total": 100},
+            {"mount": "/bool", "total": True, "used": True, "pct": True},
+            "not-a-volume",
+            None,
+        ])], now=self.BASE)
+
+        rows = self.stored_disk_samples()
+        self.assertEqual([row[1] for row in rows], ["/"])
+
+    def test_oversized_volume_lists_are_capped(self):
+        disks = [self.volume("/vol%02d" % index, 10.0 + index, "V%d" % index)
+                 for index in range(20)]
+        self.sample([self.device(disks=disks)], now=self.BASE)
+        self.assertEqual(len(self.stored_disk_samples()), app.MAX_DISKS)
+
+    def test_retention_prunes_old_volume_rows_too(self):
+        self.sample([self.device(disks=[self.volume("/", 50.0)])],
+                    now=self.BASE - app.HISTORY_SECONDS - 600)
+        self.assertEqual(len(self.stored_disk_samples()), 1)
+
+        app._last_prune["at"] = 0.0
+        self.sample([self.device(disks=[self.volume("/", 50.0)])], now=self.BASE)
+
+        rows = self.stored_disk_samples()
+        self.assertEqual(len(rows), 1)
+        self.assertGreaterEqual(rows[0][2], self.BASE - 60)
+
+    def test_volume_history_survives_a_reconnect(self):
+        self.sample([self.device(disks=[self.volume("/", 50.0)])], now=self.BASE)
+        # Every read opens its own connection and re-applies the schema
+        # idempotently; the row must still be there afterwards.
+        self.assertEqual(len(self.stored_disk_samples()), 1)
+        self.assertEqual(len(self.stored_disk_samples()), 1)
+
+    def test_metrics_series_adds_bucketed_volumes_and_their_growth(self):
+        for offset, pct in ((0, 50.0), (3600, 50.5), (7200, 51.0)):
+            self.sample([self.device(disk=pct, disks=[
+                self.volume("/", pct, "System", 1000, int(pct * 10)),
+                self.volume("/mnt/data", 80.0, "Data", 2000, 1600),
+            ])], now=self.BASE + offset)
+
+        payload = app.metrics_series("docker01", "24h", 3600, now=self.BASE + 7200)
+
+        # The existing aggregate payload keeps its shape.
+        self.assertIsInstance(payload["points"], list)
+        self.assertEqual(len(payload["points"][0]), 5)
+
+        volumes = {volume["mount"]: volume for volume in payload["volumes"]}
+        self.assertEqual(set(volumes), {"/", "/mnt/data"})
+        root = volumes["/"]
+        self.assertEqual(root["label"], "System")
+        self.assertEqual(root["total"], 1000)
+        self.assertEqual(root["used"], 510)
+        self.assertEqual(root["pct"], 51.0)
+        self.assertEqual([point[0] for point in root["points"]],
+                         [self.BASE, self.BASE + 3600, self.BASE + 7200])
+        self.assertEqual([point[1] for point in root["points"]], [50.0, 50.5, 51.0])
+        self.assertAlmostEqual(root["growth_per_day"], 12.0, places=2)
+        self.assertAlmostEqual(root["days_to_90"], 3.2, places=1)
+
+        data = volumes["/mnt/data"]
+        self.assertEqual(data["growth_per_day"], 0.0)
+        self.assertIsNone(data["days_to_90"])
+        # The fullest volume leads.
+        self.assertEqual(payload["volumes"][0]["mount"], "/mnt/data")
+
+    def test_metrics_summary_adds_a_compact_volume_summary(self):
+        for offset, pct in ((0, 50.0), (3600, 50.5), (7200, 51.0)):
+            self.sample([self.device(disk=pct, disks=[
+                self.volume("/", pct, "System", 1000, int(pct * 10)),
+                self.volume("/mnt/data", 80.0, "Data", 2000, 1600),
+            ])], now=self.BASE + offset)
+
+        summary = app.metrics_summary("24h", now=self.BASE + 7200)["devices"][0]
+        volumes = summary["volumes"]
+        self.assertEqual(volumes["count"], 2)
+        fullest = volumes["fullest"]
+        self.assertEqual(fullest["mount"], "/mnt/data")
+        self.assertEqual(fullest["label"], "Data")
+        self.assertEqual(fullest["pct"], 80.0)
+        self.assertEqual(fullest["total"], 2000)
+        self.assertEqual(fullest["growth_per_day"], 0.0)
+        self.assertIsNone(fullest["days_to_90"])
+        # The existing single-gauge summary is unchanged.
+        self.assertEqual(summary["disk_pct"], 51.0)
+
+    def test_a_device_without_volumes_reports_empty_volume_fields(self):
+        self.sample([self.device()], now=self.BASE)
+        summary = app.metrics_summary("1h", now=self.BASE + 60)["devices"][0]
+        self.assertEqual(summary["volumes"], {"count": 0, "fullest": None})
+        series_payload = app.metrics_series("docker01", "1h", 60, now=self.BASE + 60)
+        self.assertEqual(series_payload["volumes"], [])
+
+    # ---------- peaks and rollups ----------
+
+    def rollup_rows(self, table, columns="*"):
+        con = app._connect_metrics()
+        try:
+            return con.execute(
+                f"SELECT {columns} FROM {table} ORDER BY ts"  # fixed internal names
+            ).fetchall()
+        finally:
+            con.close()
+
+    def test_the_sampler_writes_five_minute_and_hourly_rollups(self):
+        for index, cpu in enumerate((10.0, 90.0, 50.0)):
+            self.sample([self.device(cpu=cpu, mem=20.0, disk=50.0)],
+                        now=self.BASE + index * 60)
+
+        five = self.rollup_rows(
+            "rollup_5m",
+            "device_id, ts, samples, online_samples, cpu_avg, cpu_min, cpu_max",
+        )
+        self.assertEqual(len(five), 1)
+        self.assertEqual(five[0][:4], ("docker01", self.BASE, 3, 3))
+        self.assertAlmostEqual(five[0][4], 50.0, places=1)
+        self.assertEqual(five[0][5], 10.0)
+        self.assertEqual(five[0][6], 90.0)
+
+        hour = self.rollup_rows(
+            "rollup_1h", "ts, samples, online_samples, cpu_min, cpu_max"
+        )
+        self.assertEqual(len(hour), 1)
+        self.assertEqual(hour[0][0], self.BASE)
+        self.assertEqual(hour[0][1:], (3, 3, 10.0, 90.0))
+
+    def test_metrics_series_bands_keep_min_and_max_per_bucket(self):
+        for index, cpu in enumerate((10.0, 90.0)):
+            self.sample([self.device(cpu=cpu)], now=self.BASE + index * 60)
+
+        payload = app.metrics_series("docker01", "1h", 300, now=self.BASE + 120)
+
+        self.assertEqual(payload["source"], "raw")
+        self.assertEqual(len(payload["points"]), 1)
+        # The old five-tuple is untouched; the average is still the point.
+        self.assertEqual(payload["points"][0][1], 50.0)
+        self.assertEqual(len(payload["bands"]["cpu"]), 1)
+        ts, low, high = payload["bands"]["cpu"][0]
+        self.assertEqual(ts, self.BASE)
+        self.assertEqual(low, 10.0)
+        self.assertEqual(high, 90.0)
+        for key in ("cpu", "mem", "disk"):
+            self.assertIn(key, payload["bands"])
+
+    def test_long_windows_read_five_minute_rollups_not_raw_rows(self):
+        now = self.BASE + 7200
+        for offset, cpu in ((0, 10.0), (3600, 20.0)):
+            self.sample([self.device(cpu=cpu)], now=now - 7200 + offset)
+
+        con = app._connect_metrics()
+        try:
+            con.execute("DELETE FROM samples")  # keep only the rollups
+            con.commit()
+        finally:
+            con.close()
+
+        payload = app.metrics_series("docker01", "7d", 3600, now=now)
+        self.assertEqual(payload["source"], "5m")
+        self.assertEqual([point[1] for point in payload["points"]], [10.0, 20.0])
+        self.assertGreaterEqual(payload["summary"]["samples"], 2)
+        self.assertEqual(len(payload["bands"]["cpu"]), len(payload["points"]))
+
+    def test_windows_beyond_thirty_days_read_hourly_rollups(self):
+        now = self.BASE + 7200
+        self.sample([self.device(cpu=42.0)], now=self.BASE)
+
+        con = app._connect_metrics()
+        try:
+            con.execute("DELETE FROM samples")
+            con.execute("DELETE FROM rollup_5m")
+            con.execute("DELETE FROM disk_rollup_5m")
+            con.commit()
+        finally:
+            con.close()
+
+        payload = app.metrics_series("docker01", "90d", 21600, now=now)
+        self.assertEqual(payload["source"], "1h")
+        self.assertEqual([point[1] for point in payload["points"]], [42.0])
+
+    def test_a_long_summary_does_not_need_raw_rows(self):
+        now = self.BASE + 7200
+        self.sample([self.device(cpu=20.0, online=True)], now=self.BASE)
+        self.sample([self.device(cpu=40.0, online=False)], now=self.BASE + 3600)
+
+        con = app._connect_metrics()
+        try:
+            con.execute("DELETE FROM samples")
+            con.commit()
+        finally:
+            con.close()
+
+        summary = app.metrics_summary("7d", now=now)["devices"][0]
+        self.assertEqual(summary["source"], "5m")
+        self.assertEqual(summary["samples"], 2)
+        self.assertEqual(summary["availability_pct"], 50.0)
+        self.assertEqual(len(summary["spark"]), 12)
+
+    def test_long_summary_reports_offline_runs_and_restarts_from_rollups(self):
+        # One sample a minute for 15 minutes: two full 5-minute online runs
+        # around one full offline run, then a reboot in the final run.
+        now = self.BASE + 900
+        for minute in range(15):
+            online = not (5 <= minute < 10)
+            uptime = 1000 + minute * 60 if minute < 10 else 30 + minute * 60
+            self.sample([self.device(online=online, uptime=uptime)],
+                        now=self.BASE + minute * 60)
+
+        con = app._connect_metrics()
+        try:
+            con.execute("DELETE FROM samples")
+            con.commit()
+        finally:
+            con.close()
+
+        summary = app.metrics_summary("7d", now=now)["devices"][0]
+        self.assertEqual(summary["availability_pct"], 66.7)
+        self.assertEqual(summary["offline_events"], 1)
+        self.assertEqual(summary["restarts"], 1)
+        self.assertEqual(summary["downtime_s"], 300)
+
+    def test_summary_is_cached_until_a_write_invalidates_it(self):
+        self.sample([self.device(cpu=10.0)], now=self.BASE)
+        with frozen_time(self.BASE + 60):
+            first = app.metrics_summary("24h")
+            cached = app.metrics_summary("24h")
+            self.assertIs(first, cached)
+            # An explicit clock always computes a fresh payload.
+            explicit = app.metrics_summary("24h", now=self.BASE + 60)
+            self.assertIsNot(explicit, first)
+            # A write invalidates the live cache instead of hiding a new value.
+            # Same bucket, so this replaces the row the window already sees.
+            self.sample([self.device(cpu=90.0)], now=self.BASE)
+            refreshed = app.metrics_summary("24h")
+        self.assertNotEqual(first["devices"], refreshed["devices"])
+
+    def test_retention_prunes_each_rollup_tier_on_its_own_window(self):
+        old = self.BASE - 10 * 86400
+        self.sample([self.device(disks=[self.volume("/", 50.0)])], now=old)
+
+        with mock.patch.object(app, "ROLLUP_5M_RETENTION", 5 * 86400):
+            app._last_prune["at"] = 0.0
+            self.sample([self.device(disks=[self.volume("/", 50.0)])], now=self.BASE)
+
+        self.assertEqual(len(self.rollup_rows("rollup_5m")), 1)  # new bucket only
+        self.assertEqual(len(self.rollup_rows("rollup_1h")), 2)  # 1 h keeps both
+        self.assertEqual(len(self.rollup_rows("disk_rollup_5m")), 1)
+        self.assertEqual(len(self.rollup_rows("disk_rollup_1h")), 2)
+        # Raw retention is still 30 d, so both raw rows survive.
+        self.assertEqual(len(self.stored_disk_samples()), 2)
+
+    def test_the_new_range_windows_are_accepted(self):
+        self.sample([self.device()], now=time.time())
+        for window in ("90d", "1y"):
+            self.assertEqual(
+                self.get_status("/api/metrics/summary?window=" + window)[0], 200
+            )
+            status, body = self.get_status(
+                "/api/metrics?device=docker01&window=" + window
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)["window"], window)
+
+    # ---------- extra signals ----------
+
+    def stored_metric_samples(self):
+        con = app._connect_metrics()
+        try:
+            return con.execute(
+                "SELECT metric, ts, value FROM metric_samples ORDER BY ts, metric"
+            ).fetchall()
+        finally:
+            con.close()
+
+    def signal_values(self):
+        return {metric: value for metric, _ts, value in self.stored_metric_samples()}
+
+    def test_a_push_with_extra_signals_writes_generic_metric_rows(self):
+        body = {
+            "name": "sigpc", "kind": "pc", "cpu_pct": 5.0, "mem_pct": 20.0,
+            "mem_used": 1, "mem_total": 2, "disk_pct": 10.0, "uptime_s": 10,
+            "load_1": 0.8, "load_5": 0.6, "load_15": 0.5,
+            "swap_used": 100, "swap_total": 400,
+            "net_rx_bps": 1200, "net_tx_bps": 300,
+            "cpu_iowait": 1.5, "cpu_steal": 0.2,
+        }
+        status, _ = self.post(json.dumps(body).encode(), path="/api/push/sigpc")
+        self.assertEqual(status, 200)
+
+        app.record_samples(app.agent_devices(), now=self.BASE)
+
+        self.assertEqual(self.signal_values(), {
+            "load_1": 0.8, "load_5": 0.6, "load_15": 0.5,
+            "swap_used": 100.0, "swap_total": 400.0,
+            "net_rx_bps": 1200.0, "net_tx_bps": 300.0,
+            "cpu_iowait": 1.5, "cpu_steal": 0.2,
+        })
+
+    def test_a_repeat_in_the_same_bucket_replaces_every_signal(self):
+        self.sample([self.device(load_1=0.5)], now=self.BASE)
+        self.sample([self.device(load_1=1.5, load_5=1.0)], now=self.BASE + 10)
+        self.assertEqual(self.signal_values(),
+                         {"load_1": 1.5, "load_5": 1.0})
+
+        # A metric that disappears from the heartbeat disappears from the bucket.
+        self.sample([self.device(load_1=2.0)], now=self.BASE + 20)
+        self.assertEqual(self.signal_values(), {"load_1": 2.0})
+
+    def test_malformed_extra_signals_are_dropped_or_clamped(self):
+        self.sample([self.device(
+            load_1=-1, load_5="high", load_15=True,
+            net_rx_bps=None, cpu_iowait=250, cpu_steal=-3,
+            swap_used=500, swap_total=0,
+        )], now=self.BASE)
+
+        self.assertEqual(self.signal_values(), {
+            "cpu_iowait": 100.0, "swap_used": 0.0, "swap_total": 0.0,
+        })
+
+    def test_an_old_agent_without_signals_still_works(self):
+        self.sample([self.device()], now=self.BASE)
+        self.assertEqual(self.stored_metric_samples(), [])
+        payload = app.metrics_series("docker01", "1h", 60, now=self.BASE + 60)
+        self.assertEqual(payload["signals"], {})
+
+    def test_metrics_series_exposes_signal_points_and_a_derived_swap_pct(self):
+        for offset, load, rx, used in (
+            (0, 0.5, 100, 100), (300, 1.5, 300, 200), (600, 1.0, 200, 300),
+        ):
+            self.sample([self.device(
+                load_1=load, swap_used=used, swap_total=1000,
+                net_rx_bps=rx, net_tx_bps=rx / 2, cpu_iowait=2.0,
+            )], now=self.BASE + offset)
+
+        signals = app.metrics_series(
+            "docker01", "1h", 300, now=self.BASE + 600
+        )["signals"]
+        self.assertEqual([point[1] for point in signals["load_1"]["points"]],
+                         [0.5, 1.5, 1.0])
+        self.assertEqual(signals["load_1"]["value"], 1.0)
+        self.assertEqual(signals["net_rx_bps"]["value"], 200.0)
+        self.assertAlmostEqual(signals["swap"]["pct"], 30.0)
+        self.assertEqual(signals["swap"]["used"], 300.0)
+        self.assertEqual(signals["swap"]["total"], 1000.0)
+        self.assertEqual(signals["cpu_iowait"]["value"], 2.0)
+        self.assertNotIn("load_5", signals)
+        self.assertNotIn("cpu_steal", signals)
+
+    def test_signal_history_is_capped_even_for_a_long_window(self):
+        self.sample([self.device(load_1=9.0)], now=self.BASE - 20 * 86400)
+        self.sample([self.device(load_1=1.0)], now=self.BASE)
+
+        signals = app.metrics_series(
+            "docker01", "30d", None, now=self.BASE
+        )["signals"]
+        # Raw signal rows are kept for 30 d, but the strip only asks for 24 h.
+        self.assertEqual([point[1] for point in signals["load_1"]["points"]],
+                         [1.0])
+
+    def test_summary_adds_the_latest_signal_values(self):
+        self.sample([self.device(
+            load_1=0.7, swap_used=250, swap_total=1000,
+            net_rx_bps=500, cpu_iowait=3.0,
+        )], now=self.BASE)
+
+        summary = app.metrics_summary("1h", now=self.BASE + 60)["devices"][0]
+        self.assertEqual(summary["signals"], {
+            "load_1": 0.7, "net_rx_bps": 500.0,
+            "swap_pct": 25.0, "cpu_iowait": 3.0,
+        })
+
+    def test_retention_prunes_signal_rows_with_raw_samples(self):
+        self.sample([self.device(load_1=1.0)],
+                    now=self.BASE - app.HISTORY_SECONDS - 600)
+        self.assertEqual(len(self.stored_metric_samples()), 1)
+
+        app._last_prune["at"] = 0.0
+        self.sample([self.device(load_1=1.0)], now=self.BASE)
+
+        rows = self.stored_metric_samples()
+        self.assertEqual(len(rows), 1)
+        self.assertGreaterEqual(rows[0][1], self.BASE - 60)
+
+    # ---------- annotations ----------
+
+    def post_annotation(self, payload, headers=None):
+        return self.post(json.dumps(payload).encode(),
+                         path="/api/annotations", headers=headers)
+
+    def stored_annotations(self):
+        con = app._connect_metrics()
+        try:
+            return con.execute(
+                "SELECT device_id, ts, kind, text FROM annotations ORDER BY ts"
+            ).fetchall()
+        finally:
+            con.close()
+
+    def test_annotation_endpoint_stores_a_note_and_validates_input(self):
+        status, body = self.post_annotation({
+            "device": "docker01", "kind": "deploy", "text": "v1.2",
+            "ts": self.BASE,
+        })
+        self.assertEqual(status, 201)
+        self.assertTrue(json.loads(body)["id"])
+        self.assertEqual(self.stored_annotations(),
+                         [("docker01", self.BASE, "deploy", "v1.2")])
+
+        self.assertEqual(self.post_annotation({"kind": "party", "text": "x"})[0], 400)
+        self.assertEqual(self.post_annotation({"kind": "deploy", "text": "  "})[0], 400)
+        self.assertEqual(
+            self.post_annotation({"kind": "deploy", "text": "x", "ts": "soon"})[0],
+            400,
+        )
+        self.assertEqual(
+            self.post_annotation({"kind": "deploy", "text": "x", "device": 7})[0],
+            400,
+        )
+        oversized = {"kind": "deploy", "text": "x" * 5000}
+        self.assertEqual(self.post_annotation(oversized)[0], 413)
+
+    def test_annotations_appear_in_the_window_events_and_as_markers(self):
+        self.sample([self.device()], now=self.BASE + 60)
+        self.post_annotation({"device": "docker01", "kind": "deploy",
+                              "text": "rolled out", "ts": self.BASE})
+        self.post_annotation({"kind": "backup", "text": "nightly backup",
+                              "ts": self.BASE + 30})
+        self.post_annotation({"device": "agent:other", "kind": "note",
+                              "text": "other device", "ts": self.BASE + 40})
+        self.post_annotation({"device": "docker01", "kind": "note",
+                              "text": "too old", "ts": self.BASE - 7200})
+
+        payload = app.metrics_series(
+            "docker01", "1h", 60, now=self.BASE + 60
+        )
+        self.assertEqual(
+            [(a["kind"], a["text"], a["auto"]) for a in payload["annotations"]],
+            [("deploy", "rolled out", False), ("backup", "nightly backup", False)],
+        )
+        annotation_events = [
+            event for event in payload["events"] if event["type"] == "annotation"
+        ]
+        self.assertEqual({event["text"] for event in annotation_events},
+                         {"rolled out", "nightly backup"})
+
+    def test_detected_restarts_become_auto_annotations(self):
+        self.sample([self.device(uptime=5000)], now=self.BASE)
+        self.sample([self.device(uptime=40)], now=self.BASE + 60)
+
+        payload = app.metrics_series(
+            "docker01", "1h", 60, now=self.BASE + 60
+        )
+        auto = [a for a in payload["annotations"] if a["auto"]]
+        self.assertEqual(len(auto), 1)
+        self.assertEqual(auto[0]["kind"], "restart")
+        self.assertEqual(auto[0]["ts"], self.BASE + 60)
+        self.assertEqual(self.stored_annotations(), [])
+
+    def test_auto_restart_markers_are_bounded(self):
+        for index in range(50):
+            self.sample([self.device(uptime=1000 if index % 2 == 0 else 10)],
+                        now=self.BASE + index * 60)
+        payload = app.metrics_series(
+            "docker01", "1h", 60, now=self.BASE + 3000
+        )
+        auto = [a for a in payload["annotations"] if a["auto"]]
+        self.assertGreater(len(auto), 0)
+        self.assertLessEqual(len(auto), app.MAX_AUTO_ANNOTATIONS)
+
+    # ---------- curated warnings ----------
+
+    def test_warning_levels_cover_the_five_signals(self):
+        warnings = app.evaluate_warnings({
+            "disk_pct": 96.0,
+            "days_to_90": 2.0,
+            "disk_growth_per_day": 6.0,
+            "mem_pct": 92.0,
+            "online": False,
+            "last_seen": self.BASE - 7200,
+        }, now=self.BASE)
+        levels = {warning["code"]: warning["level"] for warning in warnings}
+        self.assertEqual(levels, {
+            "disk": "critical",
+            "days_to_90": "critical",
+            "growth": "critical",
+            "mem": "warning",
+            "offline": "critical",
+        })
+        for warning in warnings:
+            self.assertTrue(warning["text"])
+
+    def test_a_healthy_device_has_no_warnings(self):
+        self.assertEqual(app.evaluate_warnings({
+            "disk_pct": 40.0, "days_to_90": None,
+            "disk_growth_per_day": None, "mem_pct": 30.0,
+            "online": True, "last_seen": self.BASE,
+        }, now=self.BASE), [])
+
+    def test_summary_and_series_carry_warnings(self):
+        device_id = "agent:gone"
+        self.sample([self.device(device_id, disk=96.0, mem=95.0, online=False)],
+                    now=self.BASE)
+
+        summary = app.metrics_summary("24h", now=self.BASE + 7200)["devices"][0]
+        codes = {warning["code"] for warning in summary["warnings"]}
+        self.assertEqual(codes, {"disk", "mem", "offline"})
+
+        series = app.metrics_series(
+            device_id, "24h", 300, now=self.BASE + 7200
+        )
+        self.assertEqual(
+            {warning["code"] for warning in series["warnings"]},
+            {"disk", "mem", "offline"},
+        )
+
+    def test_live_warnings_are_the_cheap_rail_subset(self):
+        warnings = app.live_warnings({
+            "disk_pct": 96.0, "mem_pct": 95.0,
+            "online": True, "last_seen": self.BASE,
+        }, now=self.BASE)
+        self.assertEqual({warning["code"] for warning in warnings},
+                         {"disk", "mem"})
+
+        status, _ = self.post(json.dumps({
+            "name": "warnpc", "kind": "pc", "disk_pct": 96.0,
+            "mem_pct": 95.0, "cpu_pct": 1.0,
+        }).encode(), path="/api/push/warnpc")
+        self.assertEqual(status, 200)
+        app._cache.update(at=0.0, body=None)
+        with frozen_time(self.BASE):
+            payload = app.stats()
+        agent = next(d for d in payload["devices"] if d["id"] == "agent:warnpc")
+        self.assertEqual(agent["warning_count"], 2)
+        self.assertEqual(agent["warning_level"], "critical")
+
 
 class MetricsPageSourceTest(FrontEndSourceTest):
     """The metrics page, chart markup and deploy wiring, asserted at the source."""
@@ -1714,3 +2322,171 @@ class MultiDiskTest(FrontEndSourceTest):
         # The base row keeps its three fixed metric cells, so single-disk
         # devices are no taller than before.
         self.assertRegex(self.css, r"\.device-row\s*\{[^}]*repeat\(3,\s*46px\)")
+
+
+class MetricsVolumeSourceTest(FrontEndSourceTest):
+    """Phase 1: per-volume history under the chart and inside the table view."""
+
+    def setUp(self):
+        super().setUp()
+        self.metrics_html = (APP_JS.parent / "metrics.html").read_text()
+        self.metrics_js = (APP_JS.parent / "metrics.js").read_text()
+        self.metrics_css = (APP_JS.parent / "metrics.css").read_text()
+
+    def test_volume_table_lives_under_the_chart_and_in_the_table_view(self):
+        self.assertIn('id="volume-section"', self.metrics_html)
+        self.assertIn('id="volume-table"', self.metrics_html)
+        self.assertIn('id="chart-volume-table"', self.metrics_html)
+        chart = self.metrics_html.index('id="chart"')
+        volumes = self.metrics_html.index('id="volume-section"')
+        rail = self.metrics_html.index('class="rail metrics-rail"')
+        self.assertLess(chart, volumes)
+        self.assertLess(volumes, rail)
+
+    def test_volume_rows_show_label_mount_pct_size_growth_and_days_to_full(self):
+        body = function_body(self.metrics_js, "volumeRow")
+        for needle in ("volume.mount", "volumeLabel(volume)", "pct(volume.pct)",
+                       "fmtBytes(volume.total)", "fmtGrowth(volume.growth_per_day)",
+                       "fmtDays(volume.days_to_90)"):
+            self.assertIn(needle, body)
+        self.assertIn("volume.label", function_body(self.metrics_js, "volumeLabel"))
+        growth = function_body(self.metrics_js, "fmtGrowth")
+        self.assertIn("/day", growth)
+
+    def test_volume_section_only_appears_for_more_than_one_volume(self):
+        body = function_body(self.metrics_js, "renderVolumes")
+        self.assertIn("series.volumes", body)
+        self.assertIn("volumes.length < 2", body)
+        self.assertIn("volumeSectionEl.hidden", body)
+        self.assertIn("renderVolumes()", function_body(self.metrics_js, "load"))
+
+    def test_table_view_includes_volume_rows(self):
+        body = function_body(self.metrics_js, "renderTable")
+        self.assertIn("renderVolumeTable()", body)
+        volume_body = function_body(self.metrics_js, "renderVolumeTable")
+        self.assertIn("volume.points", volume_body)
+        self.assertIn("chartVolumeTableEl", volume_body)
+
+    def test_volume_table_is_compact_and_scrolls_on_a_phone(self):
+        self.assertRegex(self.metrics_css, r"\.volume-table\s*\{")
+        self.assertRegex(self.metrics_css, r"\.volume-scroll\s*\{[^}]*overflow-x:\s*auto")
+        self.assertRegex(self.metrics_css, r"\.volume-table th,\s*\.volume-table td\s*\{")
+
+
+class MetricsPeaksSourceTest(FrontEndSourceTest):
+    """Phase 2: min/max bands and the 90d / 1y ranges."""
+
+    def setUp(self):
+        super().setUp()
+        self.metrics_html = (APP_JS.parent / "metrics.html").read_text()
+        self.metrics_js = (APP_JS.parent / "metrics.js").read_text()
+        self.metrics_css = (APP_JS.parent / "metrics.css").read_text()
+
+    def test_the_api_bands_are_drawn_as_a_peak_band_behind_the_lines(self):
+        body = function_body(self.metrics_js, "bandPaths")
+        self.assertIn("point[4] !== 1", body)
+        self.assertIn("isNumber", body)
+        render = function_body(self.metrics_js, "renderChart")
+        self.assertIn("bandPaths(", render)
+        self.assertIn("chart-band", render)
+        self.assertRegex(self.metrics_css, r"\.chart-band\s*\{")
+        self.assertRegex(self.metrics_css, r"\.chart-band\.is-cpu\s*\{")
+
+    def test_the_table_view_shows_min_average_and_max(self):
+        body = function_body(self.metrics_js, "tableCells")
+        self.assertIn("series.bands", body)
+        self.assertIn("item.band", body)
+        self.assertIn("Math.round", body)
+        self.assertIn("'–'", body)
+        self.assertIn("min–avg–max", self.metrics_html)
+        # The RAM series key is 'ram' but the API names the band 'mem'.
+        self.assertIn("{ key: 'ram', field: 2, label: 'RAM', band: 'mem' }",
+                      self.metrics_js)
+
+    def test_ninety_day_and_one_year_ranges_are_wired_end_to_end(self):
+        for window in ("90d", "1y"):
+            self.assertIn('data-range="' + window + '"', self.metrics_html)
+            self.assertIn("'" + window + "'", self.metrics_js)
+        self.assertIn("RANGES = ['1h', '6h', '24h', '7d', '30d', '90d', '1y']",
+                      self.metrics_js)
+
+
+class MetricsSignalsSourceTest(FrontEndSourceTest):
+    """Phase 3: load/swap/network/iowait live outside the 0-100 chart."""
+
+    def setUp(self):
+        super().setUp()
+        self.metrics_html = (APP_JS.parent / "metrics.html").read_text()
+        self.metrics_js = (APP_JS.parent / "metrics.js").read_text()
+        self.metrics_css = (APP_JS.parent / "metrics.css").read_text()
+
+    def test_signals_have_their_own_strip_outside_the_chart(self):
+        self.assertIn('id="signal-strip"', self.metrics_html)
+        chart = self.metrics_html.index('id="chart"')
+        strip = self.metrics_html.index('id="signal-strip"')
+        self.assertGreater(strip, chart)
+        body = function_body(self.metrics_js, "renderSignals")
+        self.assertIn("series.signals", body)
+        self.assertIn("signalTile(", body)
+        self.assertIn("signal-strip", self.metrics_css)
+
+    def test_missing_signals_render_absent_never_zero(self):
+        body = function_body(self.metrics_js, "renderSignals")
+        self.assertIn("isNumber", body)
+        self.assertIn("signals.length", body)
+        self.assertIn("signalStripEl.hidden", body)
+        self.assertNotIn("?? 0", body)
+        self.assertNotIn("|| 0", body)
+
+    def test_network_rates_have_their_own_units(self):
+        rate = function_body(self.metrics_js, "fmtRate")
+        self.assertIn("fmtBytes", rate)
+        self.assertIn("/s", rate)
+        tiles = function_body(self.metrics_js, "signalTile")
+        self.assertIn("fmtRate", tiles)
+
+    def test_signal_strip_is_compact_on_a_phone(self):
+        self.assertRegex(self.metrics_css, r"\.signal-strip\s*\{")
+        self.assertRegex(self.metrics_css, r"\.signal-tile\s*\{")
+        self.assertRegex(self.metrics_css, r"\.signal-spark\s*\{")
+
+
+class MetricsAnnotationsWarningsSourceTest(FrontEndSourceTest):
+    """Phase 4: warning banner, chart markers and annotation Events rows."""
+
+    def setUp(self):
+        super().setUp()
+        self.metrics_html = (APP_JS.parent / "metrics.html").read_text()
+        self.metrics_js = (APP_JS.parent / "metrics.js").read_text()
+        self.metrics_css = (APP_JS.parent / "metrics.css").read_text()
+
+    def test_warning_banner_lists_active_warnings_and_hides_when_clean(self):
+        self.assertIn('id="warning-banner"', self.metrics_html)
+        body = function_body(self.metrics_js, "renderWarnings")
+        self.assertIn("device.warnings", body)
+        self.assertIn("warningBannerEl.hidden", body)
+        self.assertIn("warning.level", body)
+        self.assertIn("warning.text", body)
+        self.assertIn("renderWarnings()", function_body(self.metrics_js, "load"))
+
+    def test_chart_draws_annotation_markers(self):
+        body = function_body(self.metrics_js, "renderChart")
+        self.assertIn("series.annotations", body)
+        self.assertIn("chart-marker", body)
+        self.assertIn("annotation.text", body)
+
+    def test_events_show_manual_annotations(self):
+        body = function_body(self.metrics_js, "eventItem")
+        self.assertIn("event.type === 'annotation'", body)
+        self.assertIn("event.kind", body)
+        self.assertIn("event.text", body)
+        self.assertIn("is-annotation", self.metrics_css)
+        self.assertRegex(self.metrics_css, r"\.chart-marker\s*\{")
+        self.assertRegex(self.metrics_css, r"\.warning-banner\s*\{")
+
+    def test_dashboard_rail_shows_a_compact_warning_count(self):
+        row = function_body(self.source, "deviceRow")
+        self.assertIn("warning_count", row)
+        self.assertIn("device-warn", row)
+        self.assertIn("warning_count", function_body(self.source, "networkKey"))
+        self.assertRegex(self.css, r"\.device-warn\s*\{")

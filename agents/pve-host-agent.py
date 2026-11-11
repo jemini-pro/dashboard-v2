@@ -40,14 +40,97 @@ def cpu_pct():
     return round(100.0 * (1 - (i2 - i1) / (t2 - t1)), 1) if t2 > t1 else None
 
 
-def mem():
+def meminfo():
     d = {}
-    with open("/proc/meminfo") as f:
-        for line in f:
-            k, _, rest = line.partition(":")
-            d[k] = int(rest.strip().split()[0]) * 1024
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, rest = line.partition(":")
+                try:
+                    d[k] = int(rest.strip().split()[0]) * 1024
+                except (ValueError, IndexError):
+                    continue
+    except OSError:
+        return {}
+    return d
+
+
+def mem():
+    d = meminfo()
     total = d.get("MemTotal", 0)
     return total - d.get("MemAvailable", d.get("MemFree", 0)), total
+
+
+def swap():
+    """(used, total) swap bytes, or (None, None) when the host has no swap."""
+    d = meminfo()
+    total = d.get("SwapTotal", 0)
+    if not total:
+        return None, None
+    return max(0, total - d.get("SwapFree", 0)), total
+
+
+def load_average():
+    try:
+        with open("/proc/loadavg") as f:
+            parts = f.read().split()
+        return tuple(round(float(value), 2) for value in parts[:3])
+    except (OSError, ValueError):
+        return None, None, None
+
+
+def net_counters():
+    """(rx_bytes, tx_bytes) across real interfaces, or (None, None)."""
+    rx = tx = 0
+    try:
+        with open("/proc/net/dev") as f:
+            for line in f.readlines()[2:]:
+                name, sep, rest = line.partition(":")
+                if not sep or name.strip() == "lo":
+                    continue
+                cols = rest.split()
+                if len(cols) < 9:
+                    continue
+                rx += int(cols[0])
+                tx += int(cols[8])
+    except (OSError, ValueError):
+        return None, None
+    return rx, tx
+
+
+def net_rates():
+    rx1, tx1 = net_counters()
+    at1 = time.time()
+    if rx1 is None or tx1 is None:
+        return None, None
+    time.sleep(1)
+    rx2, tx2 = net_counters()
+    at2 = time.time()
+    if (rx2 is None or tx2 is None or at2 <= at1
+            or rx2 < rx1 or tx2 < tx1):
+        return None, None
+    elapsed = at2 - at1
+    return round((rx2 - rx1) / elapsed), round((tx2 - tx1) / elapsed)
+
+
+def cpu_extra():
+    """(iowait %, steal %) over a one-second delta."""
+    def sample():
+        with open("/proc/stat") as f:
+            v = [float(x) for x in f.readline().split()[1:]]
+        return (v[4] if len(v) > 4 else 0.0,
+                v[7] if len(v) > 7 else 0.0, sum(v))
+
+    try:
+        i1, s1, t1 = sample()
+        time.sleep(1)
+        i2, s2, t2 = sample()
+    except (OSError, ValueError):
+        return None, None
+    if t2 <= t1 or i2 < i1 or s2 < s1:
+        return None, None
+    return (round(100.0 * (i2 - i1) / (t2 - t1), 1),
+            round(100.0 * (s2 - s1) / (t2 - t1), 1))
 
 
 def uptime():
@@ -70,22 +153,57 @@ def guests():
         return []
 
 
+def root_disks():
+    """The host's root filesystem as a volume list.
+
+    LXC guests have no per-volume data from pvesh, so only the host sends
+    this. The server rejects a malformed entry rather than storing it.
+    """
+    try:
+        du = shutil.disk_usage("/")
+    except OSError:
+        return []
+    if not du.total:
+        return []
+    return [{
+        "mount": "/",
+        "label": "System",
+        "total": du.total,
+        "used": du.used,
+        "pct": round(100.0 * du.used / du.total, 1),
+    }]
+
+
 def main():
     used, total = mem()
-    du = shutil.disk_usage("/")
+    disks = root_disks()
+    load_1, load_5, load_15 = load_average()
+    swap_used, swap_total = swap()
+    net_rx, net_tx = net_rates()
+    iowait, steal = cpu_extra()
     errors = []
 
     try:
-        push("pve", {
+        host = {
             "name": "pve",
             "kind": "host",
             "cpu_pct": cpu_pct(),
             "mem_pct": round(100.0 * used / total, 1) if total else None,
             "mem_used": used,
             "mem_total": total,
-            "disk_pct": round(100.0 * du.used / du.total, 1) if du.total else None,
+            "disk_pct": disks[0]["pct"] if disks else None,
+            "disks": disks,
             "uptime_s": uptime(),
-        })
+        }
+        for key, value in (
+            ("load_1", load_1), ("load_5", load_5), ("load_15", load_15),
+            ("swap_used", swap_used), ("swap_total", swap_total),
+            ("net_rx_bps", net_rx), ("net_tx_bps", net_tx),
+            ("cpu_iowait", iowait), ("cpu_steal", steal),
+        ):
+            if value is not None:
+                host[key] = value
+        push("pve", host)
         print("pushed pve")
     except Exception as exc:  # noqa: BLE001
         errors.append(f"pve: {exc}")

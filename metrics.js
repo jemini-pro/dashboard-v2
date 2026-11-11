@@ -1,15 +1,28 @@
 const WORK_START_HOUR = 9;
 const WORK_END_HOUR = 17;
 const DEFAULT_RANGE = '24h';
-const RANGES = ['1h', '6h', '24h', '7d', '30d'];
+const RANGES = ['1h', '6h', '24h', '7d', '30d', '90d', '1y'];
 const REFRESH_MS = 60000;
 
 // One definition drives the lines, the legend and the table. Fields index into
 // the compact point arrays the API sends: [ts, cpu, mem, disk, online].
 const SERIES = [
-    { key: 'cpu', field: 1, label: 'CPU' },
-    { key: 'ram', field: 2, label: 'RAM' },
-    { key: 'disk', field: 3, label: 'Disk' }
+    { key: 'cpu', field: 1, label: 'CPU', band: 'cpu' },
+    { key: 'ram', field: 2, label: 'RAM', band: 'mem' },
+    { key: 'disk', field: 3, label: 'Disk', band: 'disk' }
+];
+
+// Extra signals are not percentages on the fixed chart. Each definition is a
+// tile; a signal with no data is skipped rather than shown as zero.
+const SIGNAL_DEFS = [
+    { key: 'load_1', label: 'Load 1m', decimals: 2 },
+    { key: 'load_5', label: 'Load 5m', decimals: 2 },
+    { key: 'load_15', label: 'Load 15m', decimals: 2 },
+    { key: 'swap', label: 'Swap' },
+    { key: 'net_rx_bps', label: 'Net RX', rate: true },
+    { key: 'net_tx_bps', label: 'Net TX', rate: true },
+    { key: 'cpu_iowait', label: 'I/O wait' },
+    { key: 'cpu_steal', label: 'Steal' }
 ];
 
 const KIND_DEFS = [
@@ -26,6 +39,7 @@ const healthDotEl = document.getElementById('health-dot');
 const healthTextEl = document.getElementById('health-text');
 const rangeTabsEl = document.getElementById('range-tabs');
 const statGridEl = document.getElementById('stat-grid');
+const warningBannerEl = document.getElementById('warning-banner');
 const staleEl = document.getElementById('metrics-stale');
 const chartTitleEl = document.getElementById('chart-title');
 const chartSubEl = document.getElementById('chart-sub');
@@ -36,6 +50,13 @@ const chartXAxisEl = document.getElementById('chart-xaxis');
 const chartEmptyEl = document.getElementById('chart-empty');
 const tableViewEl = document.getElementById('table-view');
 const chartTableEl = document.getElementById('chart-table');
+const volumeSectionEl = document.getElementById('volume-section');
+const volumeSubEl = document.getElementById('volume-sub');
+const volumeTableEl = document.getElementById('volume-table');
+const chartVolumeTableEl = document.getElementById('chart-volume-table');
+const signalStripEl = document.getElementById('signal-strip');
+const signalSubEl = document.getElementById('signal-sub');
+const signalTilesEl = document.getElementById('signal-tiles');
 const deviceListEl = document.getElementById('device-list');
 const devicesSubEl = document.getElementById('devices-sub');
 const eventsEl = document.getElementById('events');
@@ -146,7 +167,10 @@ function hhmm(ts) {
 
 function pointTime(ts, range) {
     const date = new Date(ts * 1000);
-    if (range === '7d' || range === '30d') {
+    if (range === '1y') {
+        return date.toLocaleDateString('en-GB', { month: 'short', year: '2-digit' });
+    }
+    if (range === '7d' || range === '30d' || range === '90d') {
         return date.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
     }
     return hhmm(ts);
@@ -180,6 +204,48 @@ function stepLabel(seconds) {
     if (!isNumber(seconds)) return '';
     if (seconds < 3600) return Math.round(seconds / 60) + 'm';
     return Math.round(seconds / 3600) + 'h';
+}
+
+function fmtBytes(value) {
+    if (!isNumber(value) || value <= 0) return '—';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let size = value;
+    let unit = 0;
+    while (size >= 1024 && unit < units.length - 1) {
+        size /= 1024;
+        unit += 1;
+    }
+    const digits = unit === 0 || size >= 100 ? 0 : (size >= 10 ? 1 : 2);
+    return size.toFixed(digits) + ' ' + units[unit];
+}
+
+function fmtGrowth(value) {
+    if (!isNumber(value)) return '—';
+    return (value > 0 ? '+' : '') + value.toFixed(2) + '%/day';
+}
+
+function fmtRate(value) {
+    if (!isNumber(value) || value < 0) return '—';
+    if (value < 1) return '0 B/s';
+    return fmtBytes(value) + '/s';
+}
+
+function volumeLabel(volume) {
+    return volume.label || volume.mount || '—';
+}
+
+// A volume row is a summary of the window, not a chart series: the 0-100
+// chart keeps its single aggregate disk line.
+function volumeRow(volume) {
+    const days = fmtDays(volume.days_to_90);
+    return '<tr data-mount="' + escapeHtml(volume.mount) + '">' +
+        '<td>' + escapeHtml(volumeLabel(volume)) + '</td>' +
+        '<td>' + escapeHtml(volume.mount) + '</td>' +
+        '<td>' + pct(volume.pct) + '</td>' +
+        '<td>' + escapeHtml(fmtBytes(volume.total)) + '</td>' +
+        '<td>' + escapeHtml(fmtGrowth(volume.growth_per_day)) + '</td>' +
+        '<td>' + (days ? '~' + escapeHtml(days) : '—') + '</td>' +
+        '</tr>';
 }
 
 async function getJson(path) {
@@ -269,6 +335,29 @@ function renderTiles() {
             diskFlag);
 }
 
+// ---------- warnings ----------
+
+function renderWarnings() {
+    const devices = (summary && summary.devices) || [];
+    const rows = [];
+    devices.forEach((device) => {
+        (device.warnings || []).forEach((warning) => {
+            rows.push('<li class="warning-row is-' + escapeHtml(warning.level) + '">' +
+                '<span class="warning-device">' + escapeHtml(device.name) + '</span>' +
+                '<span class="warning-text">' + escapeHtml(warning.text) + '</span>' +
+                '</li>');
+        });
+    });
+    warningBannerEl.hidden = rows.length === 0;
+    warningBannerEl.innerHTML = rows.length
+        ? '<div class="warning-head">' +
+            '<h2 class="card-heading">Warnings</h2>' +
+            '<span class="card-sub">' + rows.length + ' active</span>' +
+          '</div>' +
+          '<ul class="warning-list">' + rows.join('') + '</ul>'
+        : '';
+}
+
 // ---------- device rail ----------
 
 function sparkSvg(values) {
@@ -299,11 +388,17 @@ function deviceItem(device) {
         : '—';
     // State is text as well as a dot: colour and opacity never carry it alone.
     const stateText = kindLabel(device.kind) + ' · ' + (device.online ? 'online' : 'offline');
+    const warningCount = Array.isArray(device.warnings) ? device.warnings.length : 0;
+    const warning = warningCount
+        ? '<span class="device-item-warn" title="' + warningCount +
+          ' active warning(s)">' + warningCount + 'w</span>'
+        : '';
     return '<button type="button" class="device-item' + (selected ? ' is-selected' : '') + '" ' +
         'data-device="' + escapeHtml(device.id) + '" aria-pressed="' + String(selected) + '">' +
         '<span class="device-item-head">' +
         '<span class="device-dot ' + state + '" aria-hidden="true"></span>' +
         '<span class="device-item-name">' + escapeHtml(device.name) + '</span>' +
+        warning +
         '<span class="device-item-avail" title="Availability over ' + escapeHtml(activeRange) + '">' +
         availability + '</span>' +
         '</span>' +
@@ -425,6 +520,35 @@ function seriesPath(points, field, xOf, yOf) {
     return path.trim();
 }
 
+// A peak band is the min/max envelope behind a line, so a spike that survives
+// bucketing is still visible. Bands break at offline points exactly like the
+// line does, rather than bridging a gap.
+function bandPaths(points, band, xOf, yOf) {
+    let path = '';
+    let top = [];
+    let bottom = [];
+    const flush = () => {
+        if (top.length >= 2) {
+            path += 'M' + top.map((point) => point.join(' ')).join(' L ') +
+                ' L' + bottom.slice().reverse().map((point) => point.join(' ')).join(' L ') +
+                ' Z ';
+        }
+        top = [];
+        bottom = [];
+    };
+    points.forEach((point, index) => {
+        const row = band && band[index];
+        if (point[4] !== 1 || !row || !isNumber(row[1]) || !isNumber(row[2])) {
+            flush();
+            return;
+        }
+        top.push([xOf(row[0]).toFixed(1), yOf(row[2]).toFixed(1)]);
+        bottom.push([xOf(row[0]).toFixed(1), yOf(row[1]).toFixed(1)]);
+    });
+    flush();
+    return path.trim();
+}
+
 function renderChartHead() {
     const device = series && series.device;
     if (!device) {
@@ -497,6 +621,23 @@ function renderChart() {
         'x2="' + (width - pad.right) + '" y2="' + yOf(value).toFixed(1) + '"/>'
     ).join('');
 
+    const annotations = (series && series.annotations) || [];
+    const markers = annotations.map((annotation) => {
+        if (annotation.ts < first || annotation.ts > last) return '';
+        const x = xOf(annotation.ts).toFixed(1);
+        return '<line class="chart-marker is-' + escapeHtml(annotation.kind) + '" ' +
+            'x1="' + x + '" y1="' + pad.top + '" x2="' + x + '" ' +
+            'y2="' + (height - pad.bottom) + '">' +
+            '<title>' + escapeHtml(annotation.kind + ': ' + annotation.text) +
+            '</title></line>';
+    }).join('');
+
+    const bands = (series && series.bands) || {};
+    const bandMarks = SERIES.map((item) =>
+        '<path class="chart-band is-' + item.key + '" d="' +
+        bandPaths(points, bands[item.band], xOf, yOf) + '"/>'
+    ).join('');
+
     const lines = SERIES.map((item) =>
         '<path class="chart-line is-' + item.key + '" d="' +
         seriesPath(points, item.field, xOf, yOf) + '"/>'
@@ -511,7 +652,7 @@ function renderChart() {
 
     chartEl.innerHTML =
         '<svg class="chart-svg" viewBox="0 0 ' + width + ' ' + height + '" ' +
-        'preserveAspectRatio="none" aria-hidden="true">' + grid + lines + dots + '</svg>' +
+        'preserveAspectRatio="none" aria-hidden="true">' + grid + markers + bandMarks + lines + dots + '</svg>' +
         '<span class="chart-crosshair" hidden></span>' +
         '<span class="chart-hover-dots" hidden>' + SERIES.map((item) =>
             '<span class="chart-hover-dot is-' + item.key + '" data-series-key="' + item.key +
@@ -587,14 +728,97 @@ function hidePointer() {
     if (tooltip) tooltip.hidden = true;
 }
 
+function renderVolumes() {
+    const volumes = (series && series.volumes) || [];
+    const body = volumeTableEl.querySelector('tbody');
+    // The fixed 0-100 chart keeps one aggregate disk line. The volume table
+    // appears only when a device reports more than one volume, otherwise the
+    // single DSK value above already says everything.
+    volumeSectionEl.hidden = volumes.length < 2;
+    if (volumeSectionEl.hidden) {
+        body.innerHTML = '';
+        volumeSubEl.textContent = '';
+        return;
+    }
+    volumeSubEl.textContent = volumes.length + ' volumes · fullest ' +
+        volumeLabel(volumes[0]) + ' ' + pct(volumes[0].pct);
+    body.innerHTML = volumes.map(volumeRow).join('');
+}
+
+const MAX_VOLUME_ROWS = 400;
+
+// The opt-in table view carries the per-volume samples too: the chart cannot
+// show them without turning one 0-100 axis into a crowded multi-line mess.
+function renderVolumeTable() {
+    const body = chartVolumeTableEl.querySelector('tbody');
+    const volumes = (series && series.volumes) || [];
+    const rows = [];
+    volumes.forEach((volume) => {
+        (volume.points || []).slice().reverse().forEach((point) => {
+            if (rows.length >= MAX_VOLUME_ROWS) return;
+            rows.push('<tr><td>' + escapeHtml(fullTime(point[0])) + '</td>' +
+                '<td>' + escapeHtml(volumeLabel(volume)) + '</td>' +
+                '<td>' + pct(point[1]) + '</td></tr>');
+        });
+    });
+    body.innerHTML = rows.length
+        ? rows.join('')
+        : '<tr><td colspan="3">No per-volume samples in this window.</td></tr>';
+}
+
+function signalTile(def, signal) {
+    let text = null;
+    if (def.key === 'swap' && isNumber(signal.pct)) {
+        text = pct(signal.pct);
+    } else if (isNumber(signal.value)) {
+        text = def.rate ? fmtRate(signal.value)
+            : (isNumber(def.decimals) ? signal.value.toFixed(def.decimals)
+                : pct(signal.value));
+    }
+    if (!text) return '';
+    const spark = sparkSvg((signal.points || []).map((point) => point[1]));
+    return '<div class="signal-tile">' +
+        '<span class="signal-label">' + escapeHtml(def.label) + '</span>' +
+        '<span class="signal-value">' + escapeHtml(text) + '</span>' +
+        '<span class="signal-spark">' + spark + '</span>' +
+        '</div>';
+}
+
+function signalRangeLabel() {
+    return ['1h', '6h', '24h'].includes(activeRange) ? activeRange : '24h';
+}
+
+function renderSignals() {
+    const signals = SIGNAL_DEFS
+        .filter((def) => series && series.signals && series.signals[def.key])
+        .map((def) => ({ def, data: series.signals[def.key] }))
+        .filter(({ data }) => isNumber(data.value) || isNumber(data.pct));
+    signalStripEl.hidden = signals.length === 0;
+    if (signalStripEl.hidden) {
+        signalTilesEl.innerHTML = '';
+        signalSubEl.textContent = '';
+        return;
+    }
+    signalSubEl.textContent = 'last ' + signalRangeLabel();
+    signalTilesEl.innerHTML = signals
+        .map(({ def, data }) => signalTile(def, data)).join('');
+}
+
 // ---------- table and events ----------
 
-function tableCells(point) {
+function tableCells(point, index) {
     const online = point[4] === 1;
+    const bands = (series && series.bands) || {};
     return '<td>' + escapeHtml(fullTime(point[0])) + '</td>' +
         SERIES.map((item) => {
             const value = point[item.field];
-            return '<td>' + (online && isNumber(value) ? Math.round(value) + '%' : '—') + '</td>';
+            if (!online || !isNumber(value)) return '<td>—</td>';
+            const band = bands[item.band] && bands[item.band][index];
+            if (band && isNumber(band[1]) && isNumber(band[2])) {
+                return '<td>' + Math.round(band[1]) + '–' + Math.round(value) +
+                    '–' + Math.round(band[2]) + '%</td>';
+            }
+            return '<td>' + Math.round(value) + '%</td>';
         }).join('') +
         '<td>' + (online ? 'online' : 'offline') + '</td>';
 }
@@ -602,12 +826,25 @@ function tableCells(point) {
 function renderTable() {
     const body = chartTableEl.querySelector('tbody');
     const points = (series && series.points) || [];
-    body.innerHTML = points.length
-        ? points.slice().reverse().map((point) => '<tr>' + tableCells(point) + '</tr>').join('')
+    // Keep the original index so each row can read its matching band entry.
+    const rows = points.map((point, index) => ({ point, index })).reverse();
+    body.innerHTML = rows.length
+        ? rows.map(({ point, index }) =>
+            '<tr>' + tableCells(point, index) + '</tr>').join('')
         : '<tr><td colspan="5">No samples in this window.</td></tr>';
+    renderVolumeTable();
 }
 
 function eventItem(event) {
+    if (event.type === 'annotation') {
+        return '<li class="event is-annotation is-' + escapeHtml(event.kind) + '">' +
+            '<span class="event-mark" aria-hidden="true">◆</span>' +
+            '<span class="event-body">' +
+            '<span class="event-label">' + escapeHtml(event.kind) + ' · ' +
+            escapeHtml(event.text) + '</span>' +
+            '<span class="event-time">' + escapeHtml(hhmm(event.ts)) + '</span>' +
+            '</span></li>';
+    }
     if (event.type === 'offline') {
         return '<li class="event is-offline">' +
             '<span class="event-mark" aria-hidden="true">▼</span>' +
@@ -648,6 +885,7 @@ async function load(full) {
             const ids = summary.devices.map((device) => device.id);
             if (!selectedId || !ids.includes(selectedId)) selectedId = ids[0] || null;
             renderTiles();
+            renderWarnings();
             renderDevices();
             renderHealth();
             syncUrl();
@@ -663,6 +901,8 @@ async function load(full) {
         renderChartHead();
         renderLegend();
         renderChart();
+        renderSignals();
+        renderVolumes();
         renderEvents();
         if (tableViewEl.open) renderTable();
         setStale(false);
@@ -695,6 +935,8 @@ rangeTabsEl.addEventListener('click', (event) => {
     syncUrl();
     series = null;
     renderChart();
+    renderSignals();
+    renderVolumes();
     load(true);
 });
 
