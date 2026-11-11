@@ -64,14 +64,26 @@ def cpu_pct():
     return round(100.0 - float(m.group(1)), 1) if m else None
 
 
+def meminfo():
+    """Linux /proc/meminfo in bytes, keyed without the trailing colon."""
+    info = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                key, _, rest = line.partition(":")
+                try:
+                    info[key] = int(rest.strip().split()[0]) * 1024
+                except (ValueError, IndexError):
+                    continue
+    except OSError:
+        return {}
+    return info
+
+
 def mem():
     system = platform.system()
     if system == "Linux":
-        info = {}
-        with open("/proc/meminfo") as f:
-            for line in f:
-                k, _, rest = line.partition(":")
-                info[k] = int(rest.strip().split()[0]) * 1024
+        info = meminfo()
         total = info.get("MemTotal", 0)
         used = total - info.get("MemAvailable", info.get("MemFree", 0))
         return used, total
@@ -84,6 +96,115 @@ def mem():
     page = 4096
     used = (pages.get("Anonymous pages", 0) + pages.get("Pages wired down", 0)) * page
     return used, total
+
+
+SIZE_MULT = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+
+
+def _size_bytes(number, unit):
+    return int(float(number) * SIZE_MULT[unit.upper()])
+
+
+def swap():
+    """(used, total) swap bytes, or (None, None) when the OS has no data.
+
+    Windows has no equivalent here; its agent reports the page file instead.
+    A machine with swap disabled reports (0, 0), which the server treats as
+    absent rather than as a full disk.
+    """
+    if platform.system() == "Linux":
+        info = meminfo()
+        total = info.get("SwapTotal", 0)
+        if not total:
+            return 0, 0
+        return max(0, total - info.get("SwapFree", 0)), total
+    out = run("sysctl -n vm.swapusage")
+    total = re.search(r"total = ([\d.]+)([KMGT])", out)
+    used = re.search(r"used = ([\d.]+)([KMGT])", out)
+    if not total or not used:
+        return None, None
+    return (_size_bytes(used.group(1), used.group(2)),
+            _size_bytes(total.group(1), total.group(2)))
+
+
+def load_average():
+    """The 1/5/15-minute load averages, or (None, None, None) if unavailable."""
+    try:
+        one, five, fifteen = os.getloadavg()
+    except (OSError, AttributeError):
+        return None, None, None
+    return round(one, 2), round(five, 2), round(fifteen, 2)
+
+
+def net_counters():
+    """(rx_bytes, tx_bytes) across real interfaces, or (None, None)."""
+    if platform.system() == "Linux":
+        rx = tx = 0
+        try:
+            with open("/proc/net/dev") as f:
+                for line in f.readlines()[2:]:
+                    name, sep, rest = line.partition(":")
+                    if not sep or name.strip() == "lo":
+                        continue
+                    cols = rest.split()
+                    if len(cols) < 9:
+                        continue
+                    rx += int(cols[0])
+                    tx += int(cols[8])
+        except (OSError, ValueError):
+            return None, None
+        return rx, tx
+    # macOS: Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes
+    # netstat prints one row per address, so count each interface once.
+    rx = tx = 0
+    seen = set()
+    for line in run("netstat -ib").splitlines()[1:]:
+        cols = line.split()
+        if len(cols) < 10 or cols[0].startswith("lo") or cols[0] in seen:
+            continue
+        try:
+            rx += int(cols[6])
+            tx += int(cols[9])
+        except ValueError:
+            continue
+        seen.add(cols[0])
+    return (rx, tx) if seen else (None, None)
+
+
+def net_rates():
+    """Bytes per second over a one-second delta, or (None, None)."""
+    rx1, tx1 = net_counters()
+    at1 = time.time()
+    if rx1 is None or tx1 is None:
+        return None, None
+    time.sleep(1)
+    rx2, tx2 = net_counters()
+    at2 = time.time()
+    if (rx2 is None or tx2 is None or at2 <= at1
+            or rx2 < rx1 or tx2 < tx1):
+        return None, None
+    elapsed = at2 - at1
+    return round((rx2 - rx1) / elapsed), round((tx2 - tx1) / elapsed)
+
+
+def cpu_extra():
+    """(iowait %, steal %) over a one-second delta; (None, None) off Linux."""
+    if platform.system() != "Linux":
+        return None, None
+
+    def sample():
+        with open("/proc/stat") as f:
+            v = [float(x) for x in f.readline().split()[1:]]
+        return (v[4] if len(v) > 4 else 0.0,
+                v[7] if len(v) > 7 else 0.0, sum(v))
+
+    i1, s1, t1 = sample()
+    time.sleep(1)
+    i2, s2, t2 = sample()
+    if t2 <= t1 or i2 < i1 or s2 < s1:
+        return None, None
+    return (round(100.0 * (i2 - i1) / (t2 - t1), 1),
+            round(100.0 * (s2 - s1) / (t2 - t1), 1))
 
 
 def uptime_s():
@@ -192,7 +313,11 @@ def disks():
 def collect():
     used, total = mem()
     volumes = disks()
-    return {
+    load_1, load_5, load_15 = load_average()
+    swap_used, swap_total = swap()
+    net_rx, net_tx = net_rates()
+    iowait, steal = cpu_extra()
+    payload = {
         "name": NAME,
         "kind": KIND,
         "cpu_pct": cpu_pct(),
@@ -205,6 +330,17 @@ def collect():
         "disks": volumes,
         "uptime_s": uptime_s(),
     }
+    # Optional signals are omitted when this OS cannot provide them. The
+    # server omits them from the API too, so nothing renders as a fake zero.
+    for key, value in (
+        ("load_1", load_1), ("load_5", load_5), ("load_15", load_15),
+        ("swap_used", swap_used), ("swap_total", swap_total),
+        ("net_rx_bps", net_rx), ("net_tx_bps", net_tx),
+        ("cpu_iowait", iowait), ("cpu_steal", steal),
+    ):
+        if value is not None:
+            payload[key] = value
+    return payload
 
 
 def push(payload):

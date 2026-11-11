@@ -34,8 +34,8 @@ a main column (Jump back in, Launchpad, All tools) and a Network rail. There is 
 | `/api/health` | GET | `{ok}` |
 | `/api/bookmarks` | GET | the bookmark store, with a decayed `score` per item |
 | `/api/stats` | GET | devices array, cached 5 s; each device carries 24 h availability |
-| `/api/metrics/summary` | GET | per-device availability, averages, events, disk trend, a compact volume summary and a CPU sparkline; long windows read rollups |
-| `/api/metrics` | GET | one device's bucketed history, min/max bands and per-volume series: `?device=<id>&window=1h\|6h\|24h\|7d\|30d\|90d\|1y&step=<s>` |
+| `/api/metrics/summary` | GET | per-device availability, averages, events, disk trend, compact volume and latest-signal summaries, and a CPU sparkline; long windows read rollups |
+| `/api/metrics` | GET | one device's bucketed history, min/max bands, per-volume series and recent signals: `?device=<id>&window=1h\|6h\|24h\|7d\|30d\|90d\|1y&step=<s>` |
 | `/api/hit` | POST | record a bookmark click (`{"url": "..."}` → `204`, no body) |
 | `/api/push/<name>` | POST | agent heartbeat, needs `X-Dash-Token`; optionally carries `disks` |
 
@@ -74,6 +74,14 @@ can answer "is this normal, and since when?" rather than only "what is it now?".
   heartbeat never double-counts. The local `docker01` volume and each agent's
   `disks` array both feed it. LXC guests report no volume data, so they have
   no rows; old agents that send only `disk_pct` simply have none.
+- **Extra signals use one generic table.** `metric_samples (device_id, metric,
+  ts, value)` stores load (1/5/15), swap used/total, network rx/tx rates and
+  CPU iowait/steal. The allowlist is `EXTRA_METRICS` in `app.py`, so a future
+  signal needs no schema migration. A heartbeat with no signal fields writes
+  nothing, an old agent keeps working, and the API omits what it never
+  received — missing signals are never rendered as zero. Swap percentage is
+  derived on read as `swap_used / swap_total`; a host with no swap reports
+  total 0 and therefore no swap signal.
 - **Two rollup tiers.** `rollup_5m` and `rollup_1h` (plus the matching
   `disk_rollup_5m` / `disk_rollup_1h` for volumes) store `samples`,
   `online_samples`, per-series average/min/max and the uptime first/last/min
@@ -89,7 +97,7 @@ can answer "is this normal, and since when?" rather than only "what is it now?".
   `SUMMARY_CACHE_SECONDS` (30 s) and shared across open tabs; every sample
   write and every agent push invalidates it, so a new value is never hidden
   for the full TTL. An explicit `now` (tests/backfills) bypasses the cache.
-- **Retention.** Raw samples and raw volume rows are kept for
+- **Retention.** Raw samples, raw volume rows and signal rows are kept for
   `DASH_HISTORY_DAYS` (default **30**); 5-minute rollups for
   `DASH_ROLLUP_5M_DAYS` (default **30**); hourly rollups for
   `DASH_ROLLUP_1H_DAYS` (default **366**). All six tables are pruned at most
@@ -131,6 +139,9 @@ The Metrics page (`/metrics.html`) uses the same data:
   one volume (label, mount, used %, size, growth/day, days-to-full), with the
   per-volume samples added to the opt-in table view — the 0–100 chart keeps a
   single aggregate disk line rather than becoming multi-volume;
+- a compact signal strip (load 1/5/15, swap, net RX/TX, I/O wait, steal) with
+  sparklines, fed by the extra-signal API. It never joins the 0–100 chart and
+  a signal the device did not send is absent rather than a zero tile;
 - a fleet summary (online count, average availability, peak CPU, disk
   pressure), a device list with 5-minute CPU sparklines, and an events rail
   (offline / back online / restarted, newest first).
@@ -205,6 +216,31 @@ get no breakdown and their single gauge stays as it was.
 Every accepted `disks` entry is also written to `disk_samples`, so per-volume growth and
 days-to-90 survive the live payload and are available after a restart. The local
 container's volume is included on every sample pass.
+
+### Extra signals
+
+Optional top-level fields on `/api/push/<name>` feed `metric_samples`:
+
+| Field | Meaning |
+|---|---|
+| `load_1`, `load_5`, `load_15` | run-queue load averages |
+| `swap_used`, `swap_total` | bytes; the API derives `swap.pct` |
+| `net_rx_bps`, `net_tx_bps` | bytes per second across real interfaces |
+| `cpu_iowait`, `cpu_steal` | percent, clamped to 0–100 |
+
+`dash-agent.py` samples `/proc/loadavg`, swap, `/proc/net/dev` (twice, one second
+apart) and `/proc/stat` on Linux; on macOS it uses `os.getloadavg()`,
+`sysctl vm.swapusage` and `netstat -ib`. `pve-host-agent.py` reports the same host
+signals and none for LXC guests. `dash-agent.ps1` reports the Windows page file as
+swap and `Get-Counter` network rates as best effort; Windows has no load average
+or iowait/steal, so those fields are never sent. The PowerShell path cannot be
+executed in this repo's test environment — the server side is covered with
+synthetic payloads, and the source-level assertions guard the optional fields.
+
+Signals are raw-only and the API caps their series at the last 24 hours
+(`SIGNAL_WINDOW_S`). A 90d/1y range does not scan signal history just to draw a
+sparkline; the strip says which window it is showing. Missing signals are omitted
+from `signals`, never filled with zero.
 
 ## Jump back in (click scores)
 
@@ -380,9 +416,11 @@ sampler writes history with no browser open; `/api/metrics` returns bucketed poi
 a step, min/max bands and a derived summary; 7d/30d route through `rollup_5m` and
 90d/1y through `rollup_1h`; all four rollup tables contain rows; a push with a `disks`
 array becomes per-volume series with growth/day and days-to-90 and a compact summary,
-an oversized list is capped at 16; unknown windows/devices are rejected; hits, metrics
-history **and** per-volume history survive a full process restart; and the click feature
-sets no cookie and makes no third-party request. It also guards the compose/README path documentation below and the
+an oversized list is capped at 16; a push with extra signals exposes load/swap/network/
+CPU pressure, while an old payload still works and gains no synthetic zeros; unknown
+windows/devices are rejected; hits, metrics history, per-volume history **and**
+extra-signal history survive a full process restart; and the click feature sets no
+cookie and makes no third-party request. It also guards the compose/README path documentation below and the
 Workbench UI, breakpoint and check documentation above.
 
 ## Click-history durability
@@ -477,3 +515,12 @@ ok 14 - metrics history survived a full server restart (first sample 1794320920)
   it. `record_samples()` and the push handler call `_invalidate_summary()`, so a new
   device or value appears on the next poll rather than after the TTL. Any new write
   path must do the same, or it will look invisible for up to 30 s.
+- **Signal history is intentionally raw-only and capped at 24 h.** Do not widen
+  `SIGNAL_WINDOW_S` without either a rollup tier or a cache: `metric_samples` has
+  one row per metric per bucket, so a 30-day query would scan several hundred
+  thousand rows just to draw a sparkline. The 24 h cap is what makes the strip
+  cheap on every range.
+- **Windows network counters are localized.** `Get-Counter` paths such as
+  `\Network Interface(*)\Bytes Received/sec` differ by OS language, which is why
+  the PowerShell agent treats them as optional. Never make a missing counter a
+  hard failure; omit the keys instead.

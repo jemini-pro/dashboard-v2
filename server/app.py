@@ -236,6 +236,18 @@ def save_agents(agents):
 # a thousand mounts; the page has no room for them anyway.
 MAX_DISKS = 16
 
+# Extra signals use one generic table and one allowlist, so adding a metric
+# needs no schema migration. Unknown keys are dropped, never stored.
+EXTRA_METRICS = (
+    "load_1", "load_5", "load_15",
+    "swap_used", "swap_total",
+    "net_rx_bps", "net_tx_bps",
+    "cpu_iowait", "cpu_steal",
+)
+PERCENT_METRICS = {"cpu_iowait", "cpu_steal"}
+# A compact strip does not need a year of history; cap the series query.
+SIGNAL_WINDOW_S = 86400
+
 
 def _finite(value):
     """Return a real number or None. JSON can carry NaN/Infinity, and bools
@@ -313,6 +325,8 @@ def agent_devices():
             "disk_pct": worst_disk_pct(disks, rec.get("disk_pct")),
             "disks": disks,
             "uptime_s": rec.get("uptime_s"),
+            **{metric: rec.get(metric) for metric in EXTRA_METRICS
+               if metric in rec},
             "online": age < 150,  # agents push every 60 s; allow two misses
             "last_seen": int(rec.get("last_seen", 0)),
         })
@@ -444,6 +458,19 @@ CREATE TABLE IF NOT EXISTS disk_rollup_1h (
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS disk_rollup_1h_ts ON disk_rollup_1h (ts);
+
+-- Generic extra signals (load, swap bytes, network rates, CPU pressure).
+-- The allowlist lives in EXTRA_METRICS; an existing agent that sends none of
+-- these simply has no rows and the API omits the signal rather than zeroing it.
+CREATE TABLE IF NOT EXISTS metric_samples (
+    device_id TEXT NOT NULL,
+    metric    TEXT NOT NULL,
+    ts        INTEGER NOT NULL,
+    value     REAL,
+    PRIMARY KEY (device_id, metric, ts)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS metric_samples_ts ON metric_samples (ts);
 """
 
 
@@ -465,6 +492,17 @@ def _metric_number(value, cast=float):
     if not math.isfinite(value):
         return None
     return cast(value)
+
+
+def _extra_metric_value(metric, value):
+    """Validate one generic signal. Negative rates/loads are meaningless, and
+    a CPU percentage above 100 is clamped rather than stored as-is."""
+    value = _metric_number(value)
+    if value is None or value < 0:
+        return None
+    if metric in PERCENT_METRICS:
+        value = min(value, 100.0)
+    return value
 
 
 def _device_identity(device):
@@ -528,6 +566,29 @@ def record_samples(devices, now=None):
                         (device_id, disk["mount"], ts, disk["label"],
                          disk["total"], disk["used"], disk["pct"]),
                     )
+                # Generic signals share the bucket and the replacement rule.
+                # Only present, valid values are written; an absent metric is
+                # omitted from the API rather than rendered as zero.
+                con.execute(
+                    "DELETE FROM metric_samples WHERE device_id = ? AND ts = ?",
+                    (device_id, ts),
+                )
+                signals = {
+                    metric: _extra_metric_value(metric, device.get(metric))
+                    for metric in EXTRA_METRICS
+                }
+                if (signals.get("swap_used") is not None
+                        and signals.get("swap_total") is not None):
+                    signals["swap_used"] = min(
+                        signals["swap_used"], signals["swap_total"]
+                    )
+                for metric, value in signals.items():
+                    if value is not None:
+                        con.execute(
+                            "INSERT INTO metric_samples (device_id, metric, ts, value) "
+                            "VALUES (?, ?, ?, ?)",
+                            (device_id, metric, ts, value),
+                        )
                 # Recompute only the buckets this heartbeat touches. Later
                 # heartbeats in the same bucket replace the row rather than
                 # appending, so a rollup is always a pure function of raw rows.
@@ -563,6 +624,7 @@ def prune_metrics(now=None):
             for table, retention in (
                 ("samples", HISTORY_SECONDS),
                 ("disk_samples", HISTORY_SECONDS),
+                ("metric_samples", HISTORY_SECONDS),
                 ("rollup_5m", ROLLUP_5M_RETENTION),
                 ("rollup_1h", ROLLUP_1H_RETENTION),
                 ("disk_rollup_5m", ROLLUP_5M_RETENTION),
@@ -1198,6 +1260,73 @@ def _volume_summary(volumes):
     }
 
 
+def _signal_series(con, device_id, now, window_s):
+    """Recent extra-signal series for the compact strip.
+
+    Signals are raw-only and the query is capped at SIGNAL_WINDOW_S, so a 90d
+    or 1y range never turns into a large scan just to draw a sparkline. Missing
+    metrics are omitted entirely; they are never synthesised as zero.
+    """
+    window_s = min(window_s, SIGNAL_WINDOW_S)
+    step = _step_for(window_s, None)
+    rows = con.execute(
+        "SELECT metric, ts - (ts % ?) AS bucket, ROUND(AVG(value), 2) "
+        "FROM metric_samples WHERE device_id = ? AND ts >= ? AND ts <= ? "
+        "GROUP BY metric, bucket ORDER BY metric, bucket",
+        (step, device_id, int(now - window_s), int(now)),
+    ).fetchall()
+    series = {}
+    for metric, bucket, value in rows:
+        series.setdefault(metric, []).append([int(bucket), value])
+
+    signals = {}
+    for metric in ("load_1", "load_5", "load_15", "net_rx_bps",
+                   "net_tx_bps", "cpu_iowait", "cpu_steal"):
+        points = series.get(metric)
+        if points:
+            signals[metric] = {"value": points[-1][1], "points": points}
+
+    used = dict(series.get("swap_used", []))
+    total = dict(series.get("swap_total", []))
+    swap_points = []
+    for bucket in sorted(set(used) & set(total)):
+        if total[bucket] and total[bucket] > 0:
+            swap_points.append([
+                bucket,
+                round(100.0 * min(used[bucket], total[bucket]) / total[bucket], 1),
+            ])
+    if swap_points:
+        latest = swap_points[-1][0]
+        signals["swap"] = {
+            "used": used[latest],
+            "total": total[latest],
+            "pct": swap_points[-1][1],
+            "points": swap_points,
+        }
+    return signals
+
+
+def _latest_signals(con, device_id):
+    """Latest value per extra metric, for the compact fleet summary."""
+    rows = con.execute(
+        "SELECT m.metric, m.value FROM metric_samples m "
+        "WHERE m.device_id = ? AND m.ts = ("
+        "  SELECT MAX(m2.ts) FROM metric_samples m2 "
+        "  WHERE m2.device_id = m.device_id AND m2.metric = m.metric)",
+        (device_id,),
+    ).fetchall()
+    values = {metric: value for metric, value in rows}
+    signals = {}
+    for metric in ("load_1", "load_5", "load_15", "net_rx_bps",
+                   "net_tx_bps", "cpu_iowait", "cpu_steal"):
+        if values.get(metric) is not None:
+            signals[metric] = round(float(values[metric]), 2)
+    used, total = values.get("swap_used"), values.get("swap_total")
+    if used is not None and total and total > 0:
+        signals["swap_pct"] = round(100.0 * min(used, total) / total, 1)
+    return signals
+
+
 def _window_source(window_s):
     """Which store answers this window: raw, 5-minute or hourly rollups."""
     if window_s <= RAW_MAX_WINDOW:
@@ -1327,6 +1456,7 @@ def metrics_summary(window=DEFAULT_WINDOW, now=None):
                 "volumes": _volume_summary(
                     _volume_series(con, device_id, since, now, volume_step, source)
                 ),
+                "signals": _latest_signals(con, device_id),
                 **summary,
                 "source": source,
             })
@@ -1350,7 +1480,8 @@ def metrics_series(device_id, window=DEFAULT_WINDOW, requested_step=None, now=No
         "generated": int(now), "window": window, "window_s": window_s,
         "step": step, "source": source,
         "device": None, "summary": _derive_summary([], now), "points": [],
-        "bands": {"cpu": [], "mem": [], "disk": []}, "volumes": [], "events": [],
+        "bands": {"cpu": [], "mem": [], "disk": []}, "volumes": [],
+        "signals": {}, "events": [],
     }
     if not METRICS_FILE.exists():
         return None if device_id else payload
@@ -1377,6 +1508,7 @@ def metrics_series(device_id, window=DEFAULT_WINDOW, requested_step=None, now=No
             online = bool(rollup_rows[-1][2] >= rollup_rows[-1][1]) \
                 if rollup_rows else False
         volumes = _volume_series(con, device_id, since, now, step, source)
+        signals = _signal_series(con, device_id, now, window_s)
     finally:
         con.close()
     state = live.get(device_id, {})
@@ -1389,6 +1521,7 @@ def metrics_series(device_id, window=DEFAULT_WINDOW, requested_step=None, now=No
     payload["points"] = points
     payload["bands"] = bands
     payload["volumes"] = volumes
+    payload["signals"] = signals
     payload["events"] = events
     return payload
 
@@ -1673,7 +1806,8 @@ class Handler(BaseHTTPRequestHandler):
             rec = dict(agents.get(name, {}))
             rec.update({k: payload[k] for k in (
                 "cpu_pct", "mem_pct", "mem_used", "mem_total",
-                "disk_pct", "uptime_s", "kind", "name") if k in payload})
+                "disk_pct", "uptime_s", "kind", "name") + EXTRA_METRICS
+                if k in payload})
             if "disks" in payload:
                 rec["disks"] = clean_disks(payload["disks"])
             rec["last_seen"] = int(time.time())

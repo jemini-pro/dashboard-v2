@@ -72,6 +72,39 @@ $diskPct = if ($disks.Count -gt 0) {
 
 $uptime = ((Get-Date) - $os.LastBootUpTime).TotalSeconds
 
+# Page file is the closest Windows equivalent to swap. If the machine has no
+# page file, the metric is omitted rather than reported as zero.
+$pageFile = $null
+try {
+    $pf = @(Get-CimInstance Win32_PageFileUsage -ErrorAction Stop)
+    if ($pf.Count -gt 0) {
+        $pfUsed  = ($pf | Measure-Object -Property CurrentUsage -Sum).Sum
+        $pfTotal = ($pf | Measure-Object -Property AllocatedBaseSize -Sum).Sum
+        if ($pfTotal -gt 0) {
+            $pageFile = @{
+                used  = [int64]$pfUsed * 1MB
+                total = [int64]$pfTotal * 1MB
+            }
+        }
+    }
+} catch { }
+
+# Network throughput counter names are localized; this is best effort. A
+# missing counter path leaves the keys out of the payload.
+$net = $null
+try {
+    $rx = (Get-Counter '\Network Interface(*)\Bytes Received/sec' -ErrorAction Stop).CounterSamples |
+        Where-Object { $_.InstanceName -notmatch 'loopback' } |
+        Measure-Object -Property CookedValue -Sum
+    $tx = (Get-Counter '\Network Interface(*)\Bytes Sent/sec' -ErrorAction Stop).CounterSamples |
+        Where-Object { $_.InstanceName -notmatch 'loopback' } |
+        Measure-Object -Property CookedValue -Sum
+    if ($null -ne $rx.Sum -and $null -ne $tx.Sum) {
+        $net = @{ rx = [int64]$rx.Sum; tx = [int64]$tx.Sum }
+    }
+} catch { }
+
+# Windows has no load average or iowait/steal, so those keys are never sent.
 $body = @{
     name      = $Name
     kind      = "pc"
@@ -82,7 +115,18 @@ $body = @{
     disk_pct  = $diskPct
     disks     = $disks
     uptime_s  = [int]$uptime
-} | ConvertTo-Json -Depth 4
+}
+
+if ($pageFile) {
+    $body["swap_used"] = $pageFile.used
+    $body["swap_total"] = $pageFile.total
+}
+if ($net) {
+    $body["net_rx_bps"] = $net.rx
+    $body["net_tx_bps"] = $net.tx
+}
+
+$body = $body | ConvertTo-Json -Depth 4
 
 try {
     $res = Invoke-RestMethod -Uri "$DashUrl/api/push/$Name" -Method Post -Body $body `

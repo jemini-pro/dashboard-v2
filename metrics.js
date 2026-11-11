@@ -12,6 +12,19 @@ const SERIES = [
     { key: 'disk', field: 3, label: 'Disk', band: 'disk' }
 ];
 
+// Extra signals are not percentages on the fixed chart. Each definition is a
+// tile; a signal with no data is skipped rather than shown as zero.
+const SIGNAL_DEFS = [
+    { key: 'load_1', label: 'Load 1m', decimals: 2 },
+    { key: 'load_5', label: 'Load 5m', decimals: 2 },
+    { key: 'load_15', label: 'Load 15m', decimals: 2 },
+    { key: 'swap', label: 'Swap' },
+    { key: 'net_rx_bps', label: 'Net RX', rate: true },
+    { key: 'net_tx_bps', label: 'Net TX', rate: true },
+    { key: 'cpu_iowait', label: 'I/O wait' },
+    { key: 'cpu_steal', label: 'Steal' }
+];
+
 const KIND_DEFS = [
     { key: 'host', label: 'Hosts' },
     { key: 'lxc', label: 'LXC' },
@@ -40,6 +53,9 @@ const volumeSectionEl = document.getElementById('volume-section');
 const volumeSubEl = document.getElementById('volume-sub');
 const volumeTableEl = document.getElementById('volume-table');
 const chartVolumeTableEl = document.getElementById('chart-volume-table');
+const signalStripEl = document.getElementById('signal-strip');
+const signalSubEl = document.getElementById('signal-sub');
+const signalTilesEl = document.getElementById('signal-tiles');
 const deviceListEl = document.getElementById('device-list');
 const devicesSubEl = document.getElementById('devices-sub');
 const eventsEl = document.getElementById('events');
@@ -205,6 +221,12 @@ function fmtBytes(value) {
 function fmtGrowth(value) {
     if (!isNumber(value)) return '—';
     return (value > 0 ? '+' : '') + value.toFixed(2) + '%/day';
+}
+
+function fmtRate(value) {
+    if (!isNumber(value) || value < 0) return '—';
+    if (value < 1) return '0 B/s';
+    return fmtBytes(value) + '/s';
 }
 
 function volumeLabel(volume) {
@@ -653,6 +675,44 @@ function renderVolumeTable() {
         : '<tr><td colspan="3">No per-volume samples in this window.</td></tr>';
 }
 
+function signalTile(def, signal) {
+    let text = null;
+    if (def.key === 'swap' && isNumber(signal.pct)) {
+        text = pct(signal.pct);
+    } else if (isNumber(signal.value)) {
+        text = def.rate ? fmtRate(signal.value)
+            : (isNumber(def.decimals) ? signal.value.toFixed(def.decimals)
+                : pct(signal.value));
+    }
+    if (!text) return '';
+    const spark = sparkSvg((signal.points || []).map((point) => point[1]));
+    return '<div class="signal-tile">' +
+        '<span class="signal-label">' + escapeHtml(def.label) + '</span>' +
+        '<span class="signal-value">' + escapeHtml(text) + '</span>' +
+        '<span class="signal-spark">' + spark + '</span>' +
+        '</div>';
+}
+
+function signalRangeLabel() {
+    return ['1h', '6h', '24h'].includes(activeRange) ? activeRange : '24h';
+}
+
+function renderSignals() {
+    const signals = SIGNAL_DEFS
+        .filter((def) => series && series.signals && series.signals[def.key])
+        .map((def) => ({ def, data: series.signals[def.key] }))
+        .filter(({ data }) => isNumber(data.value) || isNumber(data.pct));
+    signalStripEl.hidden = signals.length === 0;
+    if (signalStripEl.hidden) {
+        signalTilesEl.innerHTML = '';
+        signalSubEl.textContent = '';
+        return;
+    }
+    signalSubEl.textContent = 'last ' + signalRangeLabel();
+    signalTilesEl.innerHTML = signals
+        .map(({ def, data }) => signalTile(def, data)).join('');
+}
+
 // ---------- table and events ----------
 
 function tableCells(point, index) {
@@ -740,6 +800,7 @@ async function load(full) {
         renderChartHead();
         renderLegend();
         renderChart();
+        renderSignals();
         renderVolumes();
         renderEvents();
         if (tableViewEl.open) renderTable();
@@ -773,6 +834,7 @@ rangeTabsEl.addEventListener('click', (event) => {
     syncUrl();
     series = null;
     renderChart();
+    renderSignals();
     renderVolumes();
     load(true);
 });

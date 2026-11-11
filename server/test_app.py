@@ -1806,6 +1806,126 @@ class MetricsHistoryTest(ApiTestCase):
             self.assertEqual(status, 200)
             self.assertEqual(json.loads(body)["window"], window)
 
+    # ---------- extra signals ----------
+
+    def stored_metric_samples(self):
+        con = app._connect_metrics()
+        try:
+            return con.execute(
+                "SELECT metric, ts, value FROM metric_samples ORDER BY ts, metric"
+            ).fetchall()
+        finally:
+            con.close()
+
+    def signal_values(self):
+        return {metric: value for metric, _ts, value in self.stored_metric_samples()}
+
+    def test_a_push_with_extra_signals_writes_generic_metric_rows(self):
+        body = {
+            "name": "sigpc", "kind": "pc", "cpu_pct": 5.0, "mem_pct": 20.0,
+            "mem_used": 1, "mem_total": 2, "disk_pct": 10.0, "uptime_s": 10,
+            "load_1": 0.8, "load_5": 0.6, "load_15": 0.5,
+            "swap_used": 100, "swap_total": 400,
+            "net_rx_bps": 1200, "net_tx_bps": 300,
+            "cpu_iowait": 1.5, "cpu_steal": 0.2,
+        }
+        status, _ = self.post(json.dumps(body).encode(), path="/api/push/sigpc")
+        self.assertEqual(status, 200)
+
+        app.record_samples(app.agent_devices(), now=self.BASE)
+
+        self.assertEqual(self.signal_values(), {
+            "load_1": 0.8, "load_5": 0.6, "load_15": 0.5,
+            "swap_used": 100.0, "swap_total": 400.0,
+            "net_rx_bps": 1200.0, "net_tx_bps": 300.0,
+            "cpu_iowait": 1.5, "cpu_steal": 0.2,
+        })
+
+    def test_a_repeat_in_the_same_bucket_replaces_every_signal(self):
+        self.sample([self.device(load_1=0.5)], now=self.BASE)
+        self.sample([self.device(load_1=1.5, load_5=1.0)], now=self.BASE + 10)
+        self.assertEqual(self.signal_values(),
+                         {"load_1": 1.5, "load_5": 1.0})
+
+        # A metric that disappears from the heartbeat disappears from the bucket.
+        self.sample([self.device(load_1=2.0)], now=self.BASE + 20)
+        self.assertEqual(self.signal_values(), {"load_1": 2.0})
+
+    def test_malformed_extra_signals_are_dropped_or_clamped(self):
+        self.sample([self.device(
+            load_1=-1, load_5="high", load_15=True,
+            net_rx_bps=None, cpu_iowait=250, cpu_steal=-3,
+            swap_used=500, swap_total=0,
+        )], now=self.BASE)
+
+        self.assertEqual(self.signal_values(), {
+            "cpu_iowait": 100.0, "swap_used": 0.0, "swap_total": 0.0,
+        })
+
+    def test_an_old_agent_without_signals_still_works(self):
+        self.sample([self.device()], now=self.BASE)
+        self.assertEqual(self.stored_metric_samples(), [])
+        payload = app.metrics_series("docker01", "1h", 60, now=self.BASE + 60)
+        self.assertEqual(payload["signals"], {})
+
+    def test_metrics_series_exposes_signal_points_and_a_derived_swap_pct(self):
+        for offset, load, rx, used in (
+            (0, 0.5, 100, 100), (300, 1.5, 300, 200), (600, 1.0, 200, 300),
+        ):
+            self.sample([self.device(
+                load_1=load, swap_used=used, swap_total=1000,
+                net_rx_bps=rx, net_tx_bps=rx / 2, cpu_iowait=2.0,
+            )], now=self.BASE + offset)
+
+        signals = app.metrics_series(
+            "docker01", "1h", 300, now=self.BASE + 600
+        )["signals"]
+        self.assertEqual([point[1] for point in signals["load_1"]["points"]],
+                         [0.5, 1.5, 1.0])
+        self.assertEqual(signals["load_1"]["value"], 1.0)
+        self.assertEqual(signals["net_rx_bps"]["value"], 200.0)
+        self.assertAlmostEqual(signals["swap"]["pct"], 30.0)
+        self.assertEqual(signals["swap"]["used"], 300.0)
+        self.assertEqual(signals["swap"]["total"], 1000.0)
+        self.assertEqual(signals["cpu_iowait"]["value"], 2.0)
+        self.assertNotIn("load_5", signals)
+        self.assertNotIn("cpu_steal", signals)
+
+    def test_signal_history_is_capped_even_for_a_long_window(self):
+        self.sample([self.device(load_1=9.0)], now=self.BASE - 20 * 86400)
+        self.sample([self.device(load_1=1.0)], now=self.BASE)
+
+        signals = app.metrics_series(
+            "docker01", "30d", None, now=self.BASE
+        )["signals"]
+        # Raw signal rows are kept for 30 d, but the strip only asks for 24 h.
+        self.assertEqual([point[1] for point in signals["load_1"]["points"]],
+                         [1.0])
+
+    def test_summary_adds_the_latest_signal_values(self):
+        self.sample([self.device(
+            load_1=0.7, swap_used=250, swap_total=1000,
+            net_rx_bps=500, cpu_iowait=3.0,
+        )], now=self.BASE)
+
+        summary = app.metrics_summary("1h", now=self.BASE + 60)["devices"][0]
+        self.assertEqual(summary["signals"], {
+            "load_1": 0.7, "net_rx_bps": 500.0,
+            "swap_pct": 25.0, "cpu_iowait": 3.0,
+        })
+
+    def test_retention_prunes_signal_rows_with_raw_samples(self):
+        self.sample([self.device(load_1=1.0)],
+                    now=self.BASE - app.HISTORY_SECONDS - 600)
+        self.assertEqual(len(self.stored_metric_samples()), 1)
+
+        app._last_prune["at"] = 0.0
+        self.sample([self.device(load_1=1.0)], now=self.BASE)
+
+        rows = self.stored_metric_samples()
+        self.assertEqual(len(rows), 1)
+        self.assertGreaterEqual(rows[0][1], self.BASE - 60)
+
 
 class MetricsPageSourceTest(FrontEndSourceTest):
     """The metrics page, chart markup and deploy wiring, asserted at the source."""
@@ -2034,3 +2154,43 @@ class MetricsPeaksSourceTest(FrontEndSourceTest):
             self.assertIn("'" + window + "'", self.metrics_js)
         self.assertIn("RANGES = ['1h', '6h', '24h', '7d', '30d', '90d', '1y']",
                       self.metrics_js)
+
+
+class MetricsSignalsSourceTest(FrontEndSourceTest):
+    """Phase 3: load/swap/network/iowait live outside the 0-100 chart."""
+
+    def setUp(self):
+        super().setUp()
+        self.metrics_html = (APP_JS.parent / "metrics.html").read_text()
+        self.metrics_js = (APP_JS.parent / "metrics.js").read_text()
+        self.metrics_css = (APP_JS.parent / "metrics.css").read_text()
+
+    def test_signals_have_their_own_strip_outside_the_chart(self):
+        self.assertIn('id="signal-strip"', self.metrics_html)
+        chart = self.metrics_html.index('id="chart"')
+        strip = self.metrics_html.index('id="signal-strip"')
+        self.assertGreater(strip, chart)
+        body = function_body(self.metrics_js, "renderSignals")
+        self.assertIn("series.signals", body)
+        self.assertIn("signalTile(", body)
+        self.assertIn("signal-strip", self.metrics_css)
+
+    def test_missing_signals_render_absent_never_zero(self):
+        body = function_body(self.metrics_js, "renderSignals")
+        self.assertIn("isNumber", body)
+        self.assertIn("signals.length", body)
+        self.assertIn("signalStripEl.hidden", body)
+        self.assertNotIn("?? 0", body)
+        self.assertNotIn("|| 0", body)
+
+    def test_network_rates_have_their_own_units(self):
+        rate = function_body(self.metrics_js, "fmtRate")
+        self.assertIn("fmtBytes", rate)
+        self.assertIn("/s", rate)
+        tiles = function_body(self.metrics_js, "signalTile")
+        self.assertIn("fmtRate", tiles)
+
+    def test_signal_strip_is_compact_on_a_phone(self):
+        self.assertRegex(self.metrics_css, r"\.signal-strip\s*\{")
+        self.assertRegex(self.metrics_css, r"\.signal-tile\s*\{")
+        self.assertRegex(self.metrics_css, r"\.signal-spark\s*\{")

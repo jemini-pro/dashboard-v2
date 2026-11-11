@@ -212,6 +212,49 @@ push_device() { # push_device <name> <json-file>
         --data-binary @"$2" "$BASE/api/push/$1" >/dev/null
 }
 
+wait_for_signals() { # wait_for_signals <device-id>
+    local id="$1" i
+    for i in $(seq 1 120); do
+        if curl -fsS "$BASE/api/metrics?device=$id&window=1h" \
+                -o "$TMP/sig-series.json" 2>/dev/null; then
+            if python3 - "$TMP/sig-series.json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+raise SystemExit(0 if (data.get("signals") or {}).get("load_1") else 1)
+PY
+            then
+                return 0
+            fi
+        fi
+        sleep 0.1
+    done
+    fail "no signal samples for $id within 12 s"
+}
+
+wait_for_device() { # wait_for_device <device-id>
+    local id="$1" i
+    for i in $(seq 1 120); do
+        if curl -fsS "$BASE/api/metrics?device=$id&window=1h" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    fail "device $id did not appear within 12 s"
+}
+
+metric_min_ts() {
+    python3 - "$DATA_DIR/metrics.db" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+try:
+    row = con.execute("SELECT MIN(ts) FROM metric_samples").fetchone()
+finally:
+    con.close()
+print(row[0] if row and row[0] is not None else "")
+PY
+}
+
 wait_for_volume_samples() { # wait_for_volume_samples <device-id> <min-count>
     local id="$1" want="$2" i
     for i in $(seq 1 120); do
@@ -567,6 +610,77 @@ assert device["volumes"]["count"] == 16, device["volumes"]
 PY
 ok "an oversized volume list is capped at 16 and malformed entries are dropped"
 
+# 9d. Extra signals: a synthetic payload proves the server side for agents we
+# cannot run here (Windows), and an old-style payload proves backwards compat.
+cat > "$TMP/sigtest-push.json" <<'JSON'
+{
+  "name": "sigtest",
+  "kind": "pc",
+  "cpu_pct": 5.0,
+  "mem_pct": 20.0,
+  "mem_used": 1,
+  "mem_total": 2,
+  "disk_pct": 10.0,
+  "uptime_s": 10,
+  "load_1": 0.8,
+  "load_5": 0.6,
+  "load_15": 0.5,
+  "swap_used": 250,
+  "swap_total": 1000,
+  "net_rx_bps": 1200,
+  "net_tx_bps": 300,
+  "cpu_iowait": 1.5,
+  "cpu_steal": 0.2
+}
+JSON
+push_device sigtest "$TMP/sigtest-push.json" || fail "push with extra signals failed"
+wait_for_signals agent:sigtest
+python3 - "$TMP/sig-series.json" <<'PY' || fail "signal series payload is wrong"
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+signals = data["signals"]
+assert signals["load_1"]["value"] == 0.8, signals
+assert signals["load_1"]["points"], signals
+assert signals["swap"]["pct"] == 25.0, signals
+assert signals["swap"]["used"] == 250.0, signals
+assert signals["net_rx_bps"]["value"] == 1200.0, signals
+assert signals["cpu_iowait"]["value"] == 1.5, signals
+assert "cpu_steal" in signals, signals
+PY
+ok "a push with extra signals exposes load, swap, network and CPU pressure"
+
+cat > "$TMP/oldsig-push.json" <<'JSON'
+{"name": "oldsig", "kind": "pc", "cpu_pct": 1.0, "mem_pct": 2.0,
+ "mem_used": 1, "mem_total": 2, "disk_pct": 3.0, "uptime_s": 4}
+JSON
+push_device oldsig "$TMP/oldsig-push.json" || fail "old-style push failed"
+wait_for_device agent:oldsig
+curl -fsS "$BASE/api/metrics?device=agent:oldsig&window=1h" \
+    -o "$TMP/oldsig-series.json" || fail "old-style series failed"
+python3 - "$TMP/oldsig-series.json" <<'PY' || fail "old agent gained fabricated signals"
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+assert data["signals"] == {}, data["signals"]
+PY
+ok "an old agent without signals still works and gains no fabricated zeros"
+
+curl -fsS "$BASE/api/metrics/summary?window=1h" \
+    -o "$TMP/metrics-summary.json" || fail "summary after signals failed"
+python3 - "$TMP/metrics-summary.json" <<'PY' || fail "summary signal values are wrong"
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+device = next(d for d in data["devices"] if d["id"] == "agent:sigtest")
+assert device["signals"]["load_1"] == 0.8, device["signals"]
+assert device["signals"]["swap_pct"] == 25.0, device["signals"]
+assert device["signals"]["net_rx_bps"] == 1200.0, device["signals"]
+old = next(d for d in data["devices"] if d["id"] == "agent:oldsig")
+assert old["signals"] == {}, old["signals"]
+PY
+ok "/api/metrics/summary carries latest signals and none for old agents"
+
 code="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/metrics/summary?window=2h")"
 [[ "$code" == "400" ]] || fail "unknown window returned $code, expected 400"
 code="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/metrics?window=1h")"
@@ -579,6 +693,8 @@ min_ts_before="$(metrics_min_ts)"
 [[ -n "$min_ts_before" ]] || fail "metrics.db has no samples before the restart"
 disk_min_before="$(disk_min_ts)"
 [[ -n "$disk_min_before" ]] || fail "metrics.db has no per-volume samples before the restart"
+metric_min_before="$(metric_min_ts)"
+[[ -n "$metric_min_before" ]] || fail "metrics.db has no extra-signal samples before the restart"
 
 # 10. Process restart: the same DASH_DATA_DIR keeps the history. This is the
 # no-docker equivalent of recreating the `dash` container with its bind mount.
@@ -606,6 +722,11 @@ disk_min_after="$(disk_min_ts)"
 [[ "$disk_min_after" == "$disk_min_before" ]] \
     || fail "per-volume history changed across restart: $disk_min_before -> $disk_min_after"
 ok "per-volume history survived a full server restart (first sample $disk_min_after)"
+
+metric_min_after="$(metric_min_ts)"
+[[ "$metric_min_after" == "$metric_min_before" ]] \
+    || fail "signal history changed across restart: $metric_min_before -> $metric_min_after"
+ok "extra-signal history survived a full server restart (first sample $metric_min_after)"
 
 # 11. Static guarantees: no cookie is set and the feature makes no third-party
 # request. Deliberately scoped to the click-history/strip code so unrelated
@@ -686,7 +807,8 @@ ok "README documents the Workbench UI, breakpoints and checks"
 
 # 15. Rollup/peak documentation and the two long range tabs are wired.
 for needle in 'rollup_5m' 'DASH_ROLLUP_5M_DAYS' 'DASH_ROLLUP_1H_DAYS' \
-        'SUMMARY_CACHE_SECONDS' 'min/max'; do
+        'SUMMARY_CACHE_SECONDS' 'min/max' 'metric_samples' 'SIGNAL_WINDOW_S' \
+        'load_1' 'swap_used' 'net_rx_bps'; do
     grep -Fq "$needle" "$README" \
         || fail "README does not document $needle"
 done
@@ -698,6 +820,10 @@ grep -Fq 'min–avg–max' "$REPO/metrics.html" \
     || fail "table view does not advertise min-avg-max"
 grep -Fq 'chart-band' "$REPO/metrics.js" \
     || fail "chart has no min/max peak band"
-ok "README documents rollups and the page exposes 90d/1y with peak bands"
+grep -Fq 'id="signal-strip"' "$REPO/metrics.html" \
+    || fail "metrics page has no signal strip"
+grep -Fq 'fmtRate' "$REPO/metrics.js" \
+    || fail "signal strip has no rate formatting"
+ok "README documents rollups/signals and the page exposes ranges, bands and signals"
 
 echo "all $COUNT checks passed"

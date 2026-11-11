@@ -92,6 +92,13 @@ class UnixDiskReportingTest(unittest.TestCase):
         with mock.patch.object(self.agent, "cpu_pct", return_value=1.0), \
                 mock.patch.object(self.agent, "mem", return_value=(1, 2)), \
                 mock.patch.object(self.agent, "uptime_s", return_value=3), \
+                mock.patch.object(self.agent, "load_average",
+                                  return_value=(None, None, None)), \
+                mock.patch.object(self.agent, "swap", return_value=(None, None)), \
+                mock.patch.object(self.agent, "net_rates",
+                                  return_value=(None, None)), \
+                mock.patch.object(self.agent, "cpu_extra",
+                                  return_value=(None, None)), \
                 mock.patch.object(self.agent, "disks", return_value=[
                     {"mount": "/", "label": "System", "total": 100, "used": 10, "pct": 10.0},
                     {"mount": "/mnt/data", "label": "Data", "total": 100, "used": 99, "pct": 99.0},
@@ -100,6 +107,93 @@ class UnixDiskReportingTest(unittest.TestCase):
 
         self.assertEqual(payload["disk_pct"], 99.0)
         self.assertEqual(len(payload["disks"]), 2)
+
+
+class UnixSignalReportingTest(unittest.TestCase):
+    """Load, swap, network and CPU pressure on Linux/macOS.
+
+    The collectors are pure enough to exercise with stubbed counters and files,
+    which is the only way to test both platform branches here.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.agent = load_unix_agent()
+
+    def test_linux_swap_reads_swap_total_and_free(self):
+        info = {"SwapTotal": 1000, "SwapFree": 400}
+        with mock.patch.object(self.agent, "meminfo", return_value=info):
+            self.assertEqual(self.agent.swap(), (600, 1000))
+
+    def test_macos_swap_parses_sysctl_sizes(self):
+        out = "total = 2.00G  used = 512.00M  free = 1.50G"
+        with mock.patch.object(self.agent.platform, "system", return_value="Darwin"), \
+                mock.patch.object(self.agent, "run", return_value=out):
+            self.assertEqual(
+                self.agent.swap(), (512 * 1024 ** 2, 2 * 1024 ** 3)
+            )
+
+    def test_load_average_rounds_and_reports_missing_as_none(self):
+        with mock.patch.object(self.agent.os, "getloadavg",
+                               return_value=(0.1234, 0.5, 1.0)):
+            self.assertEqual(self.agent.load_average(), (0.12, 0.5, 1.0))
+        with mock.patch.object(self.agent.os, "getloadavg", side_effect=OSError):
+            self.assertEqual(
+                self.agent.load_average(), (None, None, None)
+            )
+
+    def test_net_rates_are_a_delta_over_elapsed_time(self):
+        with mock.patch.object(self.agent, "net_counters",
+                               side_effect=[(1000, 500), (1600, 800)]), \
+                mock.patch.object(self.agent.time, "time",
+                                  side_effect=[10.0, 11.0]), \
+                mock.patch.object(self.agent.time, "sleep"):
+            self.assertEqual(self.agent.net_rates(), (600, 300))
+
+    def test_net_rates_ignore_a_counter_reset(self):
+        with mock.patch.object(self.agent, "net_counters",
+                               side_effect=[(2000, 500), (100, 600)]), \
+                mock.patch.object(self.agent.time, "time",
+                                  side_effect=[10.0, 11.0]), \
+                mock.patch.object(self.agent.time, "sleep"):
+            self.assertEqual(self.agent.net_rates(), (None, None))
+
+    def test_collect_includes_present_signals_and_omits_missing_ones(self):
+        with mock.patch.object(self.agent, "cpu_pct", return_value=1.0), \
+                mock.patch.object(self.agent, "mem", return_value=(1, 2)), \
+                mock.patch.object(self.agent, "uptime_s", return_value=3), \
+                mock.patch.object(self.agent, "disks", return_value=[]), \
+                mock.patch.object(self.agent, "load_average",
+                                  return_value=(0.5, 0.4, 0.3)), \
+                mock.patch.object(self.agent, "swap", return_value=(100, 400)), \
+                mock.patch.object(self.agent, "net_rates",
+                                  return_value=(10, 20)), \
+                mock.patch.object(self.agent, "cpu_extra",
+                                  return_value=(1.0, 0.5)):
+            payload = self.agent.collect()
+
+        self.assertEqual(payload["load_1"], 0.5)
+        self.assertEqual(payload["load_15"], 0.3)
+        self.assertEqual(payload["swap_used"], 100)
+        self.assertEqual(payload["swap_total"], 400)
+        self.assertEqual(payload["net_rx_bps"], 10)
+        self.assertEqual(payload["cpu_steal"], 0.5)
+
+        with mock.patch.object(self.agent, "cpu_pct", return_value=1.0), \
+                mock.patch.object(self.agent, "mem", return_value=(1, 2)), \
+                mock.patch.object(self.agent, "uptime_s", return_value=3), \
+                mock.patch.object(self.agent, "disks", return_value=[]), \
+                mock.patch.object(self.agent, "load_average",
+                                  return_value=(None, None, None)), \
+                mock.patch.object(self.agent, "swap", return_value=(None, None)), \
+                mock.patch.object(self.agent, "net_rates",
+                                  return_value=(None, None)), \
+                mock.patch.object(self.agent, "cpu_extra",
+                                  return_value=(None, None)):
+            empty = self.agent.collect()
+
+        for key in ("load_1", "swap_used", "net_rx_bps", "cpu_iowait"):
+            self.assertNotIn(key, empty)
 
 
 class WindowsDiskReportingTest(unittest.TestCase):
@@ -115,6 +209,35 @@ class WindowsDiskReportingTest(unittest.TestCase):
         self.assertRegex(src, r"disks\s*=\s*\$disks")
         self.assertRegex(src, r"disk_pct\s*=\s*\$diskPct")
         self.assertIn("-Depth 4", src)
+
+
+class WindowsSignalReportingTest(unittest.TestCase):
+    """Windows has no load average; page file and network are best-effort.
+
+    PowerShell is not available in this environment, so these are source-level
+    assertions. The server side is covered with synthetic payloads.
+    """
+
+    def setUp(self):
+        self.src = (AGENTS / "dash-agent.ps1").read_text()
+
+    def test_page_file_becomes_swap_only_when_present(self):
+        self.assertIn("Win32_PageFileUsage", self.src)
+        self.assertRegex(self.src, r"if \(\$pageFile\)")
+        self.assertIn('$body["swap_used"]', self.src)
+        self.assertIn('$body["swap_total"]', self.src)
+
+    def test_network_rates_are_best_effort_and_optional(self):
+        self.assertIn("Bytes Received/sec", self.src)
+        self.assertIn("Bytes Sent/sec", self.src)
+        self.assertRegex(self.src, r"if \(\$net\)")
+        self.assertIn('$body["net_rx_bps"]', self.src)
+        self.assertIn('$body["net_tx_bps"]', self.src)
+
+    def test_no_fabricated_load_average_or_iowait(self):
+        # Windows exposes neither, so the agent must not invent a zero.
+        self.assertNotIn("load_1", self.src)
+        self.assertNotIn("cpu_iowait", self.src)
 
 
 class PveHostDiskReportingTest(unittest.TestCase):
@@ -139,6 +262,13 @@ class PveHostDiskReportingTest(unittest.TestCase):
                 mock.patch.object(self.agent, "mem", return_value=(1, 2)), \
                 mock.patch.object(self.agent, "uptime", return_value=3), \
                 mock.patch.object(self.agent, "guests", return_value=[guest]), \
+                mock.patch.object(self.agent, "load_average",
+                                  return_value=(0.5, 0.4, 0.3)), \
+                mock.patch.object(self.agent, "swap", return_value=(100, 400)), \
+                mock.patch.object(self.agent, "net_rates",
+                                  return_value=(10, 20)), \
+                mock.patch.object(self.agent, "cpu_extra",
+                                  return_value=(1.0, 0.5)), \
                 mock.patch.object(self.agent.shutil, "disk_usage",
                                   return_value=volume):
             self.agent.main()
@@ -150,4 +280,10 @@ class PveHostDiskReportingTest(unittest.TestCase):
         self.assertEqual(disks[0]["used"], 900)
         self.assertEqual(disks[0]["pct"], 90.0)
         self.assertEqual(pushes["pve"]["disk_pct"], 90.0)
-        self.assertNotIn("disks", pushes["adguard"])
+        self.assertEqual(pushes["pve"]["load_1"], 0.5)
+        self.assertEqual(pushes["pve"]["swap_total"], 400)
+        self.assertEqual(pushes["pve"]["net_rx_bps"], 10)
+        self.assertEqual(pushes["pve"]["cpu_iowait"], 1.0)
+        # Guests have no host-level load/swap/network data to report.
+        for key in ("disks", "load_1", "swap_total", "net_rx_bps"):
+            self.assertNotIn(key, pushes["adguard"])
