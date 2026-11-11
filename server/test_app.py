@@ -73,6 +73,7 @@ class ApiTestCase(unittest.TestCase):
         app.METRICS_FILE = self.data / "metrics.db"
         app._cache.update(at=0.0, body=None)
         app._availability_cache.update(at=0.0, by_id={})
+        app._summary_cache.update(at=0.0, window=None, body=None)
         app._last_prune["at"] = 0.0
         self.static = self.data / "static"
         self.static.mkdir()
@@ -94,6 +95,7 @@ class ApiTestCase(unittest.TestCase):
         app.AGENTS_FILE, app.METRICS_FILE = self._old_agents, self._old_metrics
         app._cache.update(at=0.0, body=None)
         app._availability_cache.update(at=0.0, by_id={})
+        app._summary_cache.update(at=0.0, window=None, body=None)
         app._last_prune["at"] = 0.0
         self._tmp.cleanup()
 
@@ -1635,6 +1637,175 @@ class MetricsHistoryTest(ApiTestCase):
         series_payload = app.metrics_series("docker01", "1h", 60, now=self.BASE + 60)
         self.assertEqual(series_payload["volumes"], [])
 
+    # ---------- peaks and rollups ----------
+
+    def rollup_rows(self, table, columns="*"):
+        con = app._connect_metrics()
+        try:
+            return con.execute(
+                f"SELECT {columns} FROM {table} ORDER BY ts"  # fixed internal names
+            ).fetchall()
+        finally:
+            con.close()
+
+    def test_the_sampler_writes_five_minute_and_hourly_rollups(self):
+        for index, cpu in enumerate((10.0, 90.0, 50.0)):
+            self.sample([self.device(cpu=cpu, mem=20.0, disk=50.0)],
+                        now=self.BASE + index * 60)
+
+        five = self.rollup_rows(
+            "rollup_5m",
+            "device_id, ts, samples, online_samples, cpu_avg, cpu_min, cpu_max",
+        )
+        self.assertEqual(len(five), 1)
+        self.assertEqual(five[0][:4], ("docker01", self.BASE, 3, 3))
+        self.assertAlmostEqual(five[0][4], 50.0, places=1)
+        self.assertEqual(five[0][5], 10.0)
+        self.assertEqual(five[0][6], 90.0)
+
+        hour = self.rollup_rows(
+            "rollup_1h", "ts, samples, online_samples, cpu_min, cpu_max"
+        )
+        self.assertEqual(len(hour), 1)
+        self.assertEqual(hour[0][0], self.BASE)
+        self.assertEqual(hour[0][1:], (3, 3, 10.0, 90.0))
+
+    def test_metrics_series_bands_keep_min_and_max_per_bucket(self):
+        for index, cpu in enumerate((10.0, 90.0)):
+            self.sample([self.device(cpu=cpu)], now=self.BASE + index * 60)
+
+        payload = app.metrics_series("docker01", "1h", 300, now=self.BASE + 120)
+
+        self.assertEqual(payload["source"], "raw")
+        self.assertEqual(len(payload["points"]), 1)
+        # The old five-tuple is untouched; the average is still the point.
+        self.assertEqual(payload["points"][0][1], 50.0)
+        self.assertEqual(len(payload["bands"]["cpu"]), 1)
+        ts, low, high = payload["bands"]["cpu"][0]
+        self.assertEqual(ts, self.BASE)
+        self.assertEqual(low, 10.0)
+        self.assertEqual(high, 90.0)
+        for key in ("cpu", "mem", "disk"):
+            self.assertIn(key, payload["bands"])
+
+    def test_long_windows_read_five_minute_rollups_not_raw_rows(self):
+        now = self.BASE + 7200
+        for offset, cpu in ((0, 10.0), (3600, 20.0)):
+            self.sample([self.device(cpu=cpu)], now=now - 7200 + offset)
+
+        con = app._connect_metrics()
+        try:
+            con.execute("DELETE FROM samples")  # keep only the rollups
+            con.commit()
+        finally:
+            con.close()
+
+        payload = app.metrics_series("docker01", "7d", 3600, now=now)
+        self.assertEqual(payload["source"], "5m")
+        self.assertEqual([point[1] for point in payload["points"]], [10.0, 20.0])
+        self.assertGreaterEqual(payload["summary"]["samples"], 2)
+        self.assertEqual(len(payload["bands"]["cpu"]), len(payload["points"]))
+
+    def test_windows_beyond_thirty_days_read_hourly_rollups(self):
+        now = self.BASE + 7200
+        self.sample([self.device(cpu=42.0)], now=self.BASE)
+
+        con = app._connect_metrics()
+        try:
+            con.execute("DELETE FROM samples")
+            con.execute("DELETE FROM rollup_5m")
+            con.execute("DELETE FROM disk_rollup_5m")
+            con.commit()
+        finally:
+            con.close()
+
+        payload = app.metrics_series("docker01", "90d", 21600, now=now)
+        self.assertEqual(payload["source"], "1h")
+        self.assertEqual([point[1] for point in payload["points"]], [42.0])
+
+    def test_a_long_summary_does_not_need_raw_rows(self):
+        now = self.BASE + 7200
+        self.sample([self.device(cpu=20.0, online=True)], now=self.BASE)
+        self.sample([self.device(cpu=40.0, online=False)], now=self.BASE + 3600)
+
+        con = app._connect_metrics()
+        try:
+            con.execute("DELETE FROM samples")
+            con.commit()
+        finally:
+            con.close()
+
+        summary = app.metrics_summary("7d", now=now)["devices"][0]
+        self.assertEqual(summary["source"], "5m")
+        self.assertEqual(summary["samples"], 2)
+        self.assertEqual(summary["availability_pct"], 50.0)
+        self.assertEqual(len(summary["spark"]), 12)
+
+    def test_long_summary_reports_offline_runs_and_restarts_from_rollups(self):
+        # One sample a minute for 15 minutes: two full 5-minute online runs
+        # around one full offline run, then a reboot in the final run.
+        now = self.BASE + 900
+        for minute in range(15):
+            online = not (5 <= minute < 10)
+            uptime = 1000 + minute * 60 if minute < 10 else 30 + minute * 60
+            self.sample([self.device(online=online, uptime=uptime)],
+                        now=self.BASE + minute * 60)
+
+        con = app._connect_metrics()
+        try:
+            con.execute("DELETE FROM samples")
+            con.commit()
+        finally:
+            con.close()
+
+        summary = app.metrics_summary("7d", now=now)["devices"][0]
+        self.assertEqual(summary["availability_pct"], 66.7)
+        self.assertEqual(summary["offline_events"], 1)
+        self.assertEqual(summary["restarts"], 1)
+        self.assertEqual(summary["downtime_s"], 300)
+
+    def test_summary_is_cached_until_a_write_invalidates_it(self):
+        self.sample([self.device(cpu=10.0)], now=self.BASE)
+        with frozen_time(self.BASE + 60):
+            first = app.metrics_summary("24h")
+            cached = app.metrics_summary("24h")
+            self.assertIs(first, cached)
+            # An explicit clock always computes a fresh payload.
+            explicit = app.metrics_summary("24h", now=self.BASE + 60)
+            self.assertIsNot(explicit, first)
+            # A write invalidates the live cache instead of hiding a new value.
+            # Same bucket, so this replaces the row the window already sees.
+            self.sample([self.device(cpu=90.0)], now=self.BASE)
+            refreshed = app.metrics_summary("24h")
+        self.assertNotEqual(first["devices"], refreshed["devices"])
+
+    def test_retention_prunes_each_rollup_tier_on_its_own_window(self):
+        old = self.BASE - 10 * 86400
+        self.sample([self.device(disks=[self.volume("/", 50.0)])], now=old)
+
+        with mock.patch.object(app, "ROLLUP_5M_RETENTION", 5 * 86400):
+            app._last_prune["at"] = 0.0
+            self.sample([self.device(disks=[self.volume("/", 50.0)])], now=self.BASE)
+
+        self.assertEqual(len(self.rollup_rows("rollup_5m")), 1)  # new bucket only
+        self.assertEqual(len(self.rollup_rows("rollup_1h")), 2)  # 1 h keeps both
+        self.assertEqual(len(self.rollup_rows("disk_rollup_5m")), 1)
+        self.assertEqual(len(self.rollup_rows("disk_rollup_1h")), 2)
+        # Raw retention is still 30 d, so both raw rows survive.
+        self.assertEqual(len(self.stored_disk_samples()), 2)
+
+    def test_the_new_range_windows_are_accepted(self):
+        self.sample([self.device()], now=time.time())
+        for window in ("90d", "1y"):
+            self.assertEqual(
+                self.get_status("/api/metrics/summary?window=" + window)[0], 200
+            )
+            status, body = self.get_status(
+                "/api/metrics?device=docker01&window=" + window
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)["window"], window)
+
 
 class MetricsPageSourceTest(FrontEndSourceTest):
     """The metrics page, chart markup and deploy wiring, asserted at the source."""
@@ -1825,3 +1996,41 @@ class MetricsVolumeSourceTest(FrontEndSourceTest):
         self.assertRegex(self.metrics_css, r"\.volume-table\s*\{")
         self.assertRegex(self.metrics_css, r"\.volume-scroll\s*\{[^}]*overflow-x:\s*auto")
         self.assertRegex(self.metrics_css, r"\.volume-table th,\s*\.volume-table td\s*\{")
+
+
+class MetricsPeaksSourceTest(FrontEndSourceTest):
+    """Phase 2: min/max bands and the 90d / 1y ranges."""
+
+    def setUp(self):
+        super().setUp()
+        self.metrics_html = (APP_JS.parent / "metrics.html").read_text()
+        self.metrics_js = (APP_JS.parent / "metrics.js").read_text()
+        self.metrics_css = (APP_JS.parent / "metrics.css").read_text()
+
+    def test_the_api_bands_are_drawn_as_a_peak_band_behind_the_lines(self):
+        body = function_body(self.metrics_js, "bandPaths")
+        self.assertIn("point[4] !== 1", body)
+        self.assertIn("isNumber", body)
+        render = function_body(self.metrics_js, "renderChart")
+        self.assertIn("bandPaths(", render)
+        self.assertIn("chart-band", render)
+        self.assertRegex(self.metrics_css, r"\.chart-band\s*\{")
+        self.assertRegex(self.metrics_css, r"\.chart-band\.is-cpu\s*\{")
+
+    def test_the_table_view_shows_min_average_and_max(self):
+        body = function_body(self.metrics_js, "tableCells")
+        self.assertIn("series.bands", body)
+        self.assertIn("item.band", body)
+        self.assertIn("Math.round", body)
+        self.assertIn("'–'", body)
+        self.assertIn("min–avg–max", self.metrics_html)
+        # The RAM series key is 'ram' but the API names the band 'mem'.
+        self.assertIn("{ key: 'ram', field: 2, label: 'RAM', band: 'mem' }",
+                      self.metrics_js)
+
+    def test_ninety_day_and_one_year_ranges_are_wired_end_to_end(self):
+        for window in ("90d", "1y"):
+            self.assertIn('data-range="' + window + '"', self.metrics_html)
+            self.assertIn("'" + window + "'", self.metrics_js)
+        self.assertIn("RANGES = ['1h', '6h', '24h', '7d', '30d', '90d', '1y']",
+                      self.metrics_js)

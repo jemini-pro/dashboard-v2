@@ -436,8 +436,59 @@ assert data["points"], "no points"
 assert len(data["points"]) <= 400, len(data["points"])
 assert len(data["points"][0]) == 5, data["points"][0]
 assert "availability_pct" in data["summary"], data.get("summary")
+assert data["source"] == "raw", data.get("source")
+assert set(data["bands"]) == {"cpu", "mem", "disk"}, data.get("bands")
+for key, band in data["bands"].items():
+    assert len(band) == len(data["points"]), (key, len(band), len(data["points"]))
+    assert all(len(row) == 3 for row in band), (key, band[:2])
 PY
 ok "/api/metrics returns bucketed points, a step and a derived summary"
+
+# 11b. Rollup routing and peaks: 7d/30d read the 5-minute tier and 90d/1y the
+# hourly tier, and every payload carries min/max bands aligned with points.
+curl -fsS "$BASE/api/metrics?device=docker01&window=7d" \
+    -o "$TMP/series-7d.json" || fail "GET 7d series failed"
+python3 - "$TMP/series-7d.json" <<'PY' || fail "7d series is not rollup-backed"
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+assert data["source"] == "5m", data.get("source")
+assert data["points"], "no 7d points"
+assert len(data["bands"]["cpu"]) == len(data["points"])
+PY
+curl -fsS "$BASE/api/metrics?device=docker01&window=90d" \
+    -o "$TMP/series-90d.json" || fail "GET 90d series failed"
+python3 - "$TMP/series-90d.json" <<'PY' || fail "90d series is not hourly-rollup-backed"
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+assert data["source"] == "1h", data.get("source")
+assert data["points"], "no 90d points"
+assert len(data["bands"]["disk"]) == len(data["points"])
+PY
+python3 - "$DATA_DIR/metrics.db" <<'PY' || fail "a rollup tier has no rows"
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+try:
+    for table in ("rollup_5m", "rollup_1h", "disk_rollup_5m", "disk_rollup_1h"):
+        count = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        assert count > 0, f"{table} is empty"
+finally:
+    con.close()
+PY
+ok "7d/90d series route through 5-minute and hourly rollups with min/max bands"
+
+curl -fsS "$BASE/api/metrics/summary?window=90d" \
+    -o "$TMP/summary-90d.json" || fail "GET 90d summary failed"
+python3 - "$TMP/summary-90d.json" <<'PY' || fail "90d summary is not rollup-backed"
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+assert data["source"] == "1h", data.get("source")
+assert data["devices"], "no devices"
+assert all(device["source"] == "1h" for device in data["devices"])
+PY
+ok "a long-window summary is answered from hourly rollups, not raw rows"
 
 # 9b. Per-volume history. A push with a disks array must become its own rows,
 # exposed as a bucketed series plus growth/day and days-to-90, without changing
@@ -632,5 +683,21 @@ grep -Fq '1180px' "$README" \
 grep -Fq 'python3 -m unittest discover -s server' "$README" \
     || fail "README does not document the stdlib test command"
 ok "README documents the Workbench UI, breakpoints and checks"
+
+# 15. Rollup/peak documentation and the two long range tabs are wired.
+for needle in 'rollup_5m' 'DASH_ROLLUP_5M_DAYS' 'DASH_ROLLUP_1H_DAYS' \
+        'SUMMARY_CACHE_SECONDS' 'min/max'; do
+    grep -Fq "$needle" "$README" \
+        || fail "README does not document $needle"
+done
+grep -Fq 'data-range="90d"' "$REPO/metrics.html" \
+    || fail "metrics page has no 90d range tab"
+grep -Fq 'data-range="1y"' "$REPO/metrics.html" \
+    || fail "metrics page has no 1y range tab"
+grep -Fq 'min–avg–max' "$REPO/metrics.html" \
+    || fail "table view does not advertise min-avg-max"
+grep -Fq 'chart-band' "$REPO/metrics.js" \
+    || fail "chart has no min/max peak band"
+ok "README documents rollups and the page exposes 90d/1y with peak bands"
 
 echo "all $COUNT checks passed"

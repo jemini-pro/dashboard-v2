@@ -34,8 +34,8 @@ a main column (Jump back in, Launchpad, All tools) and a Network rail. There is 
 | `/api/health` | GET | `{ok}` |
 | `/api/bookmarks` | GET | the bookmark store, with a decayed `score` per item |
 | `/api/stats` | GET | devices array, cached 5 s; each device carries 24 h availability |
-| `/api/metrics/summary` | GET | per-device availability, averages, events, disk trend, a compact volume summary and a CPU sparkline |
-| `/api/metrics` | GET | one device's bucketed history and per-volume series: `?device=<id>&window=1h\|6h\|24h\|7d\|30d&step=<s>` |
+| `/api/metrics/summary` | GET | per-device availability, averages, events, disk trend, a compact volume summary and a CPU sparkline; long windows read rollups |
+| `/api/metrics` | GET | one device's bucketed history, min/max bands and per-volume series: `?device=<id>&window=1h\|6h\|24h\|7d\|30d\|90d\|1y&step=<s>` |
 | `/api/hit` | POST | record a bookmark click (`{"url": "..."}` → `204`, no body) |
 | `/api/push/<name>` | POST | agent heartbeat, needs `X-Dash-Token`; optionally carries `disks` |
 
@@ -74,14 +74,44 @@ can answer "is this normal, and since when?" rather than only "what is it now?".
   heartbeat never double-counts. The local `docker01` volume and each agent's
   `disks` array both feed it. LXC guests report no volume data, so they have
   no rows; old agents that send only `disk_pct` simply have none.
-- **Retention.** Raw samples and volume rows are kept for
-  `DASH_HISTORY_DAYS` (default **30**) and pruned at most once an hour, on the
-  same pass. At seven devices that is roughly 10k aggregate rows a day, or
-  20–30 MB for the full window; volume rows add one row per mount per bucket
-  (so 16-volume PC is 16× the row count).
+- **Two rollup tiers.** `rollup_5m` and `rollup_1h` (plus the matching
+  `disk_rollup_5m` / `disk_rollup_1h` for volumes) store `samples`,
+  `online_samples`, per-series average/min/max and the uptime first/last/min
+  for one bucket. The sampler recomputes only the buckets the current
+  heartbeat touches, inside the same transaction: the 5-minute row from raw
+  `samples`, the hourly row from the 5-minute rows, and the volume rows from
+  online `disk_samples`. A rollup row is a pure function of its raw bucket, so
+  re-running it is always safe.
+- **Window routing.** `≤ 24 h` reads raw rows; `7d` and `30d` read
+  `rollup_5m`; `90d` and `1y` read `rollup_1h`. `/api/metrics/summary` takes
+  the same route, so it never scans a raw 30-day window per device per
+  request. Live summary requests are additionally cached for
+  `SUMMARY_CACHE_SECONDS` (30 s) and shared across open tabs; every sample
+  write and every agent push invalidates it, so a new value is never hidden
+  for the full TTL. An explicit `now` (tests/backfills) bypasses the cache.
+- **Retention.** Raw samples and raw volume rows are kept for
+  `DASH_HISTORY_DAYS` (default **30**); 5-minute rollups for
+  `DASH_ROLLUP_5M_DAYS` (default **30**); hourly rollups for
+  `DASH_ROLLUP_1H_DAYS` (default **366**). All six tables are pruned at most
+  once an hour, on the same pass.
+- **Row-size math.** One device costs one `samples` row per bucket plus one
+  `disk_samples` row per mount. Rollups are 288 rows/device/day at 5 minutes
+  and 24 rows/device/day at 1 hour, regardless of mount count for the
+  aggregate tiers. Seven single-volume devices at the defaults therefore hold
+  roughly 10k raw rows/day (20–30 MB for 30 days), 60k 5-minute rows for
+  30 days (≈7–9 MB), and 61k hourly rows for a year (≈9–12 MB), with volume
+  rollups multiplying the rollup row count by the number of mounts.
+- **Peaks survive bucketing.** `/api/metrics` keeps its five-tuple `points`
+  (timestamp, cpu avg, mem avg, disk avg, online) and adds a parallel
+  `bands = {cpu|mem|disk: [[ts, min, max], …]}` array, aligned one-to-one with
+  the points. Rollup bands fold stored minima/maxima with `MIN`/`MAX`; a
+  coarse `?step=` re-weights averages by sample count so it stays exact.
+  `MAX_POINTS` still caps both arrays at 400.
 - **Derived, not stored.** Availability, downtime, offline events, restarts
   (an `uptime_s` drop), CPU/RAM averages and peaks, disk growth (least-squares
-  slope) and days-to-90% are computed when a request asks for them. The same
+  slope) and days-to-90% are computed when a request asks for them. For long
+  windows the same signals come from rollup buckets; downtime is the offline
+  share of each bucket and events are bucket-level transitions. The same
   least-squares rule and days-to-90 projection run per volume, online-only, so
   an offline agent's stale volume values never look like a trend. Offline runs
   are detected from transitions, so no separate event table is needed.
@@ -92,9 +122,11 @@ can answer "is this normal, and since when?" rather than only "what is it now?".
 
 The Metrics page (`/metrics.html`) uses the same data:
 
-- range tabs for **1h / 6h / 24h / 7d / 30d**;
+- range tabs for **1h / 6h / 24h / 7d / 30d / 90d / 1y**;
 - a three-line chart (CPU, RAM, disk, fixed 0–100% axis) with a legend, a
-  crosshair tooltip, surface-ringed end dots and a table view for exact values;
+  crosshair tooltip, surface-ringed end dots, a faint min/max peak band behind
+  each line, and a table view for exact values (each cell reads
+  `min–avg–max%`);
 - a volume table under the chart when the selected device reports more than
   one volume (label, mount, used %, size, growth/day, days-to-full), with the
   per-volume samples added to the opt-in table view — the 0–100 chart keeps a
@@ -110,8 +142,10 @@ on each device row once the first samples exist. The page and its CSS/JS are ser
 Tuning (optional; add to `dash/.env` and recreate the container):
 
 ```bash
-DASH_SAMPLE_SECONDS=60   # sampler cadence, minimum 5
-DASH_HISTORY_DAYS=30     # raw-sample retention
+DASH_SAMPLE_SECONDS=60    # sampler cadence, minimum 5
+DASH_HISTORY_DAYS=30      # raw-sample and raw volume retention
+DASH_ROLLUP_5M_DAYS=30    # 5-minute rollup retention (7d/30d windows)
+DASH_ROLLUP_1H_DAYS=366   # hourly rollup retention (90d/1y windows)
 ```
 
 ## Workbench UI
@@ -343,11 +377,12 @@ It asserts: `POST /api/hit` → `204` with no body; the score appears in
 hits older than 90 days are trimmed on write; an unknown URL is accepted; a title rename
 keeps the score; `/api/bookmarks` stays under ~10 KB for the current 31 links; the
 sampler writes history with no browser open; `/api/metrics` returns bucketed points,
-a step and a derived summary; a push with a `disks` array becomes per-volume series
-with growth/day and days-to-90 and a compact summary, an oversized list is capped at
-16; unknown windows/devices are rejected; hits, metrics history **and** per-volume
-history survive a full process restart; and the click feature sets no cookie and makes
-no third-party request. It also guards the compose/README path documentation below and the
+a step, min/max bands and a derived summary; 7d/30d route through `rollup_5m` and
+90d/1y through `rollup_1h`; all four rollup tables contain rows; a push with a `disks`
+array becomes per-volume series with growth/day and days-to-90 and a compact summary,
+an oversized list is capped at 16; unknown windows/devices are rejected; hits, metrics
+history **and** per-volume history survive a full process restart; and the click feature
+sets no cookie and makes no third-party request. It also guards the compose/README path documentation below and the
 Workbench UI, breakpoint and check documentation above.
 
 ## Click-history durability
@@ -432,3 +467,13 @@ ok 14 - metrics history survived a full server restart (first sample 1794320920)
   `disks` values, and without the join those stale values would draw a flat,
   falsely-recent volume trend. If you add another writer to `disk_samples`, it must
   also create the matching `samples` row or its history will never be served.
+- **Rollups are deleted and rewritten one bucket at a time.** Do not "fix" a rollup
+  row by editing it in place outside `_refresh_rollups`: the delete+rewrite is what
+  makes a late heartbeat inside the same bucket replace rather than double-count.
+  Raw rows are still the source of truth for ≤24 h windows and for rebuilding a
+  rollup; rollups only need to cover the retention windows that route to them.
+- **Summary caching is live-only and write-invalidated.** `metrics_summary(now=None)`
+  caches for 30 s; passing an explicit `now` (tests, a backfill) deliberately bypasses
+  it. `record_samples()` and the push handler call `_invalidate_summary()`, so a new
+  device or value appears on the next poll rather than after the TTL. Any new write
+  path must do the same, or it will look invisible for up to 30 s.

@@ -1,15 +1,15 @@
 const WORK_START_HOUR = 9;
 const WORK_END_HOUR = 17;
 const DEFAULT_RANGE = '24h';
-const RANGES = ['1h', '6h', '24h', '7d', '30d'];
+const RANGES = ['1h', '6h', '24h', '7d', '30d', '90d', '1y'];
 const REFRESH_MS = 60000;
 
 // One definition drives the lines, the legend and the table. Fields index into
 // the compact point arrays the API sends: [ts, cpu, mem, disk, online].
 const SERIES = [
-    { key: 'cpu', field: 1, label: 'CPU' },
-    { key: 'ram', field: 2, label: 'RAM' },
-    { key: 'disk', field: 3, label: 'Disk' }
+    { key: 'cpu', field: 1, label: 'CPU', band: 'cpu' },
+    { key: 'ram', field: 2, label: 'RAM', band: 'mem' },
+    { key: 'disk', field: 3, label: 'Disk', band: 'disk' }
 ];
 
 const KIND_DEFS = [
@@ -150,7 +150,10 @@ function hhmm(ts) {
 
 function pointTime(ts, range) {
     const date = new Date(ts * 1000);
-    if (range === '7d' || range === '30d') {
+    if (range === '1y') {
+        return date.toLocaleDateString('en-GB', { month: 'short', year: '2-digit' });
+    }
+    if (range === '7d' || range === '30d' || range === '90d') {
         return date.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
     }
     return hhmm(ts);
@@ -415,6 +418,35 @@ function seriesPath(points, field, xOf, yOf) {
     return path.trim();
 }
 
+// A peak band is the min/max envelope behind a line, so a spike that survives
+// bucketing is still visible. Bands break at offline points exactly like the
+// line does, rather than bridging a gap.
+function bandPaths(points, band, xOf, yOf) {
+    let path = '';
+    let top = [];
+    let bottom = [];
+    const flush = () => {
+        if (top.length >= 2) {
+            path += 'M' + top.map((point) => point.join(' ')).join(' L ') +
+                ' L' + bottom.slice().reverse().map((point) => point.join(' ')).join(' L ') +
+                ' Z ';
+        }
+        top = [];
+        bottom = [];
+    };
+    points.forEach((point, index) => {
+        const row = band && band[index];
+        if (point[4] !== 1 || !row || !isNumber(row[1]) || !isNumber(row[2])) {
+            flush();
+            return;
+        }
+        top.push([xOf(row[0]).toFixed(1), yOf(row[2]).toFixed(1)]);
+        bottom.push([xOf(row[0]).toFixed(1), yOf(row[1]).toFixed(1)]);
+    });
+    flush();
+    return path.trim();
+}
+
 function renderChartHead() {
     const device = series && series.device;
     if (!device) {
@@ -487,6 +519,12 @@ function renderChart() {
         'x2="' + (width - pad.right) + '" y2="' + yOf(value).toFixed(1) + '"/>'
     ).join('');
 
+    const bands = (series && series.bands) || {};
+    const bandMarks = SERIES.map((item) =>
+        '<path class="chart-band is-' + item.key + '" d="' +
+        bandPaths(points, bands[item.band], xOf, yOf) + '"/>'
+    ).join('');
+
     const lines = SERIES.map((item) =>
         '<path class="chart-line is-' + item.key + '" d="' +
         seriesPath(points, item.field, xOf, yOf) + '"/>'
@@ -501,7 +539,7 @@ function renderChart() {
 
     chartEl.innerHTML =
         '<svg class="chart-svg" viewBox="0 0 ' + width + ' ' + height + '" ' +
-        'preserveAspectRatio="none" aria-hidden="true">' + grid + lines + dots + '</svg>' +
+        'preserveAspectRatio="none" aria-hidden="true">' + grid + bandMarks + lines + dots + '</svg>' +
         '<span class="chart-crosshair" hidden></span>' +
         '<span class="chart-hover-dots" hidden>' + SERIES.map((item) =>
             '<span class="chart-hover-dot is-' + item.key + '" data-series-key="' + item.key +
@@ -617,12 +655,19 @@ function renderVolumeTable() {
 
 // ---------- table and events ----------
 
-function tableCells(point) {
+function tableCells(point, index) {
     const online = point[4] === 1;
+    const bands = (series && series.bands) || {};
     return '<td>' + escapeHtml(fullTime(point[0])) + '</td>' +
         SERIES.map((item) => {
             const value = point[item.field];
-            return '<td>' + (online && isNumber(value) ? Math.round(value) + '%' : '—') + '</td>';
+            if (!online || !isNumber(value)) return '<td>—</td>';
+            const band = bands[item.band] && bands[item.band][index];
+            if (band && isNumber(band[1]) && isNumber(band[2])) {
+                return '<td>' + Math.round(band[1]) + '–' + Math.round(value) +
+                    '–' + Math.round(band[2]) + '%</td>';
+            }
+            return '<td>' + Math.round(value) + '%</td>';
         }).join('') +
         '<td>' + (online ? 'online' : 'offline') + '</td>';
 }
@@ -630,8 +675,11 @@ function tableCells(point) {
 function renderTable() {
     const body = chartTableEl.querySelector('tbody');
     const points = (series && series.points) || [];
-    body.innerHTML = points.length
-        ? points.slice().reverse().map((point) => '<tr>' + tableCells(point) + '</tr>').join('')
+    // Keep the original index so each row can read its matching band entry.
+    const rows = points.map((point, index) => ({ point, index })).reverse();
+    body.innerHTML = rows.length
+        ? rows.map(({ point, index }) =>
+            '<tr>' + tableCells(point, index) + '</tr>').join('')
         : '<tr><td colspan="5">No samples in this window.</td></tr>';
     renderVolumeTable();
 }

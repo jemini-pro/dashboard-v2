@@ -46,18 +46,37 @@ TOKEN = os.environ.get("DASH_TOKEN", "").strip()
 SAMPLE_SECONDS = max(5, int(os.environ.get("DASH_SAMPLE_SECONDS", "60")))
 HISTORY_DAYS = max(1, int(os.environ.get("DASH_HISTORY_DAYS", "30")))
 HISTORY_SECONDS = HISTORY_DAYS * 86400
+# Two pre-aggregated tiers keep long windows from scanning raw rows: 5-minute
+# buckets for the 7d/30d ranges and hourly buckets for 90d/1y. They are
+# recomputed by the sampler from the current bucket, not by a separate job.
+ROLLUP_5M_SECONDS = 300
+ROLLUP_1H_SECONDS = 3600
+ROLLUP_5M_RETENTION = max(
+    1, int(os.environ.get("DASH_ROLLUP_5M_DAYS", "30"))
+) * 86400
+ROLLUP_1H_RETENTION = max(
+    1, int(os.environ.get("DASH_ROLLUP_1H_DAYS", "366"))
+) * 86400
+RAW_MAX_WINDOW = 86400
+ROLLUP_5M_MAX_WINDOW = 30 * 86400
 PRUNE_INTERVAL = 3600
+SUMMARY_CACHE_SECONDS = 30
 METRIC_WINDOWS = {
     "1h": 3600,
     "6h": 6 * 3600,
     "24h": 86400,
     "7d": 7 * 86400,
     "30d": 30 * 86400,
+    "90d": 90 * 86400,
+    "1y": 365 * 86400,
 }
 DEFAULT_WINDOW = "24h"
 # Each default lands at or below MAX_POINTS so a chart never gets a payload it
 # cannot draw. An explicit ?step= is clamped the same way.
-DEFAULT_STEPS = {"1h": 60, "6h": 300, "24h": 300, "7d": 1800, "30d": 7200}
+DEFAULT_STEPS = {
+    "1h": 60, "6h": 300, "24h": 300, "7d": 1800, "30d": 7200,
+    "90d": 21600, "1y": 86400,
+}
 MAX_POINTS = 400
 
 _lock = threading.Lock()
@@ -67,7 +86,18 @@ _db_lock = threading.Lock()
 _cache = {"at": 0.0, "body": None}
 _prev_cpu = {"usec": None, "at": None}
 _availability_cache = {"at": 0.0, "by_id": {}}
+_summary_cache = {"at": 0.0, "window": None, "body": None}
 _last_prune = {"at": 0.0}
+
+
+def _invalidate_summary():
+    """A write changes what the fleet summary would say; drop its cache.
+
+    Called after the write lock is released: stats() holds _lock and then
+    takes _db_lock, so invalidating while holding _db_lock could deadlock.
+    """
+    with _lock:
+        _summary_cache.update(at=0.0, window=None, body=None)
 
 
 # ---------- local machine ----------
@@ -334,6 +364,86 @@ CREATE TABLE IF NOT EXISTS disk_samples (
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS disk_samples_ts ON disk_samples (ts);
+
+-- Pre-aggregated tiers. The sampler recomputes the current bucket after each
+-- write, so these are ordinary derived tables: deleting them and restarting
+-- loses long history but never corrupts the live path. Averages are stored
+-- with their sample count so a coarser step can be re-weighted exactly.
+CREATE TABLE IF NOT EXISTS rollup_5m (
+    device_id      TEXT NOT NULL,
+    ts             INTEGER NOT NULL,
+    samples        INTEGER NOT NULL,
+    online_samples INTEGER NOT NULL,
+    cpu_avg        REAL,
+    cpu_min        REAL,
+    cpu_max        REAL,
+    mem_avg        REAL,
+    mem_min        REAL,
+    mem_max        REAL,
+    disk_avg       REAL,
+    disk_min       REAL,
+    disk_max       REAL,
+    uptime_first   INTEGER,
+    uptime_last    INTEGER,
+    uptime_min     INTEGER,
+    PRIMARY KEY (device_id, ts)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS rollup_5m_ts ON rollup_5m (ts);
+
+CREATE TABLE IF NOT EXISTS rollup_1h (
+    device_id      TEXT NOT NULL,
+    ts             INTEGER NOT NULL,
+    samples        INTEGER NOT NULL,
+    online_samples INTEGER NOT NULL,
+    cpu_avg        REAL,
+    cpu_min        REAL,
+    cpu_max        REAL,
+    mem_avg        REAL,
+    mem_min        REAL,
+    mem_max        REAL,
+    disk_avg       REAL,
+    disk_min       REAL,
+    disk_max       REAL,
+    uptime_first   INTEGER,
+    uptime_last    INTEGER,
+    uptime_min     INTEGER,
+    PRIMARY KEY (device_id, ts)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS rollup_1h_ts ON rollup_1h (ts);
+
+CREATE TABLE IF NOT EXISTS disk_rollup_5m (
+    device_id TEXT NOT NULL,
+    mount     TEXT NOT NULL,
+    ts        INTEGER NOT NULL,
+    samples   INTEGER NOT NULL,
+    pct_avg   REAL,
+    pct_min   REAL,
+    pct_max   REAL,
+    label     TEXT,
+    total     INTEGER,
+    used      INTEGER,
+    PRIMARY KEY (device_id, mount, ts)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS disk_rollup_5m_ts ON disk_rollup_5m (ts);
+
+CREATE TABLE IF NOT EXISTS disk_rollup_1h (
+    device_id TEXT NOT NULL,
+    mount     TEXT NOT NULL,
+    ts        INTEGER NOT NULL,
+    samples   INTEGER NOT NULL,
+    pct_avg   REAL,
+    pct_min   REAL,
+    pct_max   REAL,
+    label     TEXT,
+    total     INTEGER,
+    used      INTEGER,
+    PRIMARY KEY (device_id, mount, ts)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS disk_rollup_1h_ts ON disk_rollup_1h (ts);
 """
 
 
@@ -418,10 +528,15 @@ def record_samples(devices, now=None):
                         (device_id, disk["mount"], ts, disk["label"],
                          disk["total"], disk["used"], disk["pct"]),
                     )
+                # Recompute only the buckets this heartbeat touches. Later
+                # heartbeats in the same bucket replace the row rather than
+                # appending, so a rollup is always a pure function of raw rows.
+                _refresh_rollups(con, device_id, ts)
                 wrote += 1
             con.commit()
         finally:
             con.close()
+    _invalidate_summary()
     prune_metrics(now)
     return wrote
 
@@ -444,14 +559,230 @@ def prune_metrics(now=None):
         # Keep the delete on the same single-writer path as the sampler.
         con = _connect_metrics()
         try:
-            cutoff = int(now) - HISTORY_SECONDS
-            cur = con.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
-            removed = cur.rowcount
-            cur = con.execute("DELETE FROM disk_samples WHERE ts < ?", (cutoff,))
+            removed = 0
+            for table, retention in (
+                ("samples", HISTORY_SECONDS),
+                ("disk_samples", HISTORY_SECONDS),
+                ("rollup_5m", ROLLUP_5M_RETENTION),
+                ("rollup_1h", ROLLUP_1H_RETENTION),
+                ("disk_rollup_5m", ROLLUP_5M_RETENTION),
+                ("disk_rollup_1h", ROLLUP_1H_RETENTION),
+            ):
+                cur = con.execute(
+                    f"DELETE FROM {table} WHERE ts < ?",  # fixed internal names
+                    (int(now) - retention,),
+                )
+                removed += cur.rowcount
             con.commit()
-            return removed + cur.rowcount
+            return removed
         finally:
             con.close()
+
+
+# ---------- rollups ----------
+# A rollup row is a pure function of the raw rows in its bucket, so the
+# sampler deletes and rewrites just the touched bucket. No background job, no
+# incremental drift: re-running it is always safe.
+
+def _bucket_start(ts, size):
+    return int(ts) - (int(ts) % size)
+
+
+def _weighted(pairs):
+    """Weighted mean of (value, weight) pairs, ignoring missing values."""
+    pairs = [(value, weight) for value, weight in pairs if value is not None]
+    total = sum(weight for _value, weight in pairs)
+    if not total:
+        return None
+    return sum(value * weight for value, weight in pairs) / total
+
+
+def _bounds(values):
+    values = [value for value in values if value is not None]
+    return (min(values), max(values)) if values else (None, None)
+
+
+def _raw_aggregate_parts(rows):
+    return [{
+        "samples": 1,
+        "online_samples": 1 if online else 0,
+        "cpu_avg": cpu, "cpu_min": cpu, "cpu_max": cpu,
+        "mem_avg": mem, "mem_min": mem, "mem_max": mem,
+        "disk_avg": disk, "disk_min": disk, "disk_max": disk,
+        "uptime_first": uptime, "uptime_last": uptime, "uptime_min": uptime,
+    } for _ts, cpu, mem, disk, uptime, online in rows]
+
+
+def _rollup_aggregate_parts(rows):
+    return [{
+        "samples": samples,
+        "online_samples": online_samples,
+        "cpu_avg": cpu_avg, "cpu_min": cpu_min, "cpu_max": cpu_max,
+        "mem_avg": mem_avg, "mem_min": mem_min, "mem_max": mem_max,
+        "disk_avg": disk_avg, "disk_min": disk_min, "disk_max": disk_max,
+        "uptime_first": uptime_first, "uptime_last": uptime_last,
+        "uptime_min": uptime_min,
+    } for (samples, online_samples, cpu_avg, cpu_min, cpu_max,
+           mem_avg, mem_min, mem_max, disk_avg, disk_min, disk_max,
+           uptime_first, uptime_last, uptime_min) in rows]
+
+
+def _merge_aggregate(parts):
+    """Fold ordered parts into one aggregate row."""
+    return {
+        "samples": sum(part["samples"] for part in parts),
+        "online_samples": sum(part["online_samples"] for part in parts),
+        "cpu_avg": _weighted((part["cpu_avg"], part["samples"]) for part in parts),
+        "cpu_min": _bounds(part["cpu_min"] for part in parts)[0],
+        "cpu_max": _bounds(part["cpu_max"] for part in parts)[1],
+        "mem_avg": _weighted((part["mem_avg"], part["samples"]) for part in parts),
+        "mem_min": _bounds(part["mem_min"] for part in parts)[0],
+        "mem_max": _bounds(part["mem_max"] for part in parts)[1],
+        "disk_avg": _weighted((part["disk_avg"], part["samples"]) for part in parts),
+        "disk_min": _bounds(part["disk_min"] for part in parts)[0],
+        "disk_max": _bounds(part["disk_max"] for part in parts)[1],
+        "uptime_first": next(
+            (part["uptime_first"] for part in parts
+             if part["uptime_first"] is not None), None),
+        "uptime_last": next(
+            (part["uptime_last"] for part in reversed(parts)
+             if part["uptime_last"] is not None), None),
+        "uptime_min": min(
+            (part["uptime_min"] for part in parts
+             if part["uptime_min"] is not None), default=None),
+    }
+
+
+def _merge_disk(parts):
+    return {
+        "samples": sum(part["samples"] for part in parts),
+        "pct_avg": _weighted((part["pct_avg"], part["samples"]) for part in parts),
+        "pct_min": _bounds(part["pct_min"] for part in parts)[0],
+        "pct_max": _bounds(part["pct_max"] for part in parts)[1],
+        "label": next(
+            (part["label"] for part in reversed(parts) if part["label"]), ""),
+        "total": next(
+            (part["total"] for part in reversed(parts)
+             if part["total"] is not None), None),
+        "used": next(
+            (part["used"] for part in reversed(parts)
+             if part["used"] is not None), None),
+    }
+
+
+_AGGREGATE_COLUMNS = (
+    "device_id, ts, samples, online_samples, cpu_avg, cpu_min, cpu_max, "
+    "mem_avg, mem_min, mem_max, disk_avg, disk_min, disk_max, "
+    "uptime_first, uptime_last, uptime_min"
+)
+
+
+def _write_aggregate(con, table, device_id, ts, merged):
+    con.execute(
+        f"INSERT INTO {table} ({_AGGREGATE_COLUMNS}) VALUES "
+        "(" + ",".join("?" * 16) + ") "
+        "ON CONFLICT(device_id, ts) DO UPDATE SET "
+        "samples=excluded.samples, online_samples=excluded.online_samples, "
+        "cpu_avg=excluded.cpu_avg, cpu_min=excluded.cpu_min, "
+        "cpu_max=excluded.cpu_max, mem_avg=excluded.mem_avg, "
+        "mem_min=excluded.mem_min, mem_max=excluded.mem_max, "
+        "disk_avg=excluded.disk_avg, disk_min=excluded.disk_min, "
+        "disk_max=excluded.disk_max, uptime_first=excluded.uptime_first, "
+        "uptime_last=excluded.uptime_last, uptime_min=excluded.uptime_min",
+        (device_id, int(ts), merged["samples"], merged["online_samples"],
+         merged["cpu_avg"], merged["cpu_min"], merged["cpu_max"],
+         merged["mem_avg"], merged["mem_min"], merged["mem_max"],
+         merged["disk_avg"], merged["disk_min"], merged["disk_max"],
+         merged["uptime_first"], merged["uptime_last"], merged["uptime_min"]),
+    )
+
+
+_DISK_COLUMNS = (
+    "device_id, mount, ts, samples, pct_avg, pct_min, pct_max, label, total, used"
+)
+
+
+def _write_disk(con, table, device_id, mount, ts, merged):
+    con.execute(
+        f"INSERT INTO {table} ({_DISK_COLUMNS}) VALUES "
+        "(" + ",".join("?" * 10) + ") "
+        "ON CONFLICT(device_id, mount, ts) DO UPDATE SET "
+        "samples=excluded.samples, pct_avg=excluded.pct_avg, "
+        "pct_min=excluded.pct_min, pct_max=excluded.pct_max, "
+        "label=excluded.label, total=excluded.total, used=excluded.used",
+        (device_id, mount, int(ts), merged["samples"], merged["pct_avg"],
+         merged["pct_min"], merged["pct_max"], merged["label"],
+         merged["total"], merged["used"]),
+    )
+
+
+def _refresh_rollups(con, device_id, ts):
+    """Recompute the 5-minute and hourly buckets that contain `ts`."""
+    five = _bucket_start(ts, ROLLUP_5M_SECONDS)
+    raw = con.execute(
+        "SELECT ts, cpu_pct, mem_pct, disk_pct, uptime_s, online FROM samples "
+        "WHERE device_id = ? AND ts >= ? AND ts < ? ORDER BY ts",
+        (device_id, five, five + ROLLUP_5M_SECONDS),
+    ).fetchall()
+    con.execute("DELETE FROM rollup_5m WHERE device_id = ? AND ts = ?",
+                (device_id, five))
+    if raw:
+        _write_aggregate(con, "rollup_5m", device_id, five,
+                         _merge_aggregate(_raw_aggregate_parts(raw)))
+
+    hour = _bucket_start(ts, ROLLUP_1H_SECONDS)
+    parts = con.execute(
+        "SELECT samples, online_samples, cpu_avg, cpu_min, cpu_max, "
+        "mem_avg, mem_min, mem_max, disk_avg, disk_min, disk_max, "
+        "uptime_first, uptime_last, uptime_min FROM rollup_5m "
+        "WHERE device_id = ? AND ts >= ? AND ts < ? ORDER BY ts",
+        (device_id, hour, hour + ROLLUP_1H_SECONDS),
+    ).fetchall()
+    con.execute("DELETE FROM rollup_1h WHERE device_id = ? AND ts = ?",
+                (device_id, hour))
+    if parts:
+        _write_aggregate(con, "rollup_1h", device_id, hour,
+                         _merge_aggregate(_rollup_aggregate_parts(parts)))
+
+    # Volume rollups are online-only, matching the per-volume series. Offline
+    # agents keep stale disks in agents.json and must not enter a trend.
+    disk_rows = con.execute(
+        "SELECT d.ts, d.mount, d.label, d.total, d.used, d.pct "
+        "FROM disk_samples d "
+        "JOIN samples s ON s.device_id = d.device_id AND s.ts = d.ts "
+        "WHERE d.device_id = ? AND d.ts >= ? AND d.ts < ? AND s.online = 1 "
+        "ORDER BY d.ts",
+        (device_id, five, five + ROLLUP_5M_SECONDS),
+    ).fetchall()
+    by_mount = {}
+    for _ts, mount, label, total, used, pct in disk_rows:
+        by_mount.setdefault(mount, []).append({
+            "samples": 1, "pct_avg": pct, "pct_min": pct, "pct_max": pct,
+            "label": label, "total": total, "used": used,
+        })
+    con.execute("DELETE FROM disk_rollup_5m WHERE device_id = ? AND ts = ?",
+                (device_id, five))
+    for mount, parts in by_mount.items():
+        _write_disk(con, "disk_rollup_5m", device_id, mount, five,
+                    _merge_disk(parts))
+
+    sub = con.execute(
+        "SELECT ts, mount, samples, pct_avg, pct_min, pct_max, label, total, used "
+        "FROM disk_rollup_5m WHERE device_id = ? AND ts >= ? AND ts < ? "
+        "ORDER BY ts",
+        (device_id, hour, hour + ROLLUP_1H_SECONDS),
+    ).fetchall()
+    by_mount = {}
+    for _ts, mount, samples, pct_avg, pct_min, pct_max, label, total, used in sub:
+        by_mount.setdefault(mount, []).append({
+            "samples": samples, "pct_avg": pct_avg, "pct_min": pct_min,
+            "pct_max": pct_max, "label": label, "total": total, "used": used,
+        })
+    con.execute("DELETE FROM disk_rollup_1h WHERE device_id = ? AND ts = ?",
+                (device_id, hour))
+    for mount, parts in by_mount.items():
+        _write_disk(con, "disk_rollup_1h", device_id, mount, hour,
+                    _merge_disk(parts))
 
 
 def monitor_loop(interval=None):
@@ -595,16 +926,20 @@ def _disk_growth_per_day(rows):
     ])
 
 
+def _empty_summary():
+    return {
+        "samples": 0, "availability_pct": None, "downtime_s": 0,
+        "offline_events": 0, "last_offline": None, "restarts": 0,
+        "cpu_avg": None, "cpu_max": None, "mem_avg": None,
+        "disk_pct": None, "disk_growth_per_day": None, "days_to_90": None,
+    }
+
+
 def _derive_summary(rows, until):
     """Availability, averages, offline events and disk trend for one window."""
     count = len(rows)
     if not count:
-        return {
-            "samples": 0, "availability_pct": None, "downtime_s": 0,
-            "offline_events": 0, "last_offline": None, "restarts": 0,
-            "cpu_avg": None, "cpu_max": None, "mem_avg": None,
-            "disk_pct": None, "disk_growth_per_day": None, "days_to_90": None,
-        }
+        return _empty_summary()
     online_rows = [row for row in rows if row[5]]
     cpu_values = [row[1] for row in online_rows if row[1] is not None]
     mem_values = [row[2] for row in online_rows if row[2] is not None]
@@ -647,6 +982,103 @@ def _derive_summary(rows, until):
     }
 
 
+def _events_from_rollups(rows):
+    """Offline/recovery/restart transitions at bucket resolution.
+
+    A rollup row knows how many of its samples were online and the first,
+    last and minimum uptime, so the same transitions the raw path detects can
+    be recovered without keeping every raw row forever. A bucket that is only
+    partly online is treated as offline for transition purposes, matching the
+    raw MIN(online) rule.
+    """
+    events = []
+    prev_online = None
+    offline_since = None
+    prev_uptime_last = None
+    for row in rows:
+        ts, samples, online_samples = row[0], row[1], row[2]
+        uptime_first, uptime_last = row[7], row[8]
+        online = samples > 0 and online_samples >= samples
+        if prev_online is True and not online:
+            offline_since = ts
+            events.append({"ts": int(ts), "type": "offline"})
+        elif prev_online is False and online:
+            events.append({
+                "ts": int(ts), "type": "online",
+                "down_s": int(ts - offline_since) if offline_since is not None else None,
+            })
+            offline_since = None
+        elif prev_online is None and not online:
+            offline_since = ts
+
+        restart = False
+        if online and uptime_last is not None:
+            if prev_uptime_last is not None and uptime_last < prev_uptime_last - 60:
+                restart = True
+            if uptime_first is not None and uptime_last < uptime_first - 60:
+                restart = True
+        if restart:
+            events.append({"ts": int(ts), "type": "restart"})
+        if uptime_last is not None:
+            prev_uptime_last = uptime_last
+        prev_online = online
+
+    events.sort(key=lambda event: event["ts"], reverse=True)
+    return events
+
+
+def _summary_rows(con, source, device_id, since, until):
+    table = "rollup_5m" if source == "5m" else "rollup_1h"
+    return con.execute(
+        "SELECT ts, samples, online_samples, cpu_avg, cpu_max, mem_avg, "
+        "disk_avg, uptime_first, uptime_last "
+        f"FROM {table} WHERE device_id = ? AND ts >= ? AND ts <= ? ORDER BY ts",
+        (device_id, int(since), int(until)),
+    ).fetchall()
+
+
+def _derive_summary_rollup(rows, bucket_s):
+    """The long-window summary, computed without touching raw rows."""
+    if not rows:
+        return _empty_summary()
+    samples = sum(row[1] for row in rows)
+    online_samples = sum(row[2] for row in rows)
+    cpu_avg = _weighted((row[3], row[1]) for row in rows)
+    cpu_max = _bounds(row[4] for row in rows)[1]
+    mem_avg = _weighted((row[5], row[1]) for row in rows)
+    disk_now = next((row[6] for row in reversed(rows) if row[6] is not None), None)
+    growth = _trend_per_day([
+        (row[0], row[6]) for row in rows
+        if row[2] > 0 and row[6] is not None
+    ])
+    events = _events_from_rollups(rows)
+    offline_events = [event for event in events if event["type"] == "offline"]
+    # Each rollup row covers bucket_s of wall time, so an offline share of the
+    # bucket is the best downtime estimate that survives raw pruning.
+    downtime = sum(
+        bucket_s * (row[1] - row[2]) / row[1]
+        for row in rows if row[1]
+    )
+    latest = rows[-1]
+    return {
+        "samples": samples,
+        "availability_pct": round(100.0 * online_samples / samples, 1)
+        if samples else None,
+        "downtime_s": int(round(downtime)),
+        "offline_events": len(offline_events),
+        "last_offline": int(offline_events[0]["ts"]) if offline_events else None,
+        "restarts": sum(1 for event in events if event["type"] == "restart"),
+        "cpu_pct": round(float(latest[3]), 1) if latest[3] is not None else None,
+        "cpu_avg": round(cpu_avg, 1) if cpu_avg is not None else None,
+        "cpu_max": round(cpu_max, 1) if cpu_max is not None else None,
+        "mem_pct": round(float(latest[5]), 1) if latest[5] is not None else None,
+        "mem_avg": round(mem_avg, 1) if mem_avg is not None else None,
+        "disk_pct": round(float(disk_now), 1) if disk_now is not None else None,
+        "disk_growth_per_day": round(growth, 2) if growth is not None else None,
+        "days_to_90": _days_to_90(disk_now, growth),
+    }
+
+
 def _spark(rows, now, minutes=60, buckets=12):
     """Small CPU sparkline for the rail: one value per 5-minute bucket."""
     since = now - minutes * 60
@@ -663,39 +1095,62 @@ def _spark(rows, now, minutes=60, buckets=12):
     return [round(totals[i] / counts[i], 1) if counts[i] else None for i in range(buckets)]
 
 
-def _volume_series(con, device_id, since, until, step):
+def _volume_series(con, device_id, since, until, step, source="raw"):
     """Per-volume bucketed pct series, latest size and a growth trend.
 
     Online-only, matching the aggregate disk gauge: an agent that stopped
     pushing keeps its last values in agents.json, but those stale values must
-    not look like fresh volume history. One grouped query for the series plus
-    one latest-row query per mount (at most MAX_DISKS) keeps this bounded.
+    not look like fresh volume history. The raw path joins samples for the
+    online flag; the rollup tables were written online-only, so they need no
+    join. Long windows route here too, otherwise the 90d/1y ranges would show
+    no volume history once raw rows age out.
     """
-    rows = con.execute(
-        "SELECT d.mount, d.ts - (d.ts % ?) AS bucket, ROUND(AVG(d.pct), 1) "
-        "FROM disk_samples d "
-        "JOIN samples s ON s.device_id = d.device_id AND s.ts = d.ts "
-        "WHERE d.device_id = ? AND d.ts >= ? AND d.ts <= ? AND s.online = 1 "
-        "GROUP BY d.mount, bucket ORDER BY d.mount, bucket",
-        (step, device_id, int(since), int(until)),
-    ).fetchall()
+    if source == "raw":
+        rows = con.execute(
+            "SELECT d.mount, d.ts - (d.ts % ?) AS bucket, ROUND(AVG(d.pct), 1) "
+            "FROM disk_samples d "
+            "JOIN samples s ON s.device_id = d.device_id AND s.ts = d.ts "
+            "WHERE d.device_id = ? AND d.ts >= ? AND d.ts <= ? AND s.online = 1 "
+            "GROUP BY d.mount, bucket ORDER BY d.mount, bucket",
+            (step, device_id, int(since), int(until)),
+        ).fetchall()
+        latest = con.execute(
+            "SELECT d.mount, d.label, d.total, d.used, d.pct "
+            "FROM disk_samples d "
+            "JOIN samples s ON s.device_id = d.device_id AND s.ts = d.ts "
+            "WHERE d.device_id = ? AND d.ts >= ? AND d.ts <= ? AND s.online = 1 "
+            "AND d.ts = ("
+            "  SELECT MAX(d2.ts) FROM disk_samples d2 "
+            "  JOIN samples s2 ON s2.device_id = d2.device_id AND s2.ts = d2.ts "
+            "  WHERE d2.device_id = d.device_id AND d2.mount = d.mount "
+            "    AND d2.ts >= ? AND d2.ts <= ? AND s2.online = 1) "
+            "ORDER BY d.mount",
+            (device_id, int(since), int(until), int(since), int(until)),
+        ).fetchall()
+    else:
+        table = "disk_rollup_5m" if source == "5m" else "disk_rollup_1h"
+        rows = con.execute(
+            "SELECT mount, ts - (ts % ?) AS bucket, "
+            "ROUND(SUM(pct_avg * samples) / NULLIF(SUM(samples), 0), 1) "
+            f"FROM {table} WHERE device_id = ? AND ts >= ? AND ts <= ? "
+            "GROUP BY mount, bucket ORDER BY mount, bucket",
+            (step, device_id, int(since), int(until)),
+        ).fetchall()
+        latest = con.execute(
+            "SELECT d.mount, d.label, d.total, d.used, d.pct_avg "
+            f"FROM {table} d "
+            "WHERE d.device_id = ? AND d.ts >= ? AND d.ts <= ? "
+            "AND d.ts = ("
+            f"  SELECT MAX(d2.ts) FROM {table} d2 "
+            "  WHERE d2.device_id = d.device_id AND d2.mount = d.mount "
+            "    AND d2.ts >= ? AND d2.ts <= ?) "
+            "ORDER BY d.mount",
+            (device_id, int(since), int(until), int(since), int(until)),
+        ).fetchall()
+
     series = {}
     for mount, bucket, value in rows:
         series.setdefault(mount, []).append([int(bucket), value])
-
-    latest = con.execute(
-        "SELECT d.mount, d.label, d.total, d.used, d.pct "
-        "FROM disk_samples d "
-        "JOIN samples s ON s.device_id = d.device_id AND s.ts = d.ts "
-        "WHERE d.device_id = ? AND d.ts >= ? AND d.ts <= ? AND s.online = 1 "
-        "AND d.ts = ("
-        "  SELECT MAX(d2.ts) FROM disk_samples d2 "
-        "  JOIN samples s2 ON s2.device_id = d2.device_id AND s2.ts = d2.ts "
-        "  WHERE d2.device_id = d.device_id AND d2.mount = d.mount "
-        "    AND d2.ts >= ? AND d2.ts <= ? AND s2.online = 1) "
-        "ORDER BY d.mount",
-        (device_id, int(since), int(until), int(since), int(until)),
-    ).fetchall()
 
     volumes = []
     for mount, label, total, used, pct in latest:
@@ -743,6 +1198,15 @@ def _volume_summary(volumes):
     }
 
 
+def _window_source(window_s):
+    """Which store answers this window: raw, 5-minute or hourly rollups."""
+    if window_s <= RAW_MAX_WINDOW:
+        return "raw"
+    if window_s <= ROLLUP_5M_MAX_WINDOW:
+        return "5m"
+    return "1h"
+
+
 def _window_seconds(window):
     return METRIC_WINDOWS.get(window)
 
@@ -758,6 +1222,53 @@ def _step_for(window_s, requested):
     return step
 
 
+def _series_query(con, device_id, since, until, step, source):
+    """Bucketed points plus a min/max band per series.
+
+    Raw rows average per bucket directly. Rollup rows are re-weighted by their
+    sample count and their stored minima/maxima are folded with MIN/MAX, so a
+    coarse `?step=` stays exact without loading every raw row.
+    """
+    if source == "raw":
+        rows = con.execute(
+            "SELECT ts - (ts % ?) AS bucket, "
+            "ROUND(AVG(cpu_pct), 1), ROUND(AVG(mem_pct), 1), "
+            "ROUND(AVG(disk_pct), 1), MIN(online), "
+            "ROUND(MIN(cpu_pct), 1), ROUND(MAX(cpu_pct), 1), "
+            "ROUND(MIN(mem_pct), 1), ROUND(MAX(mem_pct), 1), "
+            "ROUND(MIN(disk_pct), 1), ROUND(MAX(disk_pct), 1) "
+            "FROM samples WHERE device_id = ? AND ts >= ? AND ts <= ? "
+            "GROUP BY bucket ORDER BY bucket",
+            (step, device_id, int(since), int(until)),
+        ).fetchall()
+    else:
+        table = "rollup_5m" if source == "5m" else "rollup_1h"
+        rows = con.execute(
+            "SELECT ts - (ts % ?) AS bucket, "
+            "ROUND(SUM(cpu_avg * samples) / NULLIF(SUM(CASE WHEN cpu_avg "
+            "IS NOT NULL THEN samples ELSE 0 END), 0), 1), "
+            "ROUND(SUM(mem_avg * samples) / NULLIF(SUM(CASE WHEN mem_avg "
+            "IS NOT NULL THEN samples ELSE 0 END), 0), 1), "
+            "ROUND(SUM(disk_avg * samples) / NULLIF(SUM(CASE WHEN disk_avg "
+            "IS NOT NULL THEN samples ELSE 0 END), 0), 1), "
+            "MIN(CASE WHEN online_samples = samples THEN 1 ELSE 0 END), "
+            "ROUND(MIN(cpu_min), 1), ROUND(MAX(cpu_max), 1), "
+            "ROUND(MIN(mem_min), 1), ROUND(MAX(mem_max), 1), "
+            "ROUND(MIN(disk_min), 1), ROUND(MAX(disk_max), 1) "
+            f"FROM {table} WHERE device_id = ? AND ts >= ? AND ts <= ? "
+            "GROUP BY bucket ORDER BY bucket",
+            (step, device_id, int(since), int(until)),
+        ).fetchall()
+
+    points = [[row[0], row[1], row[2], row[3], row[4]] for row in rows]
+    bands = {
+        "cpu": [[row[0], row[5], row[6]] for row in rows],
+        "mem": [[row[0], row[7], row[8]] for row in rows],
+        "disk": [[row[0], row[9], row[10]] for row in rows],
+    }
+    return points, bands
+
+
 def _known_devices(con):
     return con.execute(
         "SELECT id, name, kind, first_seen, last_seen FROM devices ORDER BY kind, name"
@@ -765,12 +1276,27 @@ def _known_devices(con):
 
 
 def metrics_summary(window=DEFAULT_WINDOW, now=None):
-    """Every known device with its derived window summary and a CPU sparkline."""
+    """Every known device with its derived window summary and a CPU sparkline.
+
+    Long windows are answered from rollups, not by scanning every raw row per
+    device. Live requests are also cached for SUMMARY_CACHE_SECONDS: the page
+    polls once a minute, so one shared scan serves every open tab. Explicit
+    `now` (tests, backfills) bypasses the cache and stays deterministic.
+    """
+    live_request = now is None
     now = time.time() if now is None else now
     window_s = _window_seconds(window) or METRIC_WINDOWS[DEFAULT_WINDOW]
+    if live_request:
+        with _lock:
+            if (_summary_cache["body"] is not None
+                    and _summary_cache["window"] == window
+                    and now - _summary_cache["at"] < SUMMARY_CACHE_SECONDS):
+                return _summary_cache["body"]
     since = now - window_s
+    source = _window_source(window_s)
+    bucket_s = ROLLUP_5M_SECONDS if source == "5m" else ROLLUP_1H_SECONDS
     payload = {"generated": int(now), "window": window, "window_s": window_s,
-               "devices": []}
+               "source": source, "devices": []}
     if not METRICS_FILE.exists():
         return payload
     live = _live_state(now)
@@ -778,36 +1304,53 @@ def metrics_summary(window=DEFAULT_WINDOW, now=None):
     con = _connect_metrics()
     try:
         for device_id, name, kind, _first, last_seen in _known_devices(con):
-            rows = _history_rows(con, device_id, since, now)
-            summary = _derive_summary(rows, now)
+            # The sparkline is always the last hour, so it stays a cheap raw
+            # query regardless of which store answers the window.
+            spark = _spark(_history_rows(con, device_id, now - 3600, now), now)
+            if source == "raw":
+                rows = _history_rows(con, device_id, since, now)
+                summary = _derive_summary(rows, now)
+                online = bool(rows[-1][5]) if rows else False
+            else:
+                rollup_rows = _summary_rows(con, source, device_id, since, now)
+                summary = _derive_summary_rollup(rollup_rows, bucket_s)
+                online = bool(rollup_rows[-1][2] >= rollup_rows[-1][1]) \
+                    if rollup_rows else False
             state = live.get(device_id, {})
             payload["devices"].append({
                 "id": device_id,
                 "name": name,
                 "kind": kind,
-                "online": state.get("online", bool(rows[-1][5]) if rows else False),
+                "online": state.get("online", online),
                 "last_seen": state.get("last_seen", int(last_seen)),
-                "spark": _spark(rows, now),
+                "spark": spark,
                 "volumes": _volume_summary(
-                    _volume_series(con, device_id, since, now, volume_step)
+                    _volume_series(con, device_id, since, now, volume_step, source)
                 ),
                 **summary,
+                "source": source,
             })
     finally:
         con.close()
+    if live_request:
+        with _lock:
+            _summary_cache.update(at=now, window=window, body=payload)
     return payload
 
 
 def metrics_series(device_id, window=DEFAULT_WINDOW, requested_step=None, now=None):
-    """One device's bucketed time series, derived summary and events."""
+    """One device's bucketed time series, min/max bands, summary and events."""
     now = time.time() if now is None else now
     window_s = _window_seconds(window) or METRIC_WINDOWS[DEFAULT_WINDOW]
     step = _step_for(window_s, requested_step)
     since = now - window_s
+    source = _window_source(window_s)
+    bucket_s = ROLLUP_5M_SECONDS if source == "5m" else ROLLUP_1H_SECONDS
     payload = {
-        "generated": int(now), "window": window, "window_s": window_s, "step": step,
+        "generated": int(now), "window": window, "window_s": window_s,
+        "step": step, "source": source,
         "device": None, "summary": _derive_summary([], now), "points": [],
-        "volumes": [], "events": [],
+        "bands": {"cpu": [], "mem": [], "disk": []}, "volumes": [], "events": [],
     }
     if not METRICS_FILE.exists():
         return None if device_id else payload
@@ -819,28 +1362,34 @@ def metrics_series(device_id, window=DEFAULT_WINDOW, requested_step=None, now=No
         ).fetchone()
         if meta is None:
             return None
-        rows = _history_rows(con, device_id, since, now)
-        points = con.execute(
-            "SELECT ts - (ts % ?) AS bucket, "
-            "ROUND(AVG(cpu_pct), 1), ROUND(AVG(mem_pct), 1), "
-            "ROUND(AVG(disk_pct), 1), MIN(online) "
-            "FROM samples WHERE device_id = ? AND ts >= ? AND ts <= ? "
-            "GROUP BY bucket ORDER BY bucket",
-            (step, device_id, int(since), int(now)),
-        ).fetchall()
-        volumes = _volume_series(con, device_id, since, now, step)
+        points, bands = _series_query(
+            con, device_id, since, now, step, source
+        )
+        if source == "raw":
+            rows = _history_rows(con, device_id, since, now)
+            summary = _derive_summary(rows, now)
+            events = _events(rows, limit=20)
+            online = bool(rows[-1][5]) if rows else False
+        else:
+            rollup_rows = _summary_rows(con, source, device_id, since, now)
+            summary = _derive_summary_rollup(rollup_rows, bucket_s)
+            events = _events_from_rollups(rollup_rows)[:20]
+            online = bool(rollup_rows[-1][2] >= rollup_rows[-1][1]) \
+                if rollup_rows else False
+        volumes = _volume_series(con, device_id, since, now, step, source)
     finally:
         con.close()
     state = live.get(device_id, {})
     payload["device"] = {
         "id": meta[0], "name": meta[1], "kind": meta[2],
-        "online": state.get("online", bool(rows[-1][5]) if rows else False),
+        "online": state.get("online", online),
         "last_seen": state.get("last_seen", int(meta[3])),
     }
-    payload["summary"] = _derive_summary(rows, now)
-    payload["points"] = [list(point) for point in points]
+    payload["summary"] = summary
+    payload["points"] = points
+    payload["bands"] = bands
     payload["volumes"] = volumes
-    payload["events"] = _events(rows, limit=20)
+    payload["events"] = events
     return payload
 
 
@@ -1130,6 +1679,7 @@ class Handler(BaseHTTPRequestHandler):
             rec["last_seen"] = int(time.time())
             agents[name] = rec
             save_agents(agents)
+        _invalidate_summary()
         return self._json({"ok": True, "stored": name})
 
 if __name__ == "__main__":
