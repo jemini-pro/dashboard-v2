@@ -243,6 +243,39 @@ wait_for_device() { # wait_for_device <device-id>
     fail "device $id did not appear within 12 s"
 }
 
+wait_for_auto_restart() { # wait_for_auto_restart <device-id>
+    local id="$1" i
+    for i in $(seq 1 140); do
+        if curl -fsS "$BASE/api/metrics?device=$id&window=1h" \
+                -o "$TMP/restart-series.json" 2>/dev/null; then
+            if python3 - "$TMP/restart-series.json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+raise SystemExit(0 if any(a.get("auto") and a.get("kind") == "restart"
+                          for a in data.get("annotations", [])) else 1)
+PY
+            then
+                return 0
+            fi
+        fi
+        sleep 0.1
+    done
+    fail "no auto restart annotation for $id within 14 s"
+}
+
+annotation_count() {
+    python3 - "$DATA_DIR/metrics.db" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+try:
+    row = con.execute("SELECT COUNT(*) FROM annotations").fetchone()
+finally:
+    con.close()
+print(row[0])
+PY
+}
+
 metric_min_ts() {
     python3 - "$DATA_DIR/metrics.db" <<'PY'
 import sqlite3, sys
@@ -681,6 +714,67 @@ assert old["signals"] == {}, old["signals"]
 PY
 ok "/api/metrics/summary carries latest signals and none for old agents"
 
+# 9e. Annotations are token-protected writes, rendered as markers and Events;
+# warnings are evaluated server-side from the summary fields.
+ann_ts="$(python3 -c 'import time; print(int(time.time()) - 60)')"
+cat > "$TMP/annotation-push.json" <<JSON
+{"device": "docker01", "kind": "deploy", "text": "check_api deploy", "ts": $ann_ts}
+JSON
+curl -fsS -X POST -H 'Content-Type: application/json' \
+    --data-binary @"$TMP/annotation-push.json" \
+    "$BASE/api/annotations" -o "$TMP/annotation.json" \
+    || fail "POST /api/annotations failed"
+python3 - "$TMP/annotation.json" <<'PY' || fail "annotation response is wrong"
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+assert data["ok"] is True and data["id"], data
+PY
+curl -fsS "$BASE/api/metrics?device=docker01&window=1h" \
+    -o "$TMP/ann-series.json" || fail "GET series with annotations failed"
+python3 - "$TMP/ann-series.json" <<'PY' || fail "annotation is missing from the chart/events"
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+manual = [a for a in data["annotations"] if a["text"] == "check_api deploy"]
+assert manual and manual[0]["kind"] == "deploy" and not manual[0]["auto"], data["annotations"]
+events = [e for e in data["events"]
+          if e["type"] == "annotation" and e.get("text") == "check_api deploy"]
+assert events, data["events"]
+PY
+ok "a deploy annotation appears as a chart marker and an Events row"
+
+cat > "$TMP/warn-push.json" <<'JSON'
+{"name": "warnagent", "kind": "pc", "cpu_pct": 1.0, "mem_pct": 95.0,
+ "disk_pct": 96.0, "uptime_s": 10}
+JSON
+push_device warnagent "$TMP/warn-push.json" || fail "warning push failed"
+wait_for_device agent:warnagent
+curl -fsS "$BASE/api/metrics/summary?window=1h" \
+    -o "$TMP/warn-summary.json" || fail "summary with warnings failed"
+python3 - "$TMP/warn-summary.json" <<'PY' || fail "warnings were not evaluated"
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+device = next(d for d in data["devices"] if d["id"] == "agent:warnagent")
+codes = {w["code"]: w["level"] for w in device["warnings"]}
+assert codes.get("disk") == "critical", codes
+assert codes.get("mem") == "warning", codes
+PY
+ok "server-side warnings flag disk and RAM thresholds with severity"
+
+cat > "$TMP/restart1-push.json" <<'JSON'
+{"name": "restartagent", "kind": "pc", "cpu_pct": 1.0, "uptime_s": 1000}
+JSON
+push_device restartagent "$TMP/restart1-push.json" || fail "restart push 1 failed"
+wait_for_device agent:restartagent
+cat > "$TMP/restart2-push.json" <<'JSON'
+{"name": "restartagent", "kind": "pc", "cpu_pct": 1.0, "uptime_s": 10}
+JSON
+push_device restartagent "$TMP/restart2-push.json" || fail "restart push 2 failed"
+wait_for_auto_restart agent:restartagent
+ok "a detected restart is auto-annotated on the chart"
+
 code="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/metrics/summary?window=2h")"
 [[ "$code" == "400" ]] || fail "unknown window returned $code, expected 400"
 code="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/metrics?window=1h")"
@@ -695,6 +789,8 @@ disk_min_before="$(disk_min_ts)"
 [[ -n "$disk_min_before" ]] || fail "metrics.db has no per-volume samples before the restart"
 metric_min_before="$(metric_min_ts)"
 [[ -n "$metric_min_before" ]] || fail "metrics.db has no extra-signal samples before the restart"
+annotations_before="$(annotation_count)"
+[[ "$annotations_before" -ge 1 ]] || fail "no annotations before the restart"
 
 # 10. Process restart: the same DASH_DATA_DIR keeps the history. This is the
 # no-docker equivalent of recreating the `dash` container with its bind mount.
@@ -727,6 +823,11 @@ metric_min_after="$(metric_min_ts)"
 [[ "$metric_min_after" == "$metric_min_before" ]] \
     || fail "signal history changed across restart: $metric_min_before -> $metric_min_after"
 ok "extra-signal history survived a full server restart (first sample $metric_min_after)"
+
+annotations_after="$(annotation_count)"
+[[ "$annotations_after" == "$annotations_before" ]] \
+    || fail "annotations changed across restart: $annotations_before -> $annotations_after"
+ok "annotations survived a full server restart ($annotations_after stored)"
 
 # 11. Static guarantees: no cookie is set and the feature makes no third-party
 # request. Deliberately scoped to the click-history/strip code so unrelated
@@ -808,7 +909,8 @@ ok "README documents the Workbench UI, breakpoints and checks"
 # 15. Rollup/peak documentation and the two long range tabs are wired.
 for needle in 'rollup_5m' 'DASH_ROLLUP_5M_DAYS' 'DASH_ROLLUP_1H_DAYS' \
         'SUMMARY_CACHE_SECONDS' 'min/max' 'metric_samples' 'SIGNAL_WINDOW_S' \
-        'load_1' 'swap_used' 'net_rx_bps'; do
+        'load_1' 'swap_used' 'net_rx_bps' '/api/annotations' \
+        'DASH_WARN_DISK_PCT' 'DASH_WARN_DAYS_TO_90'; do
     grep -Fq "$needle" "$README" \
         || fail "README does not document $needle"
 done
@@ -824,6 +926,12 @@ grep -Fq 'id="signal-strip"' "$REPO/metrics.html" \
     || fail "metrics page has no signal strip"
 grep -Fq 'fmtRate' "$REPO/metrics.js" \
     || fail "signal strip has no rate formatting"
-ok "README documents rollups/signals and the page exposes ranges, bands and signals"
+grep -Fq 'id="warning-banner"' "$REPO/metrics.html" \
+    || fail "metrics page has no warning banner"
+grep -Fq 'chart-marker' "$REPO/metrics.js" \
+    || fail "chart has no annotation markers"
+grep -Fq 'device-warn' "$REPO/app.js" \
+    || fail "dashboard rail has no warning indicator"
+ok "README documents rollups/signals/annotations and the page exposes their UI"
 
 echo "all $COUNT checks passed"

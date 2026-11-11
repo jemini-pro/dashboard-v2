@@ -181,6 +181,62 @@
     background: var(--status-critical-mark);
 }
 
+/* ---------- warnings ---------- */
+
+.warning-banner {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    padding: 11px 16px;
+}
+
+.warning-banner[hidden] {
+    display: none;
+}
+
+.warning-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+}
+
+.warning-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px 16px;
+    list-style: none;
+    padding: 0;
+}
+
+.warning-row {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+    font-size: 0.66rem;
+}
+
+.warning-row::before {
+    content: "";
+    align-self: center;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--status-warning-mark);
+}
+
+.warning-row.is-critical::before {
+    background: var(--status-critical-mark);
+}
+
+.warning-device {
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.warning-text {
+    color: var(--muted);
+}
+
 /* ---------- chart ---------- */
 
 .chart-card {
@@ -341,6 +397,31 @@
 
 .chart-grid.is-baseline {
     stroke: var(--chart-axis);
+}
+
+/* Annotation markers are dashed vertical rules; the SVG <title> carries the
+   note, and the Events rail carries the readable text. */
+.chart-marker {
+    stroke: var(--chart-axis);
+    stroke-width: 1px;
+    stroke-dasharray: 3 3;
+    opacity: 0.8;
+}
+
+.chart-marker.is-deploy {
+    stroke: var(--series-cpu);
+}
+
+.chart-marker.is-restart {
+    stroke: var(--status-critical-mark);
+}
+
+.chart-marker.is-backup {
+    stroke: var(--series-disk);
+}
+
+.chart-marker.is-note {
+    stroke: var(--muted);
 }
 
 .chart-crosshair {
@@ -725,6 +806,13 @@
     text-overflow: ellipsis;
 }
 
+.device-item-warn {
+    font-size: 0.54rem;
+    font-weight: 600;
+    color: var(--status-warning);
+    white-space: nowrap;
+}
+
 .device-item-avail {
     margin-left: auto;
     font-size: 0.62rem;
@@ -810,6 +898,14 @@
     color: var(--status-good);
 }
 
+.event.is-annotation .event-mark {
+    color: var(--series-cpu);
+}
+
+.event.is-annotation.is-restart .event-mark {
+    color: var(--status-critical-mark);
+}
+
 .event-body {
     display: flex;
     flex-direction: column;
@@ -820,6 +916,7 @@
 .event-label {
     font-size: 0.7rem;
     font-weight: 600;
+    overflow-wrap: anywhere;
 }
 
 .event-time {

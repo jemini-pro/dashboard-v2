@@ -248,6 +248,21 @@ PERCENT_METRICS = {"cpu_iowait", "cpu_steal"}
 # A compact strip does not need a year of history; cap the series query.
 SIGNAL_WINDOW_S = 86400
 
+ANNOTATION_KINDS = ("deploy", "restart", "backup", "note")
+MAX_ANNOTATION_TEXT = 200
+MAX_ANNOTATIONS = 200
+# A flapping device can restart every sample. Markers are for humans, so only
+# the most recent auto restarts are sent; the Events rail keeps its own limit.
+MAX_AUTO_ANNOTATIONS = 20
+
+# Curated warning thresholds. Each warning has a warning and a derived
+# critical level; the env vars move the warning line, not the whole rule.
+WARN_DISK_PCT = float(os.environ.get("DASH_WARN_DISK_PCT", "85"))
+WARN_DAYS_TO_90 = float(os.environ.get("DASH_WARN_DAYS_TO_90", "14"))
+WARN_GROWTH = float(os.environ.get("DASH_WARN_GROWTH", "1.0"))
+WARN_OFFLINE_S = int(os.environ.get("DASH_WARN_OFFLINE_S", "600"))
+WARN_MEM_PCT = float(os.environ.get("DASH_WARN_MEM_PCT", "90"))
+
 
 def _finite(value):
     """Return a real number or None. JSON can carry NaN/Infinity, and bools
@@ -471,6 +486,18 @@ CREATE TABLE IF NOT EXISTS metric_samples (
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS metric_samples_ts ON metric_samples (ts);
+
+-- Manual deploy/restart/backup/note annotations. device_id = '' means
+-- fleet-wide, so a deploy note appears on every device chart.
+CREATE TABLE IF NOT EXISTS annotations (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id TEXT NOT NULL,
+    ts        INTEGER NOT NULL,
+    kind      TEXT NOT NULL,
+    text      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS annotations_ts ON annotations (ts);
 """
 
 
@@ -988,6 +1015,97 @@ def _disk_growth_per_day(rows):
     ])
 
 
+def _high_warning(value, warning_at, critical_at):
+    if value is None:
+        return None
+    if value >= critical_at:
+        return "critical"
+    return "warning" if value >= warning_at else None
+
+
+def _low_warning(value, warning_at, critical_at):
+    if value is None:
+        return None
+    if value <= critical_at:
+        return "critical"
+    return "warning" if value <= warning_at else None
+
+
+def _duration_label(seconds):
+    seconds = max(0, int(seconds))
+    if seconds >= 3600:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+    return f"{max(1, seconds // 60)}m"
+
+
+def evaluate_warnings(device, now):
+    """Curated per-device warnings from the summary fields.
+
+    The same rule runs for the metrics page and the fleet summary. The rail
+    uses `live_warnings`, which feeds only the cheap live fields and therefore
+    skips the history-derived days-to-90/growth checks.
+    """
+    warnings = []
+
+    disk = _finite(device.get("disk_pct"))
+    level = _high_warning(disk, WARN_DISK_PCT,
+                          min(99.0, WARN_DISK_PCT + 10))
+    if level:
+        warnings.append({
+            "code": "disk", "level": level, "value": round(disk, 1),
+            "threshold": WARN_DISK_PCT, "text": f"Disk {disk:.0f}% full",
+        })
+
+    days = _finite(device.get("days_to_90"))
+    level = _low_warning(days, WARN_DAYS_TO_90,
+                         max(1.0, WARN_DAYS_TO_90 / 4))
+    if level:
+        warnings.append({
+            "code": "days_to_90", "level": level, "value": days,
+            "threshold": WARN_DAYS_TO_90, "text": f"About {days:g}d to 90%",
+        })
+
+    growth = _finite(device.get("disk_growth_per_day"))
+    level = _high_warning(growth, WARN_GROWTH, WARN_GROWTH * 5)
+    if level:
+        warnings.append({
+            "code": "growth", "level": level, "value": growth,
+            "threshold": WARN_GROWTH,
+            "text": f"Disk growing {growth:g}%/day",
+        })
+
+    mem = _finite(device.get("mem_pct"))
+    level = _high_warning(mem, WARN_MEM_PCT, min(99.0, WARN_MEM_PCT + 7))
+    if level:
+        warnings.append({
+            "code": "mem", "level": level, "value": round(mem, 1),
+            "threshold": WARN_MEM_PCT, "text": f"RAM {mem:.0f}%",
+        })
+
+    if not device.get("online", True):
+        last_seen = _finite(device.get("last_seen"))
+        offline = max(0, int(now) - int(last_seen)) if last_seen is not None else 0
+        level = _high_warning(offline, WARN_OFFLINE_S, WARN_OFFLINE_S * 6)
+        if level:
+            warnings.append({
+                "code": "offline", "level": level, "value": offline,
+                "threshold": WARN_OFFLINE_S,
+                "text": f"Offline for {_duration_label(offline)}",
+            })
+
+    return warnings
+
+
+def live_warnings(device, now):
+    """The cheap dashboard-rail subset: live disk, RAM and offline duration."""
+    return evaluate_warnings({
+        "disk_pct": device.get("disk_pct"),
+        "mem_pct": device.get("mem_pct"),
+        "online": device.get("online", True),
+        "last_seen": device.get("last_seen"),
+    }, now)
+
+
 def _empty_summary():
     return {
         "samples": 0, "availability_pct": None, "downtime_s": 0,
@@ -1327,6 +1445,22 @@ def _latest_signals(con, device_id):
     return signals
 
 
+def _stored_annotations(con, device_id, since, until):
+    """Device-specific plus fleet-wide annotations inside the window."""
+    rows = con.execute(
+        "SELECT id, device_id, ts, kind, text FROM annotations "
+        "WHERE ts >= ? AND ts <= ? AND (device_id = ? OR device_id = '') "
+        "ORDER BY ts DESC LIMIT ?",
+        (int(since), int(until), device_id, MAX_ANNOTATIONS),
+    ).fetchall()
+    # The limit keeps the newest notes; restore chronological order for markers.
+    rows = rows[::-1]
+    return [{
+        "id": row[0], "device": row[1], "ts": int(row[2]),
+        "kind": row[3], "text": row[4], "auto": False,
+    } for row in rows]
+
+
 def _window_source(window_s):
     """Which store answers this window: raw, 5-minute or hourly rollups."""
     if window_s <= RAW_MAX_WINDOW:
@@ -1446,7 +1580,7 @@ def metrics_summary(window=DEFAULT_WINDOW, now=None):
                 online = bool(rollup_rows[-1][2] >= rollup_rows[-1][1]) \
                     if rollup_rows else False
             state = live.get(device_id, {})
-            payload["devices"].append({
+            entry = {
                 "id": device_id,
                 "name": name,
                 "kind": kind,
@@ -1459,7 +1593,9 @@ def metrics_summary(window=DEFAULT_WINDOW, now=None):
                 "signals": _latest_signals(con, device_id),
                 **summary,
                 "source": source,
-            })
+            }
+            entry["warnings"] = evaluate_warnings(entry, now)
+            payload["devices"].append(entry)
     finally:
         con.close()
     if live_request:
@@ -1481,7 +1617,7 @@ def metrics_series(device_id, window=DEFAULT_WINDOW, requested_step=None, now=No
         "step": step, "source": source,
         "device": None, "summary": _derive_summary([], now), "points": [],
         "bands": {"cpu": [], "mem": [], "disk": []}, "volumes": [],
-        "signals": {}, "events": [],
+        "signals": {}, "annotations": [], "warnings": [], "events": [],
     }
     if not METRICS_FILE.exists():
         return None if device_id else payload
@@ -1499,16 +1635,17 @@ def metrics_series(device_id, window=DEFAULT_WINDOW, requested_step=None, now=No
         if source == "raw":
             rows = _history_rows(con, device_id, since, now)
             summary = _derive_summary(rows, now)
-            events = _events(rows, limit=20)
+            events = _events(rows)
             online = bool(rows[-1][5]) if rows else False
         else:
             rollup_rows = _summary_rows(con, source, device_id, since, now)
             summary = _derive_summary_rollup(rollup_rows, bucket_s)
-            events = _events_from_rollups(rollup_rows)[:20]
+            events = _events_from_rollups(rollup_rows)
             online = bool(rollup_rows[-1][2] >= rollup_rows[-1][1]) \
                 if rollup_rows else False
         volumes = _volume_series(con, device_id, since, now, step, source)
         signals = _signal_series(con, device_id, now, window_s)
+        stored = _stored_annotations(con, device_id, since, now)
     finally:
         con.close()
     state = live.get(device_id, {})
@@ -1517,12 +1654,32 @@ def metrics_series(device_id, window=DEFAULT_WINDOW, requested_step=None, now=No
         "online": state.get("online", online),
         "last_seen": state.get("last_seen", int(meta[3])),
     }
+    # Annotations are chart markers; manual ones also become Events rows.
+    events = events + [
+        {"ts": annotation["ts"], "type": "annotation",
+         "kind": annotation["kind"], "text": annotation["text"]}
+        for annotation in stored
+    ]
+    events.sort(key=lambda event: event["ts"], reverse=True)
+    annotations = stored + [
+        {"id": None, "device": device_id, "ts": event["ts"],
+         "kind": "restart", "text": "Restart detected", "auto": True}
+        for event in events if event["type"] == "restart"
+    ][:MAX_AUTO_ANNOTATIONS]
+    annotations.sort(key=lambda annotation: annotation["ts"])
+
     payload["summary"] = summary
     payload["points"] = points
     payload["bands"] = bands
     payload["volumes"] = volumes
     payload["signals"] = signals
-    payload["events"] = events
+    payload["annotations"] = annotations
+    payload["events"] = events[:20]
+    payload["warnings"] = evaluate_warnings({
+        **summary,
+        "online": payload["device"]["online"],
+        "last_seen": payload["device"]["last_seen"],
+    }, now)
     return payload
 
 
@@ -1539,6 +1696,14 @@ def stats():
     availability = availability_24h(now)
     for device in devices:
         device["availability_24h"] = availability.get(device["id"])
+        # The rail indicator is deliberately the cheap live subset: no history
+        # scan on a 5 s poll. The metrics page carries the full warning set.
+        warnings = live_warnings(device, now)
+        device["warning_count"] = len(warnings)
+        device["warning_level"] = (
+            "critical" if any(warning["level"] == "critical" for warning in warnings)
+            else ("warning" if warnings else None)
+        )
     body = {"generated": int(now), "devices": devices}
     with _lock:
         _cache["at"] = now
@@ -1786,6 +1951,52 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "missing or empty url"}, 400)
             record_hit(url)
             return self._send(204, b"")
+        if path == "/api/annotations":
+            sent = self.headers.get("X-Dash-Token", "")
+            if TOKEN and not hmac.compare_digest(sent.encode(), TOKEN.encode()):
+                return self._json({"error": "bad token"}, 401)
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length > 4096:
+                    return self._json({"error": "payload too large"}, 413)
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except Exception as exc:  # noqa: BLE001
+                return self._json({"error": f"bad payload: {exc}"}, 400)
+            if not isinstance(payload, dict):
+                return self._json({"error": "bad payload"}, 400)
+            kind = payload.get("kind", "note")
+            if kind not in ANNOTATION_KINDS:
+                return self._json({"error": "bad kind"}, 400)
+            text = payload.get("text")
+            if not isinstance(text, str) or not text.strip():
+                return self._json({"error": "missing text"}, 400)
+            text = text.strip()[:MAX_ANNOTATION_TEXT]
+            device_id = payload.get("device", "")
+            if device_id is None:
+                device_id = ""
+            if not isinstance(device_id, str):
+                return self._json({"error": "bad device"}, 400)
+            device_id = device_id.strip()[:80]
+            raw_ts = payload.get("ts")
+            if raw_ts is None:
+                ts = int(time.time())
+            else:
+                ts = _metric_number(raw_ts, int)
+                if ts is None:
+                    return self._json({"error": "bad ts"}, 400)
+            with _db_lock:
+                con = _connect_metrics()
+                try:
+                    cur = con.execute(
+                        "INSERT INTO annotations (device_id, ts, kind, text) "
+                        "VALUES (?, ?, ?, ?)",
+                        (device_id, ts, kind, text),
+                    )
+                    con.commit()
+                    annotation_id = cur.lastrowid
+                finally:
+                    con.close()
+            return self._json({"ok": True, "id": annotation_id}, 201)
         if not path.startswith("/api/push/"):
             return self._send(404, "not found", "text/plain; charset=utf-8")
         sent = self.headers.get("X-Dash-Token", "")

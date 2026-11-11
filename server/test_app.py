@@ -362,6 +362,18 @@ class PushTokenTest(ApiTestCase):
             self.assertEqual(self.push(self.TOKEN)[0], 200)
         self.assertTrue(spy.called, "push token is compared with a plain ==")
 
+    def test_the_annotation_endpoint_uses_the_same_token(self):
+        payload = json.dumps({"kind": "deploy", "text": "v1.2"}).encode()
+        self.assertEqual(self.post(payload, path="/api/annotations")[0], 401)
+        self.assertEqual(
+            self.post(payload, path="/api/annotations",
+                      headers={"X-Dash-Token": "wrong"})[0], 401
+        )
+        self.assertEqual(
+            self.post(payload, path="/api/annotations",
+                      headers={"X-Dash-Token": self.TOKEN})[0], 201
+        )
+
     def test_every_volume_is_stored_and_the_fullest_drives_the_summary(self):
         status, _ = self.push_payload({
             "kind": "pc",
@@ -1926,6 +1938,158 @@ class MetricsHistoryTest(ApiTestCase):
         self.assertEqual(len(rows), 1)
         self.assertGreaterEqual(rows[0][1], self.BASE - 60)
 
+    # ---------- annotations ----------
+
+    def post_annotation(self, payload, headers=None):
+        return self.post(json.dumps(payload).encode(),
+                         path="/api/annotations", headers=headers)
+
+    def stored_annotations(self):
+        con = app._connect_metrics()
+        try:
+            return con.execute(
+                "SELECT device_id, ts, kind, text FROM annotations ORDER BY ts"
+            ).fetchall()
+        finally:
+            con.close()
+
+    def test_annotation_endpoint_stores_a_note_and_validates_input(self):
+        status, body = self.post_annotation({
+            "device": "docker01", "kind": "deploy", "text": "v1.2",
+            "ts": self.BASE,
+        })
+        self.assertEqual(status, 201)
+        self.assertTrue(json.loads(body)["id"])
+        self.assertEqual(self.stored_annotations(),
+                         [("docker01", self.BASE, "deploy", "v1.2")])
+
+        self.assertEqual(self.post_annotation({"kind": "party", "text": "x"})[0], 400)
+        self.assertEqual(self.post_annotation({"kind": "deploy", "text": "  "})[0], 400)
+        self.assertEqual(
+            self.post_annotation({"kind": "deploy", "text": "x", "ts": "soon"})[0],
+            400,
+        )
+        self.assertEqual(
+            self.post_annotation({"kind": "deploy", "text": "x", "device": 7})[0],
+            400,
+        )
+        oversized = {"kind": "deploy", "text": "x" * 5000}
+        self.assertEqual(self.post_annotation(oversized)[0], 413)
+
+    def test_annotations_appear_in_the_window_events_and_as_markers(self):
+        self.sample([self.device()], now=self.BASE + 60)
+        self.post_annotation({"device": "docker01", "kind": "deploy",
+                              "text": "rolled out", "ts": self.BASE})
+        self.post_annotation({"kind": "backup", "text": "nightly backup",
+                              "ts": self.BASE + 30})
+        self.post_annotation({"device": "agent:other", "kind": "note",
+                              "text": "other device", "ts": self.BASE + 40})
+        self.post_annotation({"device": "docker01", "kind": "note",
+                              "text": "too old", "ts": self.BASE - 7200})
+
+        payload = app.metrics_series(
+            "docker01", "1h", 60, now=self.BASE + 60
+        )
+        self.assertEqual(
+            [(a["kind"], a["text"], a["auto"]) for a in payload["annotations"]],
+            [("deploy", "rolled out", False), ("backup", "nightly backup", False)],
+        )
+        annotation_events = [
+            event for event in payload["events"] if event["type"] == "annotation"
+        ]
+        self.assertEqual({event["text"] for event in annotation_events},
+                         {"rolled out", "nightly backup"})
+
+    def test_detected_restarts_become_auto_annotations(self):
+        self.sample([self.device(uptime=5000)], now=self.BASE)
+        self.sample([self.device(uptime=40)], now=self.BASE + 60)
+
+        payload = app.metrics_series(
+            "docker01", "1h", 60, now=self.BASE + 60
+        )
+        auto = [a for a in payload["annotations"] if a["auto"]]
+        self.assertEqual(len(auto), 1)
+        self.assertEqual(auto[0]["kind"], "restart")
+        self.assertEqual(auto[0]["ts"], self.BASE + 60)
+        self.assertEqual(self.stored_annotations(), [])
+
+    def test_auto_restart_markers_are_bounded(self):
+        for index in range(50):
+            self.sample([self.device(uptime=1000 if index % 2 == 0 else 10)],
+                        now=self.BASE + index * 60)
+        payload = app.metrics_series(
+            "docker01", "1h", 60, now=self.BASE + 3000
+        )
+        auto = [a for a in payload["annotations"] if a["auto"]]
+        self.assertGreater(len(auto), 0)
+        self.assertLessEqual(len(auto), app.MAX_AUTO_ANNOTATIONS)
+
+    # ---------- curated warnings ----------
+
+    def test_warning_levels_cover_the_five_signals(self):
+        warnings = app.evaluate_warnings({
+            "disk_pct": 96.0,
+            "days_to_90": 2.0,
+            "disk_growth_per_day": 6.0,
+            "mem_pct": 92.0,
+            "online": False,
+            "last_seen": self.BASE - 7200,
+        }, now=self.BASE)
+        levels = {warning["code"]: warning["level"] for warning in warnings}
+        self.assertEqual(levels, {
+            "disk": "critical",
+            "days_to_90": "critical",
+            "growth": "critical",
+            "mem": "warning",
+            "offline": "critical",
+        })
+        for warning in warnings:
+            self.assertTrue(warning["text"])
+
+    def test_a_healthy_device_has_no_warnings(self):
+        self.assertEqual(app.evaluate_warnings({
+            "disk_pct": 40.0, "days_to_90": None,
+            "disk_growth_per_day": None, "mem_pct": 30.0,
+            "online": True, "last_seen": self.BASE,
+        }, now=self.BASE), [])
+
+    def test_summary_and_series_carry_warnings(self):
+        device_id = "agent:gone"
+        self.sample([self.device(device_id, disk=96.0, mem=95.0, online=False)],
+                    now=self.BASE)
+
+        summary = app.metrics_summary("24h", now=self.BASE + 7200)["devices"][0]
+        codes = {warning["code"] for warning in summary["warnings"]}
+        self.assertEqual(codes, {"disk", "mem", "offline"})
+
+        series = app.metrics_series(
+            device_id, "24h", 300, now=self.BASE + 7200
+        )
+        self.assertEqual(
+            {warning["code"] for warning in series["warnings"]},
+            {"disk", "mem", "offline"},
+        )
+
+    def test_live_warnings_are_the_cheap_rail_subset(self):
+        warnings = app.live_warnings({
+            "disk_pct": 96.0, "mem_pct": 95.0,
+            "online": True, "last_seen": self.BASE,
+        }, now=self.BASE)
+        self.assertEqual({warning["code"] for warning in warnings},
+                         {"disk", "mem"})
+
+        status, _ = self.post(json.dumps({
+            "name": "warnpc", "kind": "pc", "disk_pct": 96.0,
+            "mem_pct": 95.0, "cpu_pct": 1.0,
+        }).encode(), path="/api/push/warnpc")
+        self.assertEqual(status, 200)
+        app._cache.update(at=0.0, body=None)
+        with frozen_time(self.BASE):
+            payload = app.stats()
+        agent = next(d for d in payload["devices"] if d["id"] == "agent:warnpc")
+        self.assertEqual(agent["warning_count"], 2)
+        self.assertEqual(agent["warning_level"], "critical")
+
 
 class MetricsPageSourceTest(FrontEndSourceTest):
     """The metrics page, chart markup and deploy wiring, asserted at the source."""
@@ -2194,3 +2358,44 @@ class MetricsSignalsSourceTest(FrontEndSourceTest):
         self.assertRegex(self.metrics_css, r"\.signal-strip\s*\{")
         self.assertRegex(self.metrics_css, r"\.signal-tile\s*\{")
         self.assertRegex(self.metrics_css, r"\.signal-spark\s*\{")
+
+
+class MetricsAnnotationsWarningsSourceTest(FrontEndSourceTest):
+    """Phase 4: warning banner, chart markers and annotation Events rows."""
+
+    def setUp(self):
+        super().setUp()
+        self.metrics_html = (APP_JS.parent / "metrics.html").read_text()
+        self.metrics_js = (APP_JS.parent / "metrics.js").read_text()
+        self.metrics_css = (APP_JS.parent / "metrics.css").read_text()
+
+    def test_warning_banner_lists_active_warnings_and_hides_when_clean(self):
+        self.assertIn('id="warning-banner"', self.metrics_html)
+        body = function_body(self.metrics_js, "renderWarnings")
+        self.assertIn("device.warnings", body)
+        self.assertIn("warningBannerEl.hidden", body)
+        self.assertIn("warning.level", body)
+        self.assertIn("warning.text", body)
+        self.assertIn("renderWarnings()", function_body(self.metrics_js, "load"))
+
+    def test_chart_draws_annotation_markers(self):
+        body = function_body(self.metrics_js, "renderChart")
+        self.assertIn("series.annotations", body)
+        self.assertIn("chart-marker", body)
+        self.assertIn("annotation.text", body)
+
+    def test_events_show_manual_annotations(self):
+        body = function_body(self.metrics_js, "eventItem")
+        self.assertIn("event.type === 'annotation'", body)
+        self.assertIn("event.kind", body)
+        self.assertIn("event.text", body)
+        self.assertIn("is-annotation", self.metrics_css)
+        self.assertRegex(self.metrics_css, r"\.chart-marker\s*\{")
+        self.assertRegex(self.metrics_css, r"\.warning-banner\s*\{")
+
+    def test_dashboard_rail_shows_a_compact_warning_count(self):
+        row = function_body(self.source, "deviceRow")
+        self.assertIn("warning_count", row)
+        self.assertIn("device-warn", row)
+        self.assertIn("warning_count", function_body(self.source, "networkKey"))
+        self.assertRegex(self.css, r"\.device-warn\s*\{")

@@ -623,12 +623,19 @@ function deviceRow(d) {
     const online = !!d.online;
     const state = online ? 'online' : 'offline';
     const availability = deviceAvailability(d);
+    const warningCount = Number(d.warning_count) || 0;
+    const warningLevel = d.warning_level === 'critical' ? 'critical' : 'warning';
+    const warning = warningCount
+        ? '<span class="device-warn is-' + warningLevel + '" title="' +
+          warningCount + ' active warning(s)">' + warningCount + 'w</span>'
+        : '';
     return '<div class="device-row ' + state + '" data-device-id="' + escapeHtml(deviceKey(d)) + '">' +
         '<div class="device-id">' +
         '<span class="device-dot ' + state + '" aria-hidden="true"></span>' +
         '<span class="device-text">' +
         '<span class="device-name-row">' +
         '<span class="device-name">' + escapeHtml(d.name) + '</span>' +
+        warning +
         '<span class="device-avail"' + (availability ? ' title="24h availability"' : ' hidden') + '>' +
         availability + '</span>' +
         '</span>' +
@@ -665,7 +672,8 @@ function diskKey(d) {
 }
 
 function networkKey(devices) {
-    return devices.map((d) => deviceKey(d) + ':' + (d.kind || '') + ':' + diskKey(d)).join('|');
+    return devices.map((d) => deviceKey(d) + ':' + (d.kind || '') + ':' + diskKey(d) +
+        ':' + (d.warning_count || 0) + ':' + (d.warning_level || '')).join('|');
 }
 
 function patchMetric(cell, raw) {

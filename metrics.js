@@ -39,6 +39,7 @@ const healthDotEl = document.getElementById('health-dot');
 const healthTextEl = document.getElementById('health-text');
 const rangeTabsEl = document.getElementById('range-tabs');
 const statGridEl = document.getElementById('stat-grid');
+const warningBannerEl = document.getElementById('warning-banner');
 const staleEl = document.getElementById('metrics-stale');
 const chartTitleEl = document.getElementById('chart-title');
 const chartSubEl = document.getElementById('chart-sub');
@@ -334,6 +335,29 @@ function renderTiles() {
             diskFlag);
 }
 
+// ---------- warnings ----------
+
+function renderWarnings() {
+    const devices = (summary && summary.devices) || [];
+    const rows = [];
+    devices.forEach((device) => {
+        (device.warnings || []).forEach((warning) => {
+            rows.push('<li class="warning-row is-' + escapeHtml(warning.level) + '">' +
+                '<span class="warning-device">' + escapeHtml(device.name) + '</span>' +
+                '<span class="warning-text">' + escapeHtml(warning.text) + '</span>' +
+                '</li>');
+        });
+    });
+    warningBannerEl.hidden = rows.length === 0;
+    warningBannerEl.innerHTML = rows.length
+        ? '<div class="warning-head">' +
+            '<h2 class="card-heading">Warnings</h2>' +
+            '<span class="card-sub">' + rows.length + ' active</span>' +
+          '</div>' +
+          '<ul class="warning-list">' + rows.join('') + '</ul>'
+        : '';
+}
+
 // ---------- device rail ----------
 
 function sparkSvg(values) {
@@ -364,11 +388,17 @@ function deviceItem(device) {
         : '—';
     // State is text as well as a dot: colour and opacity never carry it alone.
     const stateText = kindLabel(device.kind) + ' · ' + (device.online ? 'online' : 'offline');
+    const warningCount = Array.isArray(device.warnings) ? device.warnings.length : 0;
+    const warning = warningCount
+        ? '<span class="device-item-warn" title="' + warningCount +
+          ' active warning(s)">' + warningCount + 'w</span>'
+        : '';
     return '<button type="button" class="device-item' + (selected ? ' is-selected' : '') + '" ' +
         'data-device="' + escapeHtml(device.id) + '" aria-pressed="' + String(selected) + '">' +
         '<span class="device-item-head">' +
         '<span class="device-dot ' + state + '" aria-hidden="true"></span>' +
         '<span class="device-item-name">' + escapeHtml(device.name) + '</span>' +
+        warning +
         '<span class="device-item-avail" title="Availability over ' + escapeHtml(activeRange) + '">' +
         availability + '</span>' +
         '</span>' +
@@ -541,6 +571,17 @@ function renderChart() {
         'x2="' + (width - pad.right) + '" y2="' + yOf(value).toFixed(1) + '"/>'
     ).join('');
 
+    const annotations = (series && series.annotations) || [];
+    const markers = annotations.map((annotation) => {
+        if (annotation.ts < first || annotation.ts > last) return '';
+        const x = xOf(annotation.ts).toFixed(1);
+        return '<line class="chart-marker is-' + escapeHtml(annotation.kind) + '" ' +
+            'x1="' + x + '" y1="' + pad.top + '" x2="' + x + '" ' +
+            'y2="' + (height - pad.bottom) + '">' +
+            '<title>' + escapeHtml(annotation.kind + ': ' + annotation.text) +
+            '</title></line>';
+    }).join('');
+
     const bands = (series && series.bands) || {};
     const bandMarks = SERIES.map((item) =>
         '<path class="chart-band is-' + item.key + '" d="' +
@@ -561,7 +602,7 @@ function renderChart() {
 
     chartEl.innerHTML =
         '<svg class="chart-svg" viewBox="0 0 ' + width + ' ' + height + '" ' +
-        'preserveAspectRatio="none" aria-hidden="true">' + grid + bandMarks + lines + dots + '</svg>' +
+        'preserveAspectRatio="none" aria-hidden="true">' + grid + markers + bandMarks + lines + dots + '</svg>' +
         '<span class="chart-crosshair" hidden></span>' +
         '<span class="chart-hover-dots" hidden>' + SERIES.map((item) =>
             '<span class="chart-hover-dot is-' + item.key + '" data-series-key="' + item.key +
@@ -745,6 +786,15 @@ function renderTable() {
 }
 
 function eventItem(event) {
+    if (event.type === 'annotation') {
+        return '<li class="event is-annotation is-' + escapeHtml(event.kind) + '">' +
+            '<span class="event-mark" aria-hidden="true">◆</span>' +
+            '<span class="event-body">' +
+            '<span class="event-label">' + escapeHtml(event.kind) + ' · ' +
+            escapeHtml(event.text) + '</span>' +
+            '<span class="event-time">' + escapeHtml(hhmm(event.ts)) + '</span>' +
+            '</span></li>';
+    }
     if (event.type === 'offline') {
         return '<li class="event is-offline">' +
             '<span class="event-mark" aria-hidden="true">▼</span>' +
@@ -785,6 +835,7 @@ async function load(full) {
             const ids = summary.devices.map((device) => device.id);
             if (!selectedId || !ids.includes(selectedId)) selectedId = ids[0] || null;
             renderTiles();
+            renderWarnings();
             renderDevices();
             renderHealth();
             syncUrl();

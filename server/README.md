@@ -37,7 +37,8 @@ a main column (Jump back in, Launchpad, All tools) and a Network rail. There is 
 | `/api/metrics/summary` | GET | per-device availability, averages, events, disk trend, compact volume and latest-signal summaries, and a CPU sparkline; long windows read rollups |
 | `/api/metrics` | GET | one device's bucketed history, min/max bands, per-volume series and recent signals: `?device=<id>&window=1h\|6h\|24h\|7d\|30d\|90d\|1y&step=<s>` |
 | `/api/hit` | POST | record a bookmark click (`{"url": "..."}` → `204`, no body) |
-| `/api/push/<name>` | POST | agent heartbeat, needs `X-Dash-Token`; optionally carries `disks` |
+| `/api/push/<name>` | POST | agent heartbeat, needs `X-Dash-Token`; optionally carries `disks` and extra signals |
+| `/api/annotations` | POST | record a deploy/restart/backup/note marker, needs `X-Dash-Token` |
 
 Reads are behind the Caddy basic-auth password on the tailnet. `/api/push/*` is the only
 path exempt from that password and uses `X-Dash-Token` instead — a leaked push token can
@@ -82,6 +83,22 @@ can answer "is this normal, and since when?" rather than only "what is it now?".
   received — missing signals are never rendered as zero. Swap percentage is
   derived on read as `swap_used / swap_total`; a host with no swap reports
   total 0 and therefore no swap signal.
+- **Annotations are SQLite rows, not derived.** `POST /api/annotations` stores
+  `(device_id, ts, kind, text)`; `kind` is one of `deploy`, `restart`, `backup`
+  or `note`, and an empty `device_id` means fleet-wide. It uses the same
+  `X-Dash-Token` as `/api/push` (constant-time compare) and is capped at 4 KB
+  and 200 characters. The metrics payload returns annotations in the requested
+  window for the selected device plus fleet-wide ones, and adds detected
+  restarts as `auto: true`, `kind: "restart"` markers without storing a row.
+  Manual annotations also become `type: "annotation"` Events rows; restarts
+  already have their own row.
+- **Warnings are evaluated server-side.** `evaluate_warnings()` turns the
+  summary fields into `{code, level, value, threshold, text}` entries for disk
+  percent, days-to-90, disk growth, RAM and offline duration. Warning and
+  critical levels are derived from the env thresholds below; `/api/metrics`
+  and `/api/metrics/summary` carry the full list. `/api/stats` carries only the
+  cheap live subset (`disk`, `mem`, `offline`) as `warning_count` /
+  `warning_level`, so the dashboard rail never pays for a history scan.
 - **Two rollup tiers.** `rollup_5m` and `rollup_1h` (plus the matching
   `disk_rollup_5m` / `disk_rollup_1h` for volumes) store `samples`,
   `online_samples`, per-series average/min/max and the uptime first/last/min
@@ -142,6 +159,11 @@ The Metrics page (`/metrics.html`) uses the same data:
 - a compact signal strip (load 1/5/15, swap, net RX/TX, I/O wait, steal) with
   sparklines, fed by the extra-signal API. It never joins the 0–100 chart and
   a signal the device did not send is absent rather than a zero tile;
+- a warning banner (device, text, warning/critical dot) above the chart, plus
+  a compact `nw` chip on each device row in the page rail. The dashboard's
+  Network rail shows the same live-only chip from `/api/stats`;
+- dashed chart markers for every annotation in the window, with the note on
+  the SVG `<title>`, and an Events row for each manual annotation;
 - a fleet summary (online count, average availability, peak CPU, disk
   pressure), a device list with 5-minute CPU sparklines, and an events rail
   (offline / back online / restarted, newest first).
@@ -157,6 +179,11 @@ DASH_SAMPLE_SECONDS=60    # sampler cadence, minimum 5
 DASH_HISTORY_DAYS=30      # raw-sample and raw volume retention
 DASH_ROLLUP_5M_DAYS=30    # 5-minute rollup retention (7d/30d windows)
 DASH_ROLLUP_1H_DAYS=366   # hourly rollup retention (90d/1y windows)
+DASH_WARN_DISK_PCT=85     # disk warning line; critical is +10, capped at 99
+DASH_WARN_DAYS_TO_90=14   # days-to-90 warning line; critical is warn/4
+DASH_WARN_GROWTH=1.0      # disk growth %/day warning; critical is 5x
+DASH_WARN_MEM_PCT=90      # RAM warning line; critical is +7, capped at 99
+DASH_WARN_OFFLINE_S=600   # offline warning; critical is 6x
 ```
 
 ## Workbench UI
@@ -417,10 +444,12 @@ a step, min/max bands and a derived summary; 7d/30d route through `rollup_5m` an
 90d/1y through `rollup_1h`; all four rollup tables contain rows; a push with a `disks`
 array becomes per-volume series with growth/day and days-to-90 and a compact summary,
 an oversized list is capped at 16; a push with extra signals exposes load/swap/network/
-CPU pressure, while an old payload still works and gains no synthetic zeros; unknown
-windows/devices are rejected; hits, metrics history, per-volume history **and**
-extra-signal history survive a full process restart; and the click feature sets no
-cookie and makes no third-party request. It also guards the compose/README path documentation below and the
+CPU pressure, while an old payload still works and gains no synthetic zeros; a deploy
+annotation becomes a marker and Events row; server-side warnings flag disk and RAM;
+a detected restart becomes an auto marker; unknown windows/devices are rejected; hits,
+metrics history, per-volume history, extra-signal history **and** annotations survive
+a full process restart; and the click feature sets no cookie and makes no third-party
+request. It also guards the compose/README path documentation below and the
 Workbench UI, breakpoint and check documentation above.
 
 ## Click-history durability
@@ -524,3 +553,12 @@ ok 14 - metrics history survived a full server restart (first sample 1794320920)
   `\Network Interface(*)\Bytes Received/sec` differ by OS language, which is why
   the PowerShell agent treats them as optional. Never make a missing counter a
   hard failure; omit the keys instead.
+- **Auto restart annotations are derived, not stored.** They come from the same
+  restart transition detection as the Events rail, so they appear for long
+  windows via rollups without a write per restart. Manual annotations are the
+  only rows in the `annotations` table; a deployment note with `device: ""`
+  intentionally shows on every device's chart.
+- **The rail warning chip is live-only.** `/api/stats` evaluates only the fields
+  already in the live payload, so days-to-90 and growth warnings exist on the
+  metrics page but not on the dashboard rail. Do not add a history scan to the
+  5 s stats poll just to complete the chip; use the metrics summary instead.

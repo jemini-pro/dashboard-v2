@@ -748,6 +748,22 @@ body {
     color: var(--muted);
 }
 
+.device-warn {
+    flex: none;
+    padding: 0 4px;
+    border-radius: 999px;
+    background: rgba(183, 121, 31, 0.16);
+    font-size: 0.5rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+    white-space: nowrap;
+}
+
+.device-warn.is-critical {
+    background: rgba(197, 48, 48, 0.16);
+}
+
 .device-avail[hidden] {
     display: none;
 }
