@@ -1482,4 +1482,10 @@ class MetricsPageSourceTest(FrontEndSourceTest):
         deploy = (Path(__file__).resolve().parent / "deploy.sh").read_text()
         for name in ("metrics.html", "metrics.js", "metrics.css"):
             self.assertIn(name, deploy)
-        self.assertIn("metrics.html", deploy.split('say "smoke"', 1)[1])
+        smoke = deploy.split('say "smoke"', 1)[1]
+        self.assertIn("metrics.html", smoke)
+        # A bind-mounted app.py does not reload on its own, so the deploy must
+        # recreate the container; the smoke test must also prove the API is
+        # live, not just that the static page was installed.
+        self.assertIn("--force-recreate", deploy)
+        self.assertIn("/api/metrics/summary", smoke)

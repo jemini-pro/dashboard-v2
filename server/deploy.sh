@@ -75,6 +75,12 @@ cp -a "$BUILD/fonts/." "$STACK/dash/static/fonts/"
 install -m 0644 "$BUILD/server/Caddyfile" "$STACK/caddy/Caddyfile"
 install -m 0644 "$BUILD/server/docker-compose.yml" "$STACK/docker-compose.yml"
 
+# The metrics page is three extra files next to index.html. Fail here rather
+# than at the smoke test if one of them never reached the static directory.
+for f in metrics.html metrics.js metrics.css; do
+    [ -s "$STACK/dash/static/$f" ] || die "install left $f missing from $STACK/dash/static"
+done
+
 mkdir -p "$STACK/dash/data"
 if [ ! -f "$STACK/dash/data/bookmarks.json" ]; then
     cp "$BUILD/server/bookmarks.seed.json" "$STACK/dash/data/bookmarks.json"
@@ -93,7 +99,11 @@ if grep -RqsE 'calendar\.google\.com|fonts\.googleapis\.com|fonts\.gstatic\.com'
 fi
 
 say "up"
-( cd "$STACK" && DASH_BIND=10.10.10.20 docker compose up -d --remove-orphans )
+# Every service change here is a bind-mounted file, and compose only recreates
+# a container when its own config changes. Without --force-recreate the deploy
+# happily installs a new app.py while the old process keeps serving the code it
+# loaded at start-up, so a new API route 404s after a "successful" deploy.
+( cd "$STACK" && DASH_BIND=10.10.10.20 docker compose up -d --remove-orphans --force-recreate )
 
 say "smoke"
 HEALTHY=0
@@ -110,15 +120,37 @@ if [ "$HEALTHY" -ne 1 ]; then
     die "dash did not become healthy; rollback: tar -xzf $BACKUP -C $STACK && (cd $STACK && docker compose up -d)"
 fi
 docker compose -f "$STACK/docker-compose.yml" exec -T dash python - <<'PY' || {
+import json
+import time
 import urllib.request
-html = urllib.request.urlopen("http://127.0.0.1:8000/").read().decode()
+
+
+def fetch(path):
+    return urllib.request.urlopen("http://127.0.0.1:8000" + path).read().decode()
+
+
+html = fetch("/")
 assert "__BOOKMARKS_JSON__" not in html, "bookmark placeholder was not replaced"
 assert 'id="bookmarks-data"' in html, "bookmark data script is missing"
-metrics = urllib.request.urlopen("http://127.0.0.1:8000/metrics.html").read().decode()
+metrics = fetch("/metrics.html")
 assert "Metrics" in metrics and "metrics.js" in metrics, "metrics page is missing"
-print("page ok")
+
+# The static page says nothing about the running process. Hit the sampler's
+# API too, or a stale container that never loaded the new app.py still passes.
+summary = None
+for _ in range(30):
+    try:
+        summary = json.loads(fetch("/api/metrics/summary?window=1h"))
+        if summary.get("devices"):
+            break
+    except Exception:
+        pass
+    time.sleep(0.5)
+assert summary is not None and summary.get("devices"), \
+    "metrics API is not serving samples (old app.py still running?)"
+print("page and metrics api ok")
 PY
-    die "page render check failed; rollback: tar -xzf $BACKUP -C $STACK && (cd $STACK && docker compose up -d)"
+    die "page/API render check failed; rollback: tar -xzf $BACKUP -C $STACK && (cd $STACK && docker compose up -d)"
 }
 CODE="$(curl -s -o /dev/null -w '%{http_code}' http://10.10.10.20:8448/ || true)"
 if [ "$CODE" != "401" ]; then
