@@ -314,6 +314,56 @@ function deviceItem(device) {
         '</button>';
 }
 
+// Same containment tree as the dashboard rail: the host, its LXC guests
+// (including the Docker host and its containers), then standalones.
+function metricsTree(devices) {
+    const stack = window.dashboardStack.group(devices, summary && summary.topology);
+    const item = (device) => '<div class="network-node">' + deviceItem(device) + '</div>';
+    let html = '<div class="network-tree">';
+
+    let guests = '';
+    if (stack.dockerHost) {
+        guests += '<div class="network-node is-docker">' +
+            deviceItem(stack.dockerHost) +
+            window.dashboardStack.dockerEngine(stack.containers) +
+            '</div>';
+    }
+    stack.guests.forEach((guest) => {
+        guests += item(guest);
+    });
+
+    if (stack.host) {
+        let hostBody = item(stack.host);
+        if (guests) {
+            hostBody += window.dashboardStack.branch(
+                'LXC guests',
+                'on ' + stack.host.name,
+                guests,
+                'is-guests'
+            );
+        }
+        html += window.dashboardStack.branch(
+            'PVE host',
+            'physical · ' + stack.host.name,
+            hostBody,
+            'is-host'
+        );
+    } else if (guests) {
+        html += window.dashboardStack.branch('LXC guests', 'on pve', guests, 'is-guests');
+    }
+
+    if (stack.others.length) {
+        html += window.dashboardStack.branch(
+            'Elsewhere',
+            'standalone',
+            stack.others.map(item).join(''),
+            'is-elsewhere'
+        );
+    }
+
+    return html + '</div>';
+}
+
 function renderDevices() {
     const devices = (summary && summary.devices) || [];
     if (!devices.length) {
@@ -321,7 +371,7 @@ function renderDevices() {
         devicesSubEl.textContent = '';
         return;
     }
-    deviceListEl.innerHTML = devices.map(deviceItem).join('');
+    deviceListEl.innerHTML = metricsTree(devices);
     const online = devices.filter((device) => device.online).length;
     devicesSubEl.textContent = online + '/' + devices.length + ' online';
 }

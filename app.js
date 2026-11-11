@@ -45,7 +45,6 @@ const resultCountEl = document.getElementById('result-count');
 const mostUsedEl = document.getElementById('most-used');
 const launchpadGridEl = document.getElementById('launchpad-grid');
 const deviceGridEl = document.getElementById('device-grid');
-const kindChipsEl = document.getElementById('kind-chips');
 const networkSummaryEl = document.getElementById('network-summary');
 const networkUpdatedEl = document.getElementById('network-updated');
 const networkStaleEl = document.getElementById('network-stale');
@@ -59,6 +58,9 @@ let currentTheme = null;
 let bookmarksRendered = false;
 let bookmarkStore = [];
 let networkDevices = [];
+// The server describes pve -> docker01 -> Docker in the same payload; null
+// until the first successful poll, so the tree can fall back to device kinds.
+let networkTopology = null;
 // Keyed by device identity so a poll can patch existing rows, and null until
 // the first successful payload so the initial "Loading devices…" is replaced.
 let networkDeviceKey = null;
@@ -472,16 +474,6 @@ function kindRank(kind) {
     return index === -1 ? KIND_ORDER.length : index;
 }
 
-function groupDevicesByKind(devices) {
-    const groups = {};
-    devices.forEach((d) => {
-        const key = d.kind || 'other';
-        if (!groups[key]) groups[key] = [];
-        groups[key].push(d);
-    });
-    return groups;
-}
-
 // Kind and summary averages include online devices with a real numeric sample
 // only; offline readings and nulls never drag the average toward zero.
 function averageSample(devices, field) {
@@ -509,28 +501,6 @@ function networkSummary(devices) {
     // The avg CPU part is always present; a missing sample reads as an em dash.
     return online + '/' + total + ' online · ' +
         avgText(averageSample(devices, 'cpu_pct')) + ' avg CPU';
-}
-
-// One helper owns the "cpu · ram" chip meta for both the full render and the
-// in-place poll patch.
-function chipMeta(group) {
-    return avgText(averageSample(group, 'cpu_pct')) + ' cpu · ' +
-        avgText(averageSample(group, 'mem_pct')) + ' ram';
-}
-
-function kindChips(devices) {
-    const groups = groupDevicesByKind(devices);
-    return Object.keys(groups)
-        .sort((a, b) => kindRank(a) - kindRank(b))
-        .map((key) => {
-            const group = groups[key];
-            return '<div class="kind-chip" data-kind="' + escapeHtml(key) + '">' +
-                '<span class="kind-name">' + escapeHtml(kindLabel(key)) + '</span>' +
-                '<span class="kind-count">' + group.length + '</span>' +
-                '<span class="kind-meta">' + chipMeta(group) + '</span>' +
-                '</div>';
-        })
-        .join('');
 }
 
 // 24-hour HH:MM, independent of the browser locale (a 12-hour locale must not
@@ -647,12 +617,58 @@ function sortNetworkDevices(devices) {
     return devices.slice().sort((a, b) => kindRank(a.kind) - kindRank(b.kind));
 }
 
+// The rail's whole point is containment: PVE host, its LXC guests (with the
+// Docker host and its containers), then everything that is not on pve.
+function networkTree(devices, topology) {
+    const stack = window.dashboardStack.group(devices, topology);
+    let html = '<div class="network-tree">';
+
+    if (stack.host) {
+        html += window.dashboardStack.branch(
+            'PVE host',
+            'physical · ' + stack.host.name,
+            deviceRow(stack.host),
+            'is-host'
+        );
+    }
+
+    let guests = '';
+    if (stack.dockerHost) {
+        guests += '<div class="network-node is-docker">' +
+            deviceRow(stack.dockerHost) +
+            window.dashboardStack.dockerEngine(stack.containers) +
+            '</div>';
+    }
+    stack.guests.forEach((guest) => {
+        guests += '<div class="network-node">' + deviceRow(guest) + '</div>';
+    });
+    if (guests) {
+        html += window.dashboardStack.branch(
+            'LXC guests',
+            stack.host ? 'on ' + stack.host.name : 'on pve',
+            guests,
+            'is-guests'
+        );
+    }
+
+    const others = sortNetworkDevices(stack.others);
+    if (others.length) {
+        html += window.dashboardStack.branch(
+            'Elsewhere',
+            'standalone',
+            others.map(deviceRow).join(''),
+            'is-elsewhere'
+        );
+    }
+
+    return html + '</div>';
+}
+
 // Full render happens once and whenever the device set itself changes.
 function renderNetwork(devices) {
     networkDeviceKey = networkKey(devices);
-    kindChipsEl.innerHTML = kindChips(devices);
     deviceGridEl.innerHTML = devices.length
-        ? devices.map(deviceRow).join('')
+        ? networkTree(devices, networkTopology)
         : '<div class="device-empty">No devices reporting</div>';
     networkSummaryEl.textContent = networkSummary(devices);
 }
@@ -665,7 +681,13 @@ function diskKey(d) {
 }
 
 function networkKey(devices) {
-    return devices.map((d) => deviceKey(d) + ':' + (d.kind || '') + ':' + diskKey(d)).join('|');
+    const topology = networkTopology || {};
+    const containers = (topology.containers || [])
+        .map((container) => container.name + ':' + container.state + ':' + container.role)
+        .join(',');
+    return devices.map((d) => deviceKey(d) + ':' + (d.kind || '') + ':' + diskKey(d)).join('|') +
+        '||' + (topology.host_id || '') + ':' + (topology.docker_host_id || '') +
+        ':' + containers;
 }
 
 function patchMetric(cell, raw) {
@@ -685,14 +707,15 @@ function patchDisk(row, disk) {
     row.querySelector('.disk-size').textContent = fmtBytes(disk.total);
 }
 
-// The 10s poll changes values, not structure: existing device rows and kind
-// chips keep their elements so bars animate and nothing flickers.
+// The 10s poll changes values, not structure: existing rows keep their
+// elements so bars animate and nothing flickers. Rows are matched by device
+// id, not position, because the tree reorders them by containment.
 function patchNetwork(devices) {
     networkSummaryEl.textContent = networkSummary(devices);
 
-    const rows = deviceGridEl.querySelectorAll('.device-row');
-    rows.forEach((row, index) => {
-        const d = devices[index];
+    const byId = new Map(devices.map((device) => [deviceKey(device), device]));
+    deviceGridEl.querySelectorAll('.device-row').forEach((row) => {
+        const d = byId.get(row.getAttribute('data-device-id'));
         if (!d) return;
         const online = !!d.online;
         row.classList.toggle('online', online);
@@ -712,13 +735,6 @@ function patchNetwork(devices) {
         });
         const disks = Array.isArray(d.disks) ? d.disks : [];
         row.querySelectorAll('.disk-row').forEach((diskEl, i) => patchDisk(diskEl, disks[i]));
-    });
-
-    const groups = groupDevicesByKind(devices);
-    kindChipsEl.querySelectorAll('.kind-chip').forEach((chip) => {
-        const group = groups[chip.getAttribute('data-kind')] || [];
-        chip.querySelector('.kind-count').textContent = String(group.length);
-        chip.querySelector('.kind-meta').textContent = chipMeta(group);
     });
 }
 
@@ -750,6 +766,7 @@ async function refreshDevices() {
         if (!res.ok) throw new Error('HTTP ' + res.status);
         const data = await res.json();
         networkDevices = sortNetworkDevices(data.devices || []);
+        networkTopology = data.topology || null;
         networkUpdatedAt = data.generated || Math.floor(Date.now() / 1000);
         networkUpdatedEl.textContent = updatedLabel(networkUpdatedAt);
         setNetworkStale(false);

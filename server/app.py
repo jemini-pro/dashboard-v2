@@ -183,6 +183,36 @@ def local_device():
     }
 
 
+# Static Docker layer. server/docker-compose.yml defines exactly these two
+# services, so their names and roles are deployment facts rather than sampled
+# telemetry; container-level CPU/RAM would need a Docker socket or an agent.
+DOCKER_CONTAINERS = (
+    {"name": "caddy", "role": "reverse proxy · :8448", "state": "running"},
+    {"name": "dash", "role": "this dashboard · :8000", "state": "running"},
+)
+
+
+def stack_topology(devices):
+    """Describe where this dashboard runs: pve -> docker01 LXC -> Docker.
+
+    The page itself is served by the dash container through caddy, so both are
+    running whenever this payload can be read. Their names and roles are
+    static; the device ids are matched against the live list.
+    """
+    host = next(
+        (d for d in devices if d.get("kind") == "host" and d.get("name") == "pve"),
+        None,
+    )
+    if host is None:
+        host = next((d for d in devices if d.get("kind") == "host"), None)
+    docker_host = next((d for d in devices if d.get("id") == "docker01"), None)
+    return {
+        "host_id": host.get("id") if host else None,
+        "docker_host_id": docker_host.get("id") if docker_host else None,
+        "containers": [dict(c) for c in DOCKER_CONTAINERS] if docker_host else [],
+    }
+
+
 # ---------- push agents ----------
 
 def load_agents():
@@ -632,7 +662,7 @@ def metrics_summary(window=DEFAULT_WINDOW, now=None):
     window_s = _window_seconds(window) or METRIC_WINDOWS[DEFAULT_WINDOW]
     since = now - window_s
     payload = {"generated": int(now), "window": window, "window_s": window_s,
-               "devices": []}
+               "devices": [], "topology": stack_topology([])}
     if not METRICS_FILE.exists():
         return payload
     live = _live_state(now)
@@ -653,6 +683,7 @@ def metrics_summary(window=DEFAULT_WINDOW, now=None):
             })
     finally:
         con.close()
+    payload["topology"] = stack_topology(payload["devices"])
     return payload
 
 
@@ -712,7 +743,11 @@ def stats():
     availability = availability_24h(now)
     for device in devices:
         device["availability_24h"] = availability.get(device["id"])
-    body = {"generated": int(now), "devices": devices}
+    body = {
+        "generated": int(now),
+        "devices": devices,
+        "topology": stack_topology(devices),
+    }
     with _lock:
         _cache["at"] = now
         _cache["body"] = body

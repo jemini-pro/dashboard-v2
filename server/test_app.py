@@ -355,6 +355,40 @@ class PushTokenTest(ApiTestCase):
     def test_missing_token_is_rejected(self):
         self.assertEqual(self.push()[0], 401)
 
+    def test_stats_describes_the_pve_docker_stack(self):
+        self.push_payload({"name": "pve", "kind": "host"}, name="pve")
+        app._cache.update(at=0.0, body=None)
+
+        with frozen_time():
+            body = app.stats()
+
+        self.assertEqual(body["topology"]["host_id"], "agent:pve")
+        self.assertEqual(body["topology"]["docker_host_id"], "docker01")
+        self.assertEqual(
+            [container["name"] for container in body["topology"]["containers"]],
+            ["caddy", "dash"],
+        )
+        self.assertTrue(all(
+            container["state"] == "running"
+            for container in body["topology"]["containers"]
+        ))
+
+    def test_stats_without_a_host_agent_still_describes_the_docker_layer(self):
+        app._cache.update(at=0.0, body=None)
+
+        with frozen_time():
+            body = app.stats()
+
+        self.assertIsNone(body["topology"]["host_id"])
+        self.assertEqual(body["topology"]["docker_host_id"], "docker01")
+        self.assertEqual(len(body["topology"]["containers"]), 2)
+
+    def test_static_docker_containers_match_the_compose_services(self):
+        compose = (Path(__file__).resolve().parent / "docker-compose.yml").read_text()
+        for container in app.DOCKER_CONTAINERS:
+            self.assertIn("\n  " + container["name"] + ":", compose,
+                          "Docker container no longer matches a compose service")
+
     def test_token_compare_goes_through_hmac_compare_digest(self):
         with mock.patch("app.hmac.compare_digest", wraps=hmac.compare_digest) as spy:
             self.assertEqual(self.push(self.TOKEN)[0], 200)
@@ -1063,7 +1097,8 @@ class WorkbenchResponsiveTest(FrontEndSourceTest):
         root = APP_JS.parent
         self.assertFalse((root / "prototype").exists(), "prototype/ is still present")
 
-        for name in ("app.js", "index.html", "style.css"):
+        for name in ("app.js", "stack.js", "index.html", "style.css",
+                     "metrics.js", "metrics.html", "metrics.css"):
             text = (root / name).read_text()
             with self.subTest(file=name):
                 self.assertNotIn("?variant", text)
@@ -1117,24 +1152,47 @@ class NetworkCardTest(FrontEndSourceTest):
             function_body(self.js, "clampPct"),
         )
 
-    def test_kind_chips_show_count_and_online_numeric_averages(self):
-        body = function_body(self.js, "kindChips")
-        meta = function_body(self.js, "chipMeta")
-
-        self.assertIn("groupDevicesByKind(devices)", body)
-        self.assertIn("group.length", body)
-        # One helper owns the "cpu · ram" string for both the full render and
-        # the in-place poll patch.
-        self.assertIn("chipMeta(group)", body)
-        self.assertIn("averageSample(", meta)
-        self.assertIn("' cpu · '", meta)
-        self.assertIn("' ram'", meta)
-        self.assertIn("patchNetwork", self.js)
-        self.assertIn(
-            "chipMeta(group)", function_body(self.js, "patchNetwork")
+    def test_dashboard_loads_the_shared_stack_helper_before_app_js(self):
+        self.assertLess(
+            self.html.index('src="stack.js"'),
+            self.html.index('src="app.js"'),
         )
-        # A missing sample renders an em dash rather than 0%.
-        self.assertIn("'—'", function_body(self.js, "avgText"))
+        self.assertNotIn("kind-chips", self.html)
+
+    def test_network_tree_nests_pve_guests_and_the_docker_engine(self):
+        body = function_body(self.js, "networkTree")
+
+        self.assertIn("dashboardStack.group(devices, topology)", body)
+        self.assertIn("'PVE host'", body)
+        self.assertIn("'LXC guests'", body)
+        self.assertIn("'Elsewhere'", body)
+        self.assertIn("dashboardStack.dockerEngine(stack.containers)", body)
+        self.assertIn("sortNetworkDevices(stack.others)", body)
+        # Standalone machines must not be folded into the pve branches.
+        self.assertIn("stack.others", body)
+
+    def test_shared_stack_helper_trusts_the_server_topology(self):
+        stack = (APP_JS.parent / "stack.js").read_text()
+        body = function_body(stack, "group")
+
+        self.assertIn("topology.host_id", body)
+        self.assertIn("topology.docker_host_id", body)
+        self.assertIn("topology.containers", body)
+        self.assertIn("device.kind === 'lxc'", body)
+        self.assertIn("device.kind === 'lxc-guest'", body)
+
+    def test_docker_engine_names_containers_and_carries_state_as_text(self):
+        stack = (APP_JS.parent / "stack.js").read_text()
+        engine = function_body(stack, "dockerEngine")
+        row = function_body(stack, "containerRow")
+
+        self.assertIn("containerRow", engine)
+        self.assertIn(" running", engine)
+        self.assertIn("docker-glyph", engine)
+        self.assertIn("docker-container-name", row)
+        # Colour alone must not carry container health.
+        self.assertIn("docker-container-role", row)
+        self.assertIn("state", row)
 
     def test_unknown_kinds_get_a_readable_label(self):
         body = function_body(self.js, "kindLabel")
@@ -1284,10 +1342,9 @@ class NetworkCardTest(FrontEndSourceTest):
         self.assertNotIn("a.name", body)
         self.assertNotIn("b.name", body)
 
-    def test_kind_chips_and_compact_rows_fit_the_rail_without_page_scroll(self):
-        self.assertRegex(
-            self.css, r"\.kind-chips\s*\{[^}]*grid-template-columns:\s*1fr 1fr"
-        )
+    def test_tree_and_compact_rows_fit_the_rail_without_page_scroll(self):
+        self.assertRegex(self.css, r"\.network-branch\s*\{[^}]*border-left")
+        self.assertRegex(self.css, r"\.network-branch\.is-host\s*\{[^}]*--tree-host")
         self.assertRegex(self.css, r"\.device-row\s*\{[^}]*padding:\s*5px 0")
         self.assertRegex(self.css, r"\.device-row\s*\{[^}]*repeat\(3,\s*46px\)")
         self.assertNotRegex(self.css, r"\.device-grid\s*\{[^}]*max-height")
@@ -1477,9 +1534,28 @@ class MetricsHistoryTest(ApiTestCase):
         docker = next(device for device in payload["devices"] if device["id"] == "docker01")
         self.assertEqual(docker["availability_24h"], 66.7)
 
+    def test_summary_carries_the_same_stack_topology_as_stats(self):
+        self.sample([
+            self.device(device_id="docker01", kind="lxc"),
+            self.device(device_id="agent:pve", name="pve", kind="host"),
+        ])
+
+        payload = app.metrics_summary("1h", now=self.BASE + 60)
+
+        self.assertEqual(payload["topology"]["host_id"], "agent:pve")
+        self.assertEqual(payload["topology"]["docker_host_id"], "docker01")
+        self.assertEqual(
+            [container["name"] for container in payload["topology"]["containers"]],
+            ["caddy", "dash"],
+        )
+
     def test_a_fresh_install_returns_an_empty_summary_without_creating_a_database(self):
         payload = app.metrics_summary("24h", now=self.BASE)
         self.assertEqual(payload["devices"], [])
+        self.assertEqual(
+            payload["topology"],
+            {"host_id": None, "docker_host_id": None, "containers": []},
+        )
         self.assertEqual(app.metrics_series("docker01", "24h", None, now=self.BASE), None)
 
 
@@ -1491,6 +1567,21 @@ class MetricsPageSourceTest(FrontEndSourceTest):
         self.metrics_html = (APP_JS.parent / "metrics.html").read_text()
         self.metrics_js = (APP_JS.parent / "metrics.js").read_text()
         self.metrics_css = (APP_JS.parent / "metrics.css").read_text()
+
+    def test_page_loads_the_shared_stack_helper_before_metrics_js(self):
+        self.assertLess(
+            self.metrics_html.index('src="stack.js"'),
+            self.metrics_html.index('src="metrics.js"'),
+        )
+
+    def test_device_rail_uses_the_same_containment_tree_as_the_dashboard(self):
+        body = function_body(self.metrics_js, "metricsTree")
+
+        self.assertIn("dashboardStack.group(devices, summary && summary.topology)", body)
+        self.assertIn("dashboardStack.dockerEngine(stack.containers)", body)
+        self.assertIn("'PVE host'", body)
+        self.assertIn("'LXC guests'", body)
+        self.assertIn("'Elsewhere'", body)
 
     def test_page_has_range_tabs_a_chart_a_table_view_and_the_device_rail(self):
         self.assertIn('id="range-tabs"', self.metrics_html)
@@ -1553,7 +1644,7 @@ class MetricsPageSourceTest(FrontEndSourceTest):
 
     def test_deploy_ships_the_metrics_page_and_checks_it(self):
         deploy = (Path(__file__).resolve().parent / "deploy.sh").read_text()
-        for name in ("metrics.html", "metrics.js", "metrics.css"):
+        for name in ("stack.js", "metrics.html", "metrics.js", "metrics.css"):
             self.assertIn(name, deploy)
         smoke = deploy.split('say "smoke"', 1)[1]
         self.assertIn("metrics.html", smoke)
