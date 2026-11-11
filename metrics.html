@@ -64,6 +64,28 @@
                         History starts collecting on the server. The first sample appears within a minute.
                     </div>
 
+                    <section id="volume-section" class="volume-section" aria-labelledby="volume-title" hidden>
+                        <div class="volume-head">
+                            <h3 id="volume-title" class="volume-heading">Volumes</h3>
+                            <span id="volume-sub" class="card-sub"></span>
+                        </div>
+                        <div class="volume-scroll">
+                            <table id="volume-table" class="volume-table">
+                                <thead>
+                                    <tr>
+                                        <th scope="col">Volume</th>
+                                        <th scope="col">Mount</th>
+                                        <th scope="col">Used</th>
+                                        <th scope="col">Size</th>
+                                        <th scope="col">Growth/day</th>
+                                        <th scope="col">Full in</th>
+                                    </tr>
+                                </thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+                    </section>
+
                     <details id="table-view" class="table-view">
                         <summary>Table view</summary>
                         <div class="table-scroll">
@@ -75,6 +97,18 @@
                                         <th scope="col">RAM</th>
                                         <th scope="col">Disk</th>
                                         <th scope="col">Status</th>
+                                    </tr>
+                                </thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+                        <div class="table-scroll">
+                            <table id="chart-volume-table" class="volume-table" aria-label="Per-volume samples">
+                                <thead>
+                                    <tr>
+                                        <th scope="col">Time</th>
+                                        <th scope="col">Volume</th>
+                                        <th scope="col">Used</th>
                                     </tr>
                                 </thead>
                                 <tbody></tbody>

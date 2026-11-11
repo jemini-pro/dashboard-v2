@@ -70,9 +70,30 @@ def guests():
         return []
 
 
+def root_disks():
+    """The host's root filesystem as a volume list.
+
+    LXC guests have no per-volume data from pvesh, so only the host sends
+    this. The server rejects a malformed entry rather than storing it.
+    """
+    try:
+        du = shutil.disk_usage("/")
+    except OSError:
+        return []
+    if not du.total:
+        return []
+    return [{
+        "mount": "/",
+        "label": "System",
+        "total": du.total,
+        "used": du.used,
+        "pct": round(100.0 * du.used / du.total, 1),
+    }]
+
+
 def main():
     used, total = mem()
-    du = shutil.disk_usage("/")
+    disks = root_disks()
     errors = []
 
     try:
@@ -83,7 +104,8 @@ def main():
             "mem_pct": round(100.0 * used / total, 1) if total else None,
             "mem_used": used,
             "mem_total": total,
-            "disk_pct": round(100.0 * du.used / du.total, 1) if du.total else None,
+            "disk_pct": disks[0]["pct"] if disks else None,
+            "disks": disks,
             "uptime_s": uptime(),
         })
         print("pushed pve")

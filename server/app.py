@@ -317,6 +317,23 @@ CREATE TABLE IF NOT EXISTS samples (
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS samples_ts ON samples (ts);
+
+-- One row per device per mount per bucket. The aggregate disk_pct on
+-- samples keeps its old shape; this table is what makes "which volume is
+-- filling up?" answerable. A repeat inside a bucket replaces the bucket's
+-- rows for that device, so history never double-counts a heartbeat.
+CREATE TABLE IF NOT EXISTS disk_samples (
+    device_id TEXT NOT NULL,
+    mount     TEXT NOT NULL,
+    ts        INTEGER NOT NULL,
+    label     TEXT,
+    total     INTEGER,
+    used      INTEGER,
+    pct       REAL,
+    PRIMARY KEY (device_id, mount, ts)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS disk_samples_ts ON disk_samples (ts);
 """
 
 
@@ -384,6 +401,23 @@ def record_samples(devices, now=None):
                         online,
                     ),
                 )
+                # Per-volume history shares the bucket timestamp and the same
+                # transaction, so a volume set can never be half-written. The
+                # delete makes a heartbeat the source of truth for its bucket:
+                # a mount that vanished does not linger, and a repeat replaces
+                # rather than appends. clean_disks already caps and validates.
+                con.execute(
+                    "DELETE FROM disk_samples WHERE device_id = ? AND ts = ?",
+                    (device_id, ts),
+                )
+                for disk in clean_disks(device.get("disks")):
+                    con.execute(
+                        "INSERT INTO disk_samples "
+                        "(device_id, mount, ts, label, total, used, pct) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (device_id, disk["mount"], ts, disk["label"],
+                         disk["total"], disk["used"], disk["pct"]),
+                    )
                 wrote += 1
             con.commit()
         finally:
@@ -410,10 +444,12 @@ def prune_metrics(now=None):
         # Keep the delete on the same single-writer path as the sampler.
         con = _connect_metrics()
         try:
-            cur = con.execute("DELETE FROM samples WHERE ts < ?",
-                              (int(now) - HISTORY_SECONDS,))
+            cutoff = int(now) - HISTORY_SECONDS
+            cur = con.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
+            removed = cur.rowcount
+            cur = con.execute("DELETE FROM disk_samples WHERE ts < ?", (cutoff,))
             con.commit()
-            return cur.rowcount
+            return removed + cur.rowcount
         finally:
             con.close()
 
@@ -516,10 +552,14 @@ def _events(rows, limit=None):
     return events[:limit] if limit else events
 
 
-def _disk_growth_per_day(rows):
-    """Least-squares disk slope in percentage points per day, online only."""
-    points = [(ts, disk) for ts, _cpu, _mem, disk, _uptime, online in rows
-              if online and disk is not None]
+def _trend_per_day(points):
+    """Least-squares slope in units per day from (ts, value) pairs.
+
+    Fewer than three points is noise, not a trend, so it reports None rather
+    than a line through two points. The same rule serves the aggregate disk
+    series and each per-volume series.
+    """
+    points = [(ts, value) for ts, value in points if value is not None]
     if len(points) < 3:
         return None
     t0 = points[0][0]
@@ -533,6 +573,26 @@ def _disk_growth_per_day(rows):
         return None
     slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denom
     return slope * 86400
+
+
+def _days_to_90(pct_now, growth):
+    """Project when pct reaches 90 at the current trend, or None.
+
+    A flat or falling volume never fills, and a volume already at or over 90
+    has no meaningful countdown. This is the rule the aggregate disk gauge has
+    always used; per-volume projections reuse it exactly.
+    """
+    if growth is None or growth <= 0.01 or pct_now is None or pct_now >= 90:
+        return None
+    return round((90.0 - pct_now) / growth, 1)
+
+
+def _disk_growth_per_day(rows):
+    """Least-squares disk slope in percentage points per day, online only."""
+    return _trend_per_day([
+        (ts, disk) for ts, _cpu, _mem, disk, _uptime, online in rows
+        if online and disk is not None
+    ])
 
 
 def _derive_summary(rows, until):
@@ -567,9 +627,7 @@ def _derive_summary(rows, until):
     latest = rows[-1]
     disk_now = latest[3]
     growth = _disk_growth_per_day(rows)
-    days_to_90 = None
-    if growth is not None and growth > 0.01 and disk_now is not None and disk_now < 90:
-        days_to_90 = round((90.0 - disk_now) / growth, 1)
+    days_to_90 = _days_to_90(disk_now, growth)
 
     return {
         "samples": count,
@@ -605,6 +663,86 @@ def _spark(rows, now, minutes=60, buckets=12):
     return [round(totals[i] / counts[i], 1) if counts[i] else None for i in range(buckets)]
 
 
+def _volume_series(con, device_id, since, until, step):
+    """Per-volume bucketed pct series, latest size and a growth trend.
+
+    Online-only, matching the aggregate disk gauge: an agent that stopped
+    pushing keeps its last values in agents.json, but those stale values must
+    not look like fresh volume history. One grouped query for the series plus
+    one latest-row query per mount (at most MAX_DISKS) keeps this bounded.
+    """
+    rows = con.execute(
+        "SELECT d.mount, d.ts - (d.ts % ?) AS bucket, ROUND(AVG(d.pct), 1) "
+        "FROM disk_samples d "
+        "JOIN samples s ON s.device_id = d.device_id AND s.ts = d.ts "
+        "WHERE d.device_id = ? AND d.ts >= ? AND d.ts <= ? AND s.online = 1 "
+        "GROUP BY d.mount, bucket ORDER BY d.mount, bucket",
+        (step, device_id, int(since), int(until)),
+    ).fetchall()
+    series = {}
+    for mount, bucket, value in rows:
+        series.setdefault(mount, []).append([int(bucket), value])
+
+    latest = con.execute(
+        "SELECT d.mount, d.label, d.total, d.used, d.pct "
+        "FROM disk_samples d "
+        "JOIN samples s ON s.device_id = d.device_id AND s.ts = d.ts "
+        "WHERE d.device_id = ? AND d.ts >= ? AND d.ts <= ? AND s.online = 1 "
+        "AND d.ts = ("
+        "  SELECT MAX(d2.ts) FROM disk_samples d2 "
+        "  JOIN samples s2 ON s2.device_id = d2.device_id AND s2.ts = d2.ts "
+        "  WHERE d2.device_id = d.device_id AND d2.mount = d.mount "
+        "    AND d2.ts >= ? AND d2.ts <= ? AND s2.online = 1) "
+        "ORDER BY d.mount",
+        (device_id, int(since), int(until), int(since), int(until)),
+    ).fetchall()
+
+    volumes = []
+    for mount, label, total, used, pct in latest:
+        points = series.get(mount, [])
+        growth = _trend_per_day(points)
+        volumes.append({
+            "mount": mount,
+            "label": label or "",
+            "total": total,
+            "used": used,
+            "pct": round(float(pct), 1) if pct is not None else None,
+            "growth_per_day": round(growth, 2) if growth is not None else None,
+            "days_to_90": _days_to_90(pct, growth),
+            "points": points,
+        })
+    # Fullest first; a missing pct sorts last. Mount breaks ties so the order
+    # is stable across requests.
+    volumes.sort(key=lambda volume: (
+        volume["pct"] is None, -(volume["pct"] or 0.0), volume["mount"],
+    ))
+    return volumes
+
+
+def _volume_summary(volumes):
+    """The compact per-device volume summary: count and the fullest volume.
+
+    The fullest volume is the one the aggregate DSK gauge already reports, so
+    this is the mount worth projecting days-to-90 for without shipping every
+    series in the fleet summary.
+    """
+    if not volumes:
+        return {"count": 0, "fullest": None}
+    fullest = volumes[0]
+    return {
+        "count": len(volumes),
+        "fullest": {
+            "mount": fullest["mount"],
+            "label": fullest["label"],
+            "pct": fullest["pct"],
+            "total": fullest["total"],
+            "used": fullest["used"],
+            "growth_per_day": fullest["growth_per_day"],
+            "days_to_90": fullest["days_to_90"],
+        },
+    }
+
+
 def _window_seconds(window):
     return METRIC_WINDOWS.get(window)
 
@@ -636,6 +774,7 @@ def metrics_summary(window=DEFAULT_WINDOW, now=None):
     if not METRICS_FILE.exists():
         return payload
     live = _live_state(now)
+    volume_step = _step_for(window_s, None)
     con = _connect_metrics()
     try:
         for device_id, name, kind, _first, last_seen in _known_devices(con):
@@ -649,6 +788,9 @@ def metrics_summary(window=DEFAULT_WINDOW, now=None):
                 "online": state.get("online", bool(rows[-1][5]) if rows else False),
                 "last_seen": state.get("last_seen", int(last_seen)),
                 "spark": _spark(rows, now),
+                "volumes": _volume_summary(
+                    _volume_series(con, device_id, since, now, volume_step)
+                ),
                 **summary,
             })
     finally:
@@ -664,7 +806,8 @@ def metrics_series(device_id, window=DEFAULT_WINDOW, requested_step=None, now=No
     since = now - window_s
     payload = {
         "generated": int(now), "window": window, "window_s": window_s, "step": step,
-        "device": None, "summary": _derive_summary([], now), "points": [], "events": [],
+        "device": None, "summary": _derive_summary([], now), "points": [],
+        "volumes": [], "events": [],
     }
     if not METRICS_FILE.exists():
         return None if device_id else payload
@@ -685,6 +828,7 @@ def metrics_series(device_id, window=DEFAULT_WINDOW, requested_step=None, now=No
             "GROUP BY bucket ORDER BY bucket",
             (step, device_id, int(since), int(now)),
         ).fetchall()
+        volumes = _volume_series(con, device_id, since, now, step)
     finally:
         con.close()
     state = live.get(device_id, {})
@@ -695,6 +839,7 @@ def metrics_series(device_id, window=DEFAULT_WINDOW, requested_step=None, now=No
     }
     payload["summary"] = _derive_summary(rows, now)
     payload["points"] = [list(point) for point in points]
+    payload["volumes"] = volumes
     payload["events"] = _events(rows, limit=20)
     return payload
 

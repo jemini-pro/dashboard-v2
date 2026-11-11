@@ -14,13 +14,15 @@ from unittest import mock
 AGENTS = Path(__file__).resolve().parent.parent / "agents"
 
 
-def load_unix_agent():
-    spec = importlib.util.spec_from_file_location(
-        "dash_agent_under_test", AGENTS / "dash-agent.py"
-    )
+def load_agent(filename, module_name):
+    spec = importlib.util.spec_from_file_location(module_name, AGENTS / filename)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def load_unix_agent():
+    return load_agent("dash-agent.py", "dash_agent_under_test")
 
 
 class UnixDiskReportingTest(unittest.TestCase):
@@ -113,3 +115,39 @@ class WindowsDiskReportingTest(unittest.TestCase):
         self.assertRegex(src, r"disks\s*=\s*\$disks")
         self.assertRegex(src, r"disk_pct\s*=\s*\$diskPct")
         self.assertIn("-Depth 4", src)
+
+
+class PveHostDiskReportingTest(unittest.TestCase):
+    """The Proxmox host reports its root volume; LXC guests have no volumes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.agent = load_agent("pve-host-agent.py", "pve_host_agent_under_test")
+
+    def test_host_payload_carries_the_root_volume_and_guests_do_not(self):
+        pushes = {}
+
+        def capture(name, payload):
+            pushes[name] = payload
+            return 200
+
+        volume = types.SimpleNamespace(total=1000, used=900, free=100)
+        guest = {"name": "adguard", "vmid": 101, "cpu": 0.1, "mem": 1,
+                 "maxmem": 2, "uptime": 3}
+        with mock.patch.object(self.agent, "push", side_effect=capture), \
+                mock.patch.object(self.agent, "cpu_pct", return_value=1.0), \
+                mock.patch.object(self.agent, "mem", return_value=(1, 2)), \
+                mock.patch.object(self.agent, "uptime", return_value=3), \
+                mock.patch.object(self.agent, "guests", return_value=[guest]), \
+                mock.patch.object(self.agent.shutil, "disk_usage",
+                                  return_value=volume):
+            self.agent.main()
+
+        disks = pushes["pve"]["disks"]
+        self.assertEqual(len(disks), 1)
+        self.assertEqual(disks[0]["mount"], "/")
+        self.assertEqual(disks[0]["total"], 1000)
+        self.assertEqual(disks[0]["used"], 900)
+        self.assertEqual(disks[0]["pct"], 90.0)
+        self.assertEqual(pushes["pve"]["disk_pct"], 90.0)
+        self.assertNotIn("disks", pushes["adguard"])

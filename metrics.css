@@ -501,6 +501,72 @@
     font-weight: 600;
 }
 
+/* ---------- volume table ---------- */
+
+.volume-section {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    border-top: 1px solid var(--sidebar-border);
+    padding-top: 8px;
+}
+
+.volume-section[hidden] {
+    display: none;
+}
+
+.volume-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+}
+
+.volume-heading {
+    font-size: 0.58rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    white-space: nowrap;
+}
+
+.volume-scroll {
+    overflow-x: auto;
+    scrollbar-width: thin;
+}
+
+.volume-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.65rem;
+    font-variant-numeric: tabular-nums;
+}
+
+.volume-table th,
+.volume-table td {
+    text-align: right;
+    padding: 4px 6px;
+    border-bottom: 1px solid var(--sidebar-border);
+    white-space: nowrap;
+}
+
+.volume-table th:first-child,
+.volume-table td:first-child,
+.volume-table th:nth-child(2),
+.volume-table td:nth-child(2) {
+    text-align: left;
+}
+
+.volume-table th {
+    color: var(--muted);
+    font-weight: 600;
+}
+
+.volume-table tr:last-child td {
+    border-bottom: 0;
+}
+
 /* ---------- device rail ---------- */
 
 .metrics-rail {
@@ -748,6 +814,10 @@
 
     .chart-tooltip {
         min-width: 132px;
+    }
+
+    .volume-table {
+        font-size: 0.6rem;
     }
 
     .device-item-spark {

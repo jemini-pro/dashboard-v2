@@ -34,8 +34,8 @@ a main column (Jump back in, Launchpad, All tools) and a Network rail. There is 
 | `/api/health` | GET | `{ok}` |
 | `/api/bookmarks` | GET | the bookmark store, with a decayed `score` per item |
 | `/api/stats` | GET | devices array, cached 5 s; each device carries 24 h availability |
-| `/api/metrics/summary` | GET | per-device availability, averages, events, disk trend and a CPU sparkline |
-| `/api/metrics` | GET | one device's bucketed history: `?device=<id>&window=1h\|6h\|24h\|7d\|30d&step=<s>` |
+| `/api/metrics/summary` | GET | per-device availability, averages, events, disk trend, a compact volume summary and a CPU sparkline |
+| `/api/metrics` | GET | one device's bucketed history and per-volume series: `?device=<id>&window=1h\|6h\|24h\|7d\|30d&step=<s>` |
 | `/api/hit` | POST | record a bookmark click (`{"url": "..."}` → `204`, no body) |
 | `/api/push/<name>` | POST | agent heartbeat, needs `X-Dash-Token`; optionally carries `disks` |
 
@@ -66,13 +66,25 @@ can answer "is this normal, and since when?" rather than only "what is it now?".
   uptime_s, online`. Device metadata (`id`, display name, kind, first/last
   seen) is kept in a second table so renaming an agent does not split its
   timeline. Values that are not finite numbers are stored as `NULL`.
-- **Retention.** Raw samples are kept for `DASH_HISTORY_DAYS` (default **30**)
-  and pruned at most once an hour. At seven devices that is roughly 10k rows a
-  day, or 20–30 MB for the full window.
+- **Per-volume history.** Every heartbeat's `disks` array (capped at 16;
+  malformed entries dropped) is written to `disk_samples (device_id, mount,
+  ts, label, total, used, pct)` with the same bucket timestamp and in the same
+  transaction as its aggregate row. A repeat inside a bucket replaces that
+  device's volume rows, so a mount that vanished does not linger and a second
+  heartbeat never double-counts. The local `docker01` volume and each agent's
+  `disks` array both feed it. LXC guests report no volume data, so they have
+  no rows; old agents that send only `disk_pct` simply have none.
+- **Retention.** Raw samples and volume rows are kept for
+  `DASH_HISTORY_DAYS` (default **30**) and pruned at most once an hour, on the
+  same pass. At seven devices that is roughly 10k aggregate rows a day, or
+  20–30 MB for the full window; volume rows add one row per mount per bucket
+  (so 16-volume PC is 16× the row count).
 - **Derived, not stored.** Availability, downtime, offline events, restarts
   (an `uptime_s` drop), CPU/RAM averages and peaks, disk growth (least-squares
-  slope) and days-to-90% are computed when a request asks for them. Offline
-  runs are detected from transitions, so no separate event table is needed.
+  slope) and days-to-90% are computed when a request asks for them. The same
+  least-squares rule and days-to-90 projection run per volume, online-only, so
+  an offline agent's stale volume values never look like a trend. Offline runs
+  are detected from transitions, so no separate event table is needed.
 - **Agent gaps are explicit.** An agent that stops pushing still has a row in
   `agents.json`; the sampler records it with `online = 0`. Charts break the line
   for those points instead of drawing a flat line. A gap in the *server* itself
@@ -83,6 +95,10 @@ The Metrics page (`/metrics.html`) uses the same data:
 - range tabs for **1h / 6h / 24h / 7d / 30d**;
 - a three-line chart (CPU, RAM, disk, fixed 0–100% axis) with a legend, a
   crosshair tooltip, surface-ringed end dots and a table view for exact values;
+- a volume table under the chart when the selected device reports more than
+  one volume (label, mount, used %, size, growth/day, days-to-full), with the
+  per-volume samples added to the opt-in table view — the 0–100 chart keeps a
+  single aggregate disk line rather than becoming multi-volume;
 - a fleet summary (online count, average availability, peak CPU, disk
   pressure), a device list with 5-minute CPU sparklines, and an events rail
   (offline / back online / restarted, newest first).
@@ -146,10 +162,15 @@ Responsive rules:
 
 `dash-agent.ps1` reports every fixed and removable Windows volume, not just `C:`.
 `dash-agent.py` reports every real local Linux/macOS filesystem, root first, skipping
-pseudo filesystems, snap loops and duplicate mounts. The server drops malformed entries,
-caps the list at 16 and recomputes `disk_pct` as the fullest volume. Agents that have not
-been updated keep working: they send only `disk_pct`, so they get no breakdown and their
-single gauge stays as it was.
+pseudo filesystems, snap loops and duplicate mounts. `pve-host-agent.py` reports the
+Proxmox host's root filesystem; LXC guests have no volume data and send none. The server
+drops malformed entries, caps the list at 16 and recomputes `disk_pct` as the fullest
+volume. Agents that have not been updated keep working: they send only `disk_pct`, so they
+get no breakdown and their single gauge stays as it was.
+
+Every accepted `disks` entry is also written to `disk_samples`, so per-volume growth and
+days-to-90 survive the live payload and are available after a restart. The local
+container's volume is included on every sample pass.
 
 ## Jump back in (click scores)
 
@@ -322,9 +343,11 @@ It asserts: `POST /api/hit` → `204` with no body; the score appears in
 hits older than 90 days are trimmed on write; an unknown URL is accepted; a title rename
 keeps the score; `/api/bookmarks` stays under ~10 KB for the current 31 links; the
 sampler writes history with no browser open; `/api/metrics` returns bucketed points,
-a step and a derived summary; unknown windows/devices are rejected; hits **and**
-metrics history survive a full process restart; and the click feature sets no cookie
-and makes no third-party request. It also guards the compose/README path documentation below and the
+a step and a derived summary; a push with a `disks` array becomes per-volume series
+with growth/day and days-to-90 and a compact summary, an oversized list is capped at
+16; unknown windows/devices are rejected; hits, metrics history **and** per-volume
+history survive a full process restart; and the click feature sets no cookie and makes
+no third-party request. It also guards the compose/README path documentation below and the
 Workbench UI, breakpoint and check documentation above.
 
 ## Click-history durability
@@ -402,4 +425,10 @@ ok 14 - metrics history survived a full server restart (first sample 1794320920)
   `/api/stats`, or history only exists while a tab is open.
 - **`metrics.db` is a single writer.** `record_samples` holds `_db_lock`; reads use
   their own connections under WAL. Keep new writes on the same path rather than opening
-  a connection per request and writing concurrently.
+  a connection per request and writing concurrently. `disk_samples` is written inside
+  the same lock and transaction as `samples`, and both are pruned on the same pass.
+- **Per-volume series are joined to `samples` by `(device_id, ts)` and filtered to
+  `online = 1`.** This is deliberate: `agents.json` keeps an offline agent's last
+  `disks` values, and without the join those stale values would draw a flat,
+  falsely-recent volume trend. If you add another writer to `disk_samples`, it must
+  also create the matching `samples` row or its history will never be served.

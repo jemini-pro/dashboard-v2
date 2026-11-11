@@ -195,6 +195,47 @@ print(row[0] if row and row[0] is not None else "")
 PY
 }
 
+disk_min_ts() {
+    python3 - "$DATA_DIR/metrics.db" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+try:
+    row = con.execute("SELECT MIN(ts) FROM disk_samples").fetchone()
+finally:
+    con.close()
+print(row[0] if row and row[0] is not None else "")
+PY
+}
+
+push_device() { # push_device <name> <json-file>
+    curl -fsS -X POST -H 'Content-Type: application/json' \
+        --data-binary @"$2" "$BASE/api/push/$1" >/dev/null
+}
+
+wait_for_volume_samples() { # wait_for_volume_samples <device-id> <min-count>
+    local id="$1" want="$2" i
+    for i in $(seq 1 120); do
+        if curl -fsS "$BASE/api/metrics/summary?window=1h" \
+                -o "$TMP/metrics-summary.json" 2>/dev/null; then
+            if python3 - "$TMP/metrics-summary.json" "$id" "$want" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+for device in data.get("devices", []):
+    if device.get("id") == sys.argv[2]:
+        count = (device.get("volumes") or {}).get("count", 0)
+        raise SystemExit(0 if count >= int(sys.argv[3]) else 1)
+raise SystemExit(1)
+PY
+            then
+                return 0
+            fi
+        fi
+        sleep 0.1
+    done
+    fail "no per-volume samples for $id within 12 s"
+}
+
 hits_len() { # hits_len <url>
     python3 - "$HITS" "$1" <<'PY'
 import json, sys
@@ -398,6 +439,83 @@ assert "availability_pct" in data["summary"], data.get("summary")
 PY
 ok "/api/metrics returns bucketed points, a step and a derived summary"
 
+# 9b. Per-volume history. A push with a disks array must become its own rows,
+# exposed as a bucketed series plus growth/day and days-to-90, without changing
+# the shape of the existing points or summary.
+cat > "$TMP/voltest-push.json" <<'JSON'
+{
+  "name": "voltest",
+  "kind": "pc",
+  "cpu_pct": 5.0,
+  "mem_pct": 20.0,
+  "mem_used": 1,
+  "mem_total": 2,
+  "disk_pct": 91.0,
+  "uptime_s": 10,
+  "disks": [
+    {"mount": "/", "label": "System", "total": 1000, "used": 100, "pct": 10.0},
+    {"mount": "/mnt/data", "label": "Data", "total": 1000, "used": 910, "pct": 91.0}
+  ]
+}
+JSON
+push_device voltest "$TMP/voltest-push.json" || fail "push with a disks array failed"
+wait_for_volume_samples agent:voltest 2
+
+python3 - "$TMP/metrics-summary.json" <<'PY' || fail "volume summary payload is wrong"
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+device = next(d for d in data["devices"] if d["id"] == "agent:voltest")
+volumes = device["volumes"]
+assert volumes["count"] == 2, volumes
+assert volumes["fullest"]["mount"] == "/mnt/data", volumes
+assert volumes["fullest"]["pct"] == 91.0, volumes
+for key in ("growth_per_day", "days_to_90"):
+    assert key in volumes["fullest"], volumes
+assert len(device["spark"]) == 12
+PY
+ok "/api/metrics/summary exposes a compact per-device volume summary"
+
+curl -fsS "$BASE/api/metrics?device=agent:voltest&window=1h" \
+    -o "$TMP/voltest-series.json" || fail "GET per-volume series failed"
+python3 - "$TMP/voltest-series.json" <<'PY' || fail "per-volume series payload is wrong"
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+volumes = {v["mount"]: v for v in data.get("volumes", [])}
+assert set(volumes) == {"/", "/mnt/data"}, volumes
+assert len(data["points"][0]) == 5, data["points"][0]
+assert data["volumes"][0]["mount"] == "/mnt/data", data["volumes"]
+for key in ("mount", "label", "total", "used", "pct",
+            "growth_per_day", "days_to_90", "points"):
+    assert key in volumes["/"], key
+assert volumes["/mnt/data"]["pct"] == 91.0
+assert volumes["/"]["points"], volumes["/"]
+PY
+ok "/api/metrics returns per-volume bucket points, growth and days-to-90"
+
+# 9c. An oversized list is capped server-side: 26 volumes in, 16 stored.
+python3 - "$TMP/volcap-push.json" <<'PY'
+import json, sys
+disks = [{"mount": "/vol%02d" % i, "label": "V%d" % i,
+          "total": 1000, "used": 100, "pct": 10.0} for i in range(26)]
+disks[20] = {"mount": "", "total": 0, "used": 0, "pct": 0.0}
+with open(sys.argv[1], "w") as f:
+    json.dump({"name": "volcap", "kind": "pc", "cpu_pct": 1.0,
+               "mem_pct": 2.0, "disk_pct": 10.0, "uptime_s": 1,
+               "disks": disks}, f)
+PY
+push_device volcap "$TMP/volcap-push.json" || fail "oversized disk push failed"
+wait_for_volume_samples agent:volcap 16
+python3 - "$TMP/metrics-summary.json" <<'PY' || fail "oversized volume list was not capped"
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+device = next(d for d in data["devices"] if d["id"] == "agent:volcap")
+assert device["volumes"]["count"] == 16, device["volumes"]
+PY
+ok "an oversized volume list is capped at 16 and malformed entries are dropped"
+
 code="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/metrics/summary?window=2h")"
 [[ "$code" == "400" ]] || fail "unknown window returned $code, expected 400"
 code="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/metrics?window=1h")"
@@ -408,6 +526,8 @@ ok "metrics endpoints reject unknown windows, missing and unknown devices"
 
 min_ts_before="$(metrics_min_ts)"
 [[ -n "$min_ts_before" ]] || fail "metrics.db has no samples before the restart"
+disk_min_before="$(disk_min_ts)"
+[[ -n "$disk_min_before" ]] || fail "metrics.db has no per-volume samples before the restart"
 
 # 10. Process restart: the same DASH_DATA_DIR keeps the history. This is the
 # no-docker equivalent of recreating the `dash` container with its bind mount.
@@ -430,6 +550,11 @@ min_ts_after="$(metrics_min_ts)"
 [[ "$min_ts_after" == "$min_ts_before" ]] \
     || fail "metrics history changed across restart: $min_ts_before -> $min_ts_after"
 ok "metrics history survived a full server restart (first sample $min_ts_after)"
+
+disk_min_after="$(disk_min_ts)"
+[[ "$disk_min_after" == "$disk_min_before" ]] \
+    || fail "per-volume history changed across restart: $disk_min_before -> $disk_min_after"
+ok "per-volume history survived a full server restart (first sample $disk_min_after)"
 
 # 11. Static guarantees: no cookie is set and the feature makes no third-party
 # request. Deliberately scoped to the click-history/strip code so unrelated

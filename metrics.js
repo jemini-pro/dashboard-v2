@@ -36,6 +36,10 @@ const chartXAxisEl = document.getElementById('chart-xaxis');
 const chartEmptyEl = document.getElementById('chart-empty');
 const tableViewEl = document.getElementById('table-view');
 const chartTableEl = document.getElementById('chart-table');
+const volumeSectionEl = document.getElementById('volume-section');
+const volumeSubEl = document.getElementById('volume-sub');
+const volumeTableEl = document.getElementById('volume-table');
+const chartVolumeTableEl = document.getElementById('chart-volume-table');
 const deviceListEl = document.getElementById('device-list');
 const devicesSubEl = document.getElementById('devices-sub');
 const eventsEl = document.getElementById('events');
@@ -180,6 +184,42 @@ function stepLabel(seconds) {
     if (!isNumber(seconds)) return '';
     if (seconds < 3600) return Math.round(seconds / 60) + 'm';
     return Math.round(seconds / 3600) + 'h';
+}
+
+function fmtBytes(value) {
+    if (!isNumber(value) || value <= 0) return '—';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let size = value;
+    let unit = 0;
+    while (size >= 1024 && unit < units.length - 1) {
+        size /= 1024;
+        unit += 1;
+    }
+    const digits = unit === 0 || size >= 100 ? 0 : (size >= 10 ? 1 : 2);
+    return size.toFixed(digits) + ' ' + units[unit];
+}
+
+function fmtGrowth(value) {
+    if (!isNumber(value)) return '—';
+    return (value > 0 ? '+' : '') + value.toFixed(2) + '%/day';
+}
+
+function volumeLabel(volume) {
+    return volume.label || volume.mount || '—';
+}
+
+// A volume row is a summary of the window, not a chart series: the 0-100
+// chart keeps its single aggregate disk line.
+function volumeRow(volume) {
+    const days = fmtDays(volume.days_to_90);
+    return '<tr data-mount="' + escapeHtml(volume.mount) + '">' +
+        '<td>' + escapeHtml(volumeLabel(volume)) + '</td>' +
+        '<td>' + escapeHtml(volume.mount) + '</td>' +
+        '<td>' + pct(volume.pct) + '</td>' +
+        '<td>' + escapeHtml(fmtBytes(volume.total)) + '</td>' +
+        '<td>' + escapeHtml(fmtGrowth(volume.growth_per_day)) + '</td>' +
+        '<td>' + (days ? '~' + escapeHtml(days) : '—') + '</td>' +
+        '</tr>';
 }
 
 async function getJson(path) {
@@ -537,6 +577,44 @@ function hidePointer() {
     if (tooltip) tooltip.hidden = true;
 }
 
+function renderVolumes() {
+    const volumes = (series && series.volumes) || [];
+    const body = volumeTableEl.querySelector('tbody');
+    // The fixed 0-100 chart keeps one aggregate disk line. The volume table
+    // appears only when a device reports more than one volume, otherwise the
+    // single DSK value above already says everything.
+    volumeSectionEl.hidden = volumes.length < 2;
+    if (volumeSectionEl.hidden) {
+        body.innerHTML = '';
+        volumeSubEl.textContent = '';
+        return;
+    }
+    volumeSubEl.textContent = volumes.length + ' volumes · fullest ' +
+        volumeLabel(volumes[0]) + ' ' + pct(volumes[0].pct);
+    body.innerHTML = volumes.map(volumeRow).join('');
+}
+
+const MAX_VOLUME_ROWS = 400;
+
+// The opt-in table view carries the per-volume samples too: the chart cannot
+// show them without turning one 0-100 axis into a crowded multi-line mess.
+function renderVolumeTable() {
+    const body = chartVolumeTableEl.querySelector('tbody');
+    const volumes = (series && series.volumes) || [];
+    const rows = [];
+    volumes.forEach((volume) => {
+        (volume.points || []).slice().reverse().forEach((point) => {
+            if (rows.length >= MAX_VOLUME_ROWS) return;
+            rows.push('<tr><td>' + escapeHtml(fullTime(point[0])) + '</td>' +
+                '<td>' + escapeHtml(volumeLabel(volume)) + '</td>' +
+                '<td>' + pct(point[1]) + '</td></tr>');
+        });
+    });
+    body.innerHTML = rows.length
+        ? rows.join('')
+        : '<tr><td colspan="3">No per-volume samples in this window.</td></tr>';
+}
+
 // ---------- table and events ----------
 
 function tableCells(point) {
@@ -555,6 +633,7 @@ function renderTable() {
     body.innerHTML = points.length
         ? points.slice().reverse().map((point) => '<tr>' + tableCells(point) + '</tr>').join('')
         : '<tr><td colspan="5">No samples in this window.</td></tr>';
+    renderVolumeTable();
 }
 
 function eventItem(event) {
@@ -613,6 +692,7 @@ async function load(full) {
         renderChartHead();
         renderLegend();
         renderChart();
+        renderVolumes();
         renderEvents();
         if (tableViewEl.open) renderTable();
         setStale(false);
@@ -645,6 +725,7 @@ rangeTabsEl.addEventListener('click', (event) => {
     syncUrl();
     series = null;
     renderChart();
+    renderVolumes();
     load(true);
 });
 

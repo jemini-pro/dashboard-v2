@@ -1482,6 +1482,159 @@ class MetricsHistoryTest(ApiTestCase):
         self.assertEqual(payload["devices"], [])
         self.assertEqual(app.metrics_series("docker01", "24h", None, now=self.BASE), None)
 
+    # ---------- per-volume history ----------
+
+    def stored_disk_samples(self):
+        con = app._connect_metrics()
+        try:
+            return con.execute(
+                "SELECT device_id, mount, ts, label, total, used, pct "
+                "FROM disk_samples ORDER BY ts, mount"
+            ).fetchall()
+        finally:
+            con.close()
+
+    def volume(self, mount, pct, label="", total=1000, used=None):
+        return {
+            "mount": mount,
+            "label": label,
+            "total": total,
+            "used": int(total * pct / 100.0) if used is None else used,
+            "pct": pct,
+        }
+
+    def test_a_push_with_disks_writes_a_row_per_volume(self):
+        body = {
+            "name": "volpc", "kind": "pc", "cpu_pct": 5.0, "mem_pct": 20.0,
+            "mem_used": 1, "mem_total": 2, "disk_pct": 91.0, "uptime_s": 10,
+            "disks": [
+                self.volume("/", 10.0, "System", 1000, 100),
+                self.volume("/mnt/data", 91.0, "Data", 2000, 1820),
+            ],
+        }
+        status, _ = self.post(json.dumps(body).encode(), path="/api/push/volpc")
+        self.assertEqual(status, 200)
+
+        app.record_samples(app.agent_devices(), now=self.BASE)
+
+        rows = self.stored_disk_samples()
+        self.assertEqual(
+            [(row[0], row[1], row[3], row[4], row[5], row[6]) for row in rows],
+            [
+                ("agent:volpc", "/", "System", 1000, 100, 10.0),
+                ("agent:volpc", "/mnt/data", "Data", 2000, 1820, 91.0),
+            ],
+        )
+
+    def test_a_repeat_in_the_same_bucket_replaces_that_bucket_s_volumes(self):
+        self.sample([self.device(disks=[
+            self.volume("/", 10.0, "System"),
+            self.volume("/mnt/data", 91.0, "Data"),
+        ])], now=self.BASE)
+        self.sample([self.device(disks=[self.volume("/", 40.0, "System")])],
+                    now=self.BASE + 10)
+
+        rows = self.stored_disk_samples()
+        self.assertEqual([(row[1], row[6]) for row in rows], [("/", 40.0)])
+
+    def test_malformed_volume_entries_are_dropped(self):
+        self.sample([self.device(disks=[
+            self.volume("/", 10.0, "System"),
+            {"mount": "", "total": 100, "used": 1, "pct": 1.0},
+            {"mount": "/bad-total", "total": 0, "used": 0, "pct": 0.0},
+            {"mount": "/bad-pct", "total": 100},
+            {"mount": "/bool", "total": True, "used": True, "pct": True},
+            "not-a-volume",
+            None,
+        ])], now=self.BASE)
+
+        rows = self.stored_disk_samples()
+        self.assertEqual([row[1] for row in rows], ["/"])
+
+    def test_oversized_volume_lists_are_capped(self):
+        disks = [self.volume("/vol%02d" % index, 10.0 + index, "V%d" % index)
+                 for index in range(20)]
+        self.sample([self.device(disks=disks)], now=self.BASE)
+        self.assertEqual(len(self.stored_disk_samples()), app.MAX_DISKS)
+
+    def test_retention_prunes_old_volume_rows_too(self):
+        self.sample([self.device(disks=[self.volume("/", 50.0)])],
+                    now=self.BASE - app.HISTORY_SECONDS - 600)
+        self.assertEqual(len(self.stored_disk_samples()), 1)
+
+        app._last_prune["at"] = 0.0
+        self.sample([self.device(disks=[self.volume("/", 50.0)])], now=self.BASE)
+
+        rows = self.stored_disk_samples()
+        self.assertEqual(len(rows), 1)
+        self.assertGreaterEqual(rows[0][2], self.BASE - 60)
+
+    def test_volume_history_survives_a_reconnect(self):
+        self.sample([self.device(disks=[self.volume("/", 50.0)])], now=self.BASE)
+        # Every read opens its own connection and re-applies the schema
+        # idempotently; the row must still be there afterwards.
+        self.assertEqual(len(self.stored_disk_samples()), 1)
+        self.assertEqual(len(self.stored_disk_samples()), 1)
+
+    def test_metrics_series_adds_bucketed_volumes_and_their_growth(self):
+        for offset, pct in ((0, 50.0), (3600, 50.5), (7200, 51.0)):
+            self.sample([self.device(disk=pct, disks=[
+                self.volume("/", pct, "System", 1000, int(pct * 10)),
+                self.volume("/mnt/data", 80.0, "Data", 2000, 1600),
+            ])], now=self.BASE + offset)
+
+        payload = app.metrics_series("docker01", "24h", 3600, now=self.BASE + 7200)
+
+        # The existing aggregate payload keeps its shape.
+        self.assertIsInstance(payload["points"], list)
+        self.assertEqual(len(payload["points"][0]), 5)
+
+        volumes = {volume["mount"]: volume for volume in payload["volumes"]}
+        self.assertEqual(set(volumes), {"/", "/mnt/data"})
+        root = volumes["/"]
+        self.assertEqual(root["label"], "System")
+        self.assertEqual(root["total"], 1000)
+        self.assertEqual(root["used"], 510)
+        self.assertEqual(root["pct"], 51.0)
+        self.assertEqual([point[0] for point in root["points"]],
+                         [self.BASE, self.BASE + 3600, self.BASE + 7200])
+        self.assertEqual([point[1] for point in root["points"]], [50.0, 50.5, 51.0])
+        self.assertAlmostEqual(root["growth_per_day"], 12.0, places=2)
+        self.assertAlmostEqual(root["days_to_90"], 3.2, places=1)
+
+        data = volumes["/mnt/data"]
+        self.assertEqual(data["growth_per_day"], 0.0)
+        self.assertIsNone(data["days_to_90"])
+        # The fullest volume leads.
+        self.assertEqual(payload["volumes"][0]["mount"], "/mnt/data")
+
+    def test_metrics_summary_adds_a_compact_volume_summary(self):
+        for offset, pct in ((0, 50.0), (3600, 50.5), (7200, 51.0)):
+            self.sample([self.device(disk=pct, disks=[
+                self.volume("/", pct, "System", 1000, int(pct * 10)),
+                self.volume("/mnt/data", 80.0, "Data", 2000, 1600),
+            ])], now=self.BASE + offset)
+
+        summary = app.metrics_summary("24h", now=self.BASE + 7200)["devices"][0]
+        volumes = summary["volumes"]
+        self.assertEqual(volumes["count"], 2)
+        fullest = volumes["fullest"]
+        self.assertEqual(fullest["mount"], "/mnt/data")
+        self.assertEqual(fullest["label"], "Data")
+        self.assertEqual(fullest["pct"], 80.0)
+        self.assertEqual(fullest["total"], 2000)
+        self.assertEqual(fullest["growth_per_day"], 0.0)
+        self.assertIsNone(fullest["days_to_90"])
+        # The existing single-gauge summary is unchanged.
+        self.assertEqual(summary["disk_pct"], 51.0)
+
+    def test_a_device_without_volumes_reports_empty_volume_fields(self):
+        self.sample([self.device()], now=self.BASE)
+        summary = app.metrics_summary("1h", now=self.BASE + 60)["devices"][0]
+        self.assertEqual(summary["volumes"], {"count": 0, "fullest": None})
+        series_payload = app.metrics_series("docker01", "1h", 60, now=self.BASE + 60)
+        self.assertEqual(series_payload["volumes"], [])
+
 
 class MetricsPageSourceTest(FrontEndSourceTest):
     """The metrics page, chart markup and deploy wiring, asserted at the source."""
@@ -1623,3 +1776,52 @@ class MultiDiskTest(FrontEndSourceTest):
         # The base row keeps its three fixed metric cells, so single-disk
         # devices are no taller than before.
         self.assertRegex(self.css, r"\.device-row\s*\{[^}]*repeat\(3,\s*46px\)")
+
+
+class MetricsVolumeSourceTest(FrontEndSourceTest):
+    """Phase 1: per-volume history under the chart and inside the table view."""
+
+    def setUp(self):
+        super().setUp()
+        self.metrics_html = (APP_JS.parent / "metrics.html").read_text()
+        self.metrics_js = (APP_JS.parent / "metrics.js").read_text()
+        self.metrics_css = (APP_JS.parent / "metrics.css").read_text()
+
+    def test_volume_table_lives_under_the_chart_and_in_the_table_view(self):
+        self.assertIn('id="volume-section"', self.metrics_html)
+        self.assertIn('id="volume-table"', self.metrics_html)
+        self.assertIn('id="chart-volume-table"', self.metrics_html)
+        chart = self.metrics_html.index('id="chart"')
+        volumes = self.metrics_html.index('id="volume-section"')
+        rail = self.metrics_html.index('class="rail metrics-rail"')
+        self.assertLess(chart, volumes)
+        self.assertLess(volumes, rail)
+
+    def test_volume_rows_show_label_mount_pct_size_growth_and_days_to_full(self):
+        body = function_body(self.metrics_js, "volumeRow")
+        for needle in ("volume.mount", "volumeLabel(volume)", "pct(volume.pct)",
+                       "fmtBytes(volume.total)", "fmtGrowth(volume.growth_per_day)",
+                       "fmtDays(volume.days_to_90)"):
+            self.assertIn(needle, body)
+        self.assertIn("volume.label", function_body(self.metrics_js, "volumeLabel"))
+        growth = function_body(self.metrics_js, "fmtGrowth")
+        self.assertIn("/day", growth)
+
+    def test_volume_section_only_appears_for_more_than_one_volume(self):
+        body = function_body(self.metrics_js, "renderVolumes")
+        self.assertIn("series.volumes", body)
+        self.assertIn("volumes.length < 2", body)
+        self.assertIn("volumeSectionEl.hidden", body)
+        self.assertIn("renderVolumes()", function_body(self.metrics_js, "load"))
+
+    def test_table_view_includes_volume_rows(self):
+        body = function_body(self.metrics_js, "renderTable")
+        self.assertIn("renderVolumeTable()", body)
+        volume_body = function_body(self.metrics_js, "renderVolumeTable")
+        self.assertIn("volume.points", volume_body)
+        self.assertIn("chartVolumeTableEl", volume_body)
+
+    def test_volume_table_is_compact_and_scrolls_on_a_phone(self):
+        self.assertRegex(self.metrics_css, r"\.volume-table\s*\{")
+        self.assertRegex(self.metrics_css, r"\.volume-scroll\s*\{[^}]*overflow-x:\s*auto")
+        self.assertRegex(self.metrics_css, r"\.volume-table th,\s*\.volume-table td\s*\{")
