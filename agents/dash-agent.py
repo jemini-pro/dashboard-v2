@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Dashboard agent for macOS and Linux.
 
-Posts this machine's CPU, memory, disk and uptime to the homelab dashboard.
+Posts this machine's CPU, memory, every local volume and uptime to the homelab
+dashboard.
 Stdlib only. Run it every minute from cron/launchd, or with --loop.
 
     DASH_URL=https://pve.tail73491d.ts.net:8448 DASH_TOKEN=xxx ./dash-agent.py
@@ -95,13 +96,102 @@ def uptime_s():
     return int(time.time() - int(m.group(1))) if m else None
 
 
-def disk_pct():
-    du = shutil.disk_usage("/")
-    return round(100.0 * du.used / du.total, 1) if du.total else None
+# Real local filesystems only: pseudo mounts (tmpfs, cgroup, snap squashfs),
+# network shares and loop devices are not drives. The 1 GiB floor drops the
+# EFI/boot partitions nobody opens in the dashboard, and the cap matches the
+# server's per-heartbeat limit.
+REAL_FS = {
+    "ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs", "jfs", "reiserfs",
+    "vfat", "exfat", "ntfs", "ntfs3", "fuseblk", "msdos",
+    "hfs", "hfsplus", "apfs",
+}
+MIN_DISK_BYTES = 1 << 30
+MAX_DISKS = 16
+
+
+def mounts():
+    """Yield (device, mountpoint, fstype) for every mounted filesystem."""
+    if platform.system() == "Linux":
+        try:
+            with open("/proc/mounts") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 3:
+                        continue
+                    # The kernel escapes spaces, tabs and backslashes in \ooo.
+                    mount = (parts[1].replace("\\040", " ")
+                             .replace("\\011", "\t").replace("\\134", "\\"))
+                    yield parts[0], mount, parts[2]
+        except OSError:
+            return
+        return
+    # macOS: "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)"
+    for line in run("mount").splitlines():
+        # Split off the "(type, opts)" tail first: a mount point may itself
+        # contain " on " or " (" (e.g. /Volumes/My (Backup) Drive).
+        head, sep, tail = line.rpartition(" (")
+        device, on, mount = head.partition(" on ")
+        if not sep or not on:
+            continue
+        yield device, mount, tail.split(",", 1)[0].strip(" )")
+
+
+def volume_labels():
+    """Map a block device to its filesystem label, e.g. /dev/sdb1 -> External."""
+    labels = {}
+    try:
+        names = os.listdir("/dev/disk/by-label")
+    except OSError:
+        return labels
+    for name in names:
+        try:
+            labels[os.path.realpath(os.path.join("/dev/disk/by-label", name))] = name.replace("\\x20", " ")
+        except OSError:
+            pass
+    return labels
+
+
+def disks():
+    """Every real local volume, root first.
+
+    Pseudo filesystems, snap loops and duplicate bind mounts are skipped, and
+    the same physical volume mounted twice is reported once.
+    """
+    labels = volume_labels()
+    seen = set()
+    found = []
+    for device, mount, fstype in mounts():
+        if fstype not in REAL_FS or device.startswith("/dev/loop"):
+            continue
+        # macOS mirrors the same APFS container under /System/Volumes/*; those
+        # are implementation volumes, not drives a person recognises.
+        if mount.startswith("/System/Volumes/"):
+            continue
+        try:
+            st = os.stat(mount)
+            usage = shutil.disk_usage(mount)
+        except OSError:
+            continue
+        if st.st_dev in seen or usage.total < MIN_DISK_BYTES:
+            continue
+        label = labels.get(os.path.realpath(device)) if device.startswith("/dev/") else ""
+        if not label:
+            label = "System" if mount == "/" else (os.path.basename(mount.rstrip("/")) or mount)
+        seen.add(st.st_dev)
+        found.append({
+            "mount": mount,
+            "label": label[:32],
+            "total": usage.total,
+            "used": usage.used,
+            "pct": round(100.0 * usage.used / usage.total, 1),
+        })
+    found.sort(key=lambda d: (d["mount"] != "/", d["mount"]))
+    return found[:MAX_DISKS]
 
 
 def collect():
     used, total = mem()
+    volumes = disks()
     return {
         "name": NAME,
         "kind": KIND,
@@ -109,7 +199,10 @@ def collect():
         "mem_pct": round(100.0 * used / total, 1) if total else None,
         "mem_used": used,
         "mem_total": total,
-        "disk_pct": disk_pct(),
+        # One number for the whole device: the fullest volume, so a nearly full
+        # data or external drive cannot hide behind a roomy system disk.
+        "disk_pct": max((d["pct"] for d in volumes), default=None),
+        "disks": volumes,
         "uptime_s": uptime_s(),
     }
 

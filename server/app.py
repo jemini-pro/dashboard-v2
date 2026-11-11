@@ -157,6 +157,15 @@ def _uptime():
 def local_device():
     total, used = _mem()
     du = shutil.disk_usage(str(BASE))
+    disks = []
+    if du.total:
+        disks.append({
+            "mount": "/",
+            "label": "System",
+            "total": du.total,
+            "used": du.used,
+            "pct": round(100.0 * du.used / du.total, 1),
+        })
     return {
         "id": "docker01",
         "name": "docker01",
@@ -166,7 +175,8 @@ def local_device():
         "mem_pct": round(100.0 * used / total, 1) if total and used is not None else None,
         "mem_used": used,
         "mem_total": total,
-        "disk_pct": round(100.0 * du.used / du.total, 1) if du.total else None,
+        "disk_pct": disks[0]["pct"] if disks else None,
+        "disks": disks,
         "uptime_s": _uptime(),
         "online": True,
         "last_seen": int(time.time()),
@@ -191,11 +201,76 @@ def save_agents(agents):
     tmp.replace(AGENTS_FILE)
 
 
+# A device may legitimately have a handful of volumes (boot, data, external).
+# The cap keeps a bad or hostile heartbeat from turning the rail into a list of
+# a thousand mounts; the page has no room for them anyway.
+MAX_DISKS = 16
+
+
+def _finite(value):
+    """Return a real number or None. JSON can carry NaN/Infinity, and bools
+    are ints in Python, so both have to be rejected explicitly."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
+def clean_disks(raw):
+    """Validate the per-volume list an agent sends.
+
+    Agents are token-authenticated, but this is still untrusted input: a bad
+    entry must be dropped rather than stored and re-served to every browser.
+    """
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw[:MAX_DISKS]:
+        if not isinstance(item, dict):
+            continue
+        mount = item.get("mount")
+        if not isinstance(mount, str):
+            continue
+        mount = mount.strip()[:64]
+        if not mount:
+            continue
+        total = _finite(item.get("total"))
+        used = _finite(item.get("used"))
+        pct = _finite(item.get("pct"))
+        if total is None or total <= 0:
+            continue
+        if used is None and pct is not None:
+            used = pct / 100.0 * total
+        if pct is None and used is not None:
+            pct = 100.0 * used / total
+        if used is None or pct is None:
+            continue
+        label = item.get("label")
+        label = label.strip()[:32] if isinstance(label, str) else ""
+        out.append({
+            "mount": mount,
+            "label": label,
+            "total": int(total),
+            "used": int(max(0.0, min(used, total))),
+            "pct": round(max(0.0, min(100.0, pct)), 1),
+        })
+    return out
+
+
+def worst_disk_pct(disks, fallback):
+    """The DSK cell summarises the fullest volume, so a nearly full data or
+    external drive cannot hide behind a roomy root filesystem."""
+    values = [value for d in disks if (value := _finite(d.get("pct"))) is not None]
+    return max(values) if values else fallback
+
+
 def agent_devices():
     now = time.time()
     out = []
     for name, rec in load_agents().items():
         age = now - rec.get("last_seen", 0)
+        disks = rec.get("disks")
+        disks = disks if isinstance(disks, list) else []
         out.append({
             "id": f"agent:{name}",
             "name": rec.get("name", name),
@@ -205,7 +280,8 @@ def agent_devices():
             "mem_pct": rec.get("mem_pct"),
             "mem_used": rec.get("mem_used"),
             "mem_total": rec.get("mem_total"),
-            "disk_pct": rec.get("disk_pct"),
+            "disk_pct": worst_disk_pct(disks, rec.get("disk_pct")),
+            "disks": disks,
             "uptime_s": rec.get("uptime_s"),
             "online": age < 150,  # agents push every 60 s; allow two misses
             "last_seen": int(rec.get("last_seen", 0)),
@@ -904,6 +980,8 @@ class Handler(BaseHTTPRequestHandler):
             rec.update({k: payload[k] for k in (
                 "cpu_pct", "mem_pct", "mem_used", "mem_total",
                 "disk_pct", "uptime_s", "kind", "name") if k in payload})
+            if "disks" in payload:
+                rec["disks"] = clean_disks(payload["disks"])
             rec["last_seen"] = int(time.time())
             agents[name] = rec
             save_agents(agents)
