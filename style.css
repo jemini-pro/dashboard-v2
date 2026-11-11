@@ -27,6 +27,11 @@
     --muted: color-mix(in srgb, var(--text-color) 58%, transparent);
     --faint: color-mix(in srgb, var(--text-color) 38%, transparent);
 
+    /* Containment tree: pve host -> LXC guest -> Docker runtime. */
+    --tree-host: var(--accent-color);
+    --tree-lxc: #805ad5;
+    --tree-docker: #2f855a;
+
     /* Blob Colors Work */
     --blob-1-color: rgba(66, 153, 225, 0.3); /* blue */
     --blob-2-color: rgba(159, 122, 234, 0.2); /* purple */
@@ -47,6 +52,9 @@
     --sidebar-border: rgba(255, 255, 255, 0.03);
     --icon-bg: rgba(237, 137, 54, 0.12);
     --accent-color: #ed8936;
+
+    --tree-lxc: #b794f4;
+    --tree-docker: #68d391;
 
     /* Blob Colors Personal */
     --blob-1-color: rgba(237, 137, 54, 0.25); /* orange */
@@ -638,45 +646,144 @@ body {
     display: none;
 }
 
-.kind-chips {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 7px;
-    margin: 10px 0 8px;
+/* ---------- containment tree (dashboard + metrics rail) ---------- */
+
+.network-tree {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding-top: 2px;
 }
 
-.kind-chip {
-    display: grid;
-    grid-template-columns: 1fr auto;
-    gap: 1px 8px;
-    padding: 7px 9px;
-    border-radius: 10px;
-    background: var(--icon-bg);
+/* The left rule is the containment: a child sits inside its parent's line. */
+.network-branch {
+    position: relative;
+    margin-left: 5px;
+    padding-left: 9px;
+    border-left: 1px solid color-mix(in srgb, var(--text-color) 16%, transparent);
 }
 
-.kind-name {
-    font-size: 0.55rem;
-    font-weight: 600;
-    letter-spacing: 0.09em;
+.network-branch.is-host {
+    border-left-color: var(--tree-host);
+}
+
+.network-branch.is-guests {
+    border-left-color: var(--tree-lxc);
+}
+
+.network-branch.is-elsewhere {
+    margin-top: 7px;
+    padding-top: 1px;
+}
+
+.network-branch-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 0 2px;
+    font-size: 0.5rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
     text-transform: uppercase;
-    color: var(--muted);
+    color: var(--faint);
+}
+
+.network-branch-head > span:last-child {
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    text-transform: none;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
 }
 
-.kind-count {
-    font-size: 0.68rem;
+.network-branch.is-host > .network-branch-head {
+    color: var(--tree-host);
+}
+
+.network-branch.is-guests > .network-branch-head {
+    color: var(--tree-lxc);
+}
+
+/* Rows are separated inside a branch, but the Docker disclosure owns the
+   space below the docker01 row, so it must not draw a second top border. */
+.device-grid .network-node + .network-node {
+    border-top: 1px solid var(--sidebar-border);
+}
+
+.device-grid .network-node.is-docker > .device-row {
+    border-top: 0;
+}
+
+/* ---------- Docker engine ---------- */
+
+.docker-engine {
+    margin: 0 0 5px 12px;
+    padding: 4px 0 1px 9px;
+    border-left: 1px dashed color-mix(in srgb, var(--tree-docker) 46%, transparent);
+}
+
+.docker-engine-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.55rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--tree-docker);
+}
+
+.docker-engine-head > span:nth-child(2) {
+    flex: 1;
+}
+
+.docker-engine-count {
+    font-size: 0.5rem;
     font-weight: 600;
-    text-align: right;
+    letter-spacing: 0.04em;
+    text-transform: none;
+    color: var(--muted);
     font-variant-numeric: tabular-nums;
 }
 
-.kind-meta {
-    grid-column: 1 / -1;
-    font-size: 0.55rem;
-    color: var(--faint);
+.docker-glyph {
+    width: 12px;
+    height: 12px;
+    flex: none;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.25;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+
+.docker-containers {
+    padding: 2px 0 1px 1px;
+}
+
+.docker-container {
+    display: grid;
+    grid-template-columns: 8px minmax(0, auto) minmax(0, 1fr);
+    align-items: baseline;
+    gap: 6px;
+    padding: 2px 0;
+    min-width: 0;
+}
+
+.docker-container-name {
+    font-size: 0.66rem;
+    font-weight: 600;
     font-variant-numeric: tabular-nums;
+}
+
+.docker-container-role {
+    font-size: 0.54rem;
+    color: var(--faint);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .device-grid {
@@ -1054,8 +1161,8 @@ input:focus-visible {
         padding: 3px 0;
     }
 
-    .kind-chip {
-        padding: 6px 8px;
+    .network-branch-head {
+        padding: 4px 0 1px;
     }
 }
 

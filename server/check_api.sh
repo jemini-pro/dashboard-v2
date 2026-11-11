@@ -835,7 +835,7 @@ ok "annotations survived a full server restart ($annotations_after stored)"
 grep -q "Set-Cookie" "$APP" && fail "server sets a cookie"
 grep -q "document.cookie" "$REPO/app.js" && fail "front end touches document.cookie"
 grep -qE 'calendar\.google\.com|fonts\.googleapis\.com|fonts\.gstatic\.com' \
-    "$REPO/index.html" "$REPO/app.js" "$REPO/style.css" \
+    "$REPO/index.html" "$REPO/app.js" "$REPO/stack.js" "$REPO/style.css" \
     "$REPO/metrics.html" "$REPO/metrics.js" "$REPO/metrics.css" \
     && fail "front end still references the calendar iframe or Google Fonts"
 grep -qE 'https?://|document\.cookie' "$REPO/metrics.js" \
