@@ -19,6 +19,7 @@ a main column (Jump back in, Launchpad, All tools) and a Network rail. There is 
 | `server/bookmarks.seed.json` | fresh-install bookmark seed (the live store is never overwritten) |
 | `server/check_api.sh` | dependency-free black-box acceptance check |
 | `server/.env.example` | template for `dash/.env` (never commit `.env`) |
+| `stack.js` | shared PVE → LXC → Docker containment model for both rails |
 | `fonts/` | self-hosted Space Grotesk subset plus its OFL licence |
 | `agents/dash-agent.py` | Linux/macOS agent, posts every 60 s with all local volumes |
 | `agents/dash-agent.ps1` | Windows agent, PowerShell 5+, all fixed/removable drives |
@@ -33,8 +34,8 @@ a main column (Jump back in, Launchpad, All tools) and a Network rail. There is 
 |---|---|---|
 | `/api/health` | GET | `{ok}` |
 | `/api/bookmarks` | GET | the bookmark store, with a decayed `score` per item |
-| `/api/stats` | GET | devices array, cached 5 s; each device carries 24 h availability |
-| `/api/metrics/summary` | GET | per-device availability, averages, events, disk trend and a CPU sparkline |
+| `/api/stats` | GET | devices array, cached 5 s; each device carries 24 h availability, plus the pve → LXC → Docker `topology` |
+| `/api/metrics/summary` | GET | per-device availability, averages, events, disk trend and a CPU sparkline, plus the same `topology` |
 | `/api/metrics` | GET | one device's bucketed history: `?device=<id>&window=1h\|6h\|24h\|7d\|30d&step=<s>` |
 | `/api/hit` | POST | record a bookmark click (`{"url": "..."}` → `204`, no body) |
 | `/api/push/<name>` | POST | agent heartbeat, needs `X-Dash-Token`; optionally carries `disks` |
@@ -240,7 +241,7 @@ so copy the static front end there first:
 cd server
 cp .env.example .env            # fill DASH_TOKEN and DASH_AUTH_HASH, or skip Docker and run app.py directly
 mkdir -p static
-cp ../index.html ../app.js ../style.css ../metrics.html ../metrics.js ../metrics.css static/
+cp ../index.html ../app.js ../stack.js ../style.css ../metrics.html ../metrics.js ../metrics.css static/
 cp -r ../fonts static/
 DASH_DIR=. DASH_ENV_FILE=./.env CADDYFILE=./Caddyfile docker compose up -d
 ```
@@ -262,11 +263,11 @@ python3 -m unittest discover -s server -p 'test_*.py' -v
 server/check_api.sh
 ```
 
-For the layout, copy the six front-end files into `server/static/` and open the app:
+For the layout, copy the seven front-end files into `server/static/` and open the app:
 
 ```bash
 mkdir -p server/static
-cp index.html app.js style.css server/static/
+cp index.html app.js stack.js style.css server/static/
 env -u DASH_TOKEN DASH_PORT=8080 DASH_DATA_DIR=/tmp/dash-data python3 server/app.py
 ```
 
