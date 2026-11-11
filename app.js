@@ -552,6 +552,45 @@ function metricCell(metric, raw) {
         '</span>';
 }
 
+// Disk sizes read as "931 GB" / "1.8 TB". Binary units match what the OS shows
+// (a 1 TB drive is 931 GB here), which is less surprising than marketing units.
+function fmtBytes(bytes) {
+    if (!isNumericSample(bytes) || bytes <= 0) return '';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let value = bytes;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+        value /= 1024;
+        unit += 1;
+    }
+    const digits = unit === 0 || value >= 100 ? 0 : 1;
+    return value.toFixed(digits) + ' ' + units[unit];
+}
+
+function diskLabel(disk) {
+    return disk.label || disk.mount || 'disk';
+}
+
+function diskRow(disk) {
+    const pct = clampPct(disk.pct);
+    const warn = pct !== null && pct >= METRIC_WARN_PCT ? ' is-warn' : '';
+    const mount = escapeHtml(disk.mount || '');
+    return '<div class="disk-row' + warn + '" data-mount="' + mount + '" title="' + mount + '">' +
+        '<span class="disk-name">' + escapeHtml(diskLabel(disk)) + '</span>' +
+        '<span class="disk-size">' + escapeHtml(fmtBytes(disk.total)) + '</span>' +
+        '<span class="disk-bar"><i class="disk-fill" style="width:' + (pct === null ? 0 : pct) + '%"></i></span>' +
+        '<span class="disk-value">' + (pct === null ? '—' : Math.round(pct) + '%') + '</span>' +
+        '</div>';
+}
+
+// One volume is already summarised by the DSK cell; only a multi-volume device
+// needs the breakdown, so single-disk rows stay exactly as compact as before.
+function deviceDisks(d) {
+    const disks = Array.isArray(d.disks) ? d.disks : [];
+    if (disks.length < 2) return '';
+    return '<div class="device-disks">' + disks.map(diskRow).join('') + '</div>';
+}
+
 // Online rows read "kind · up 3d 4h · online"; offline rows keep their
 // last-seen time and say "offline". The status is text as well as the dot, so
 // assistive tech does not depend on colour.
@@ -598,6 +637,7 @@ function deviceRow(d) {
         '</span>' +
         '</div>' +
         DEVICE_METRICS.map((metric) => metricCell(metric, d[metric.field])).join('') +
+        deviceDisks(d) +
         '</div>';
 }
 
@@ -617,8 +657,15 @@ function renderNetwork(devices) {
     networkSummaryEl.textContent = networkSummary(devices);
 }
 
+// Mounts and labels are structure rather than values: if either changes, the
+// rows must be rebuilt instead of patched, or the old names would go stale.
+function diskKey(d) {
+    const disks = Array.isArray(d.disks) ? d.disks : [];
+    return disks.map((disk) => (disk.mount || '') + '~' + (disk.label || '')).join(',');
+}
+
 function networkKey(devices) {
-    return devices.map((d) => deviceKey(d) + ':' + (d.kind || '')).join('|');
+    return devices.map((d) => deviceKey(d) + ':' + (d.kind || '') + ':' + diskKey(d)).join('|');
 }
 
 function patchMetric(cell, raw) {
@@ -627,6 +674,15 @@ function patchMetric(cell, raw) {
     cell.classList.toggle('is-warn', value !== null && value >= METRIC_WARN_PCT);
     cell.querySelector('.metric-value').textContent = value === null ? '—' : Math.round(value) + '%';
     cell.querySelector('.metric-fill').style.width = (value === null ? 0 : value) + '%';
+}
+
+function patchDisk(row, disk) {
+    if (!row || !disk) return;
+    const value = clampPct(disk.pct);
+    row.classList.toggle('is-warn', value !== null && value >= METRIC_WARN_PCT);
+    row.querySelector('.disk-value').textContent = value === null ? '—' : Math.round(value) + '%';
+    row.querySelector('.disk-fill').style.width = (value === null ? 0 : value) + '%';
+    row.querySelector('.disk-size').textContent = fmtBytes(disk.total);
 }
 
 // The 10s poll changes values, not structure: existing device rows and kind
@@ -654,6 +710,8 @@ function patchNetwork(devices) {
         DEVICE_METRICS.forEach((metric) => {
             patchMetric(row.querySelector('[data-metric="' + metric.key + '"]'), d[metric.field]);
         });
+        const disks = Array.isArray(d.disks) ? d.disks : [];
+        row.querySelectorAll('.disk-row').forEach((diskEl, i) => patchDisk(diskEl, disks[i]));
     });
 
     const groups = groupDevicesByKind(devices);

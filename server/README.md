@@ -20,8 +20,8 @@ a main column (Jump back in, Launchpad, All tools) and a Network rail. There is 
 | `server/check_api.sh` | dependency-free black-box acceptance check |
 | `server/.env.example` | template for `dash/.env` (never commit `.env`) |
 | `fonts/` | self-hosted Space Grotesk subset plus its OFL licence |
-| `agents/dash-agent.py` | Linux/macOS agent, posts every 60 s |
-| `agents/dash-agent.ps1` | Windows agent, PowerShell 5+ |
+| `agents/dash-agent.py` | Linux/macOS agent, posts every 60 s with all local volumes |
+| `agents/dash-agent.ps1` | Windows agent, PowerShell 5+, all fixed/removable drives |
 | `agents/com.jem.dashagent.plist` | macOS LaunchAgent, token from `~/dash/.token` |
 | `agents/install-windows-agent.ps1` | Windows installer, hidden via `wscript` |
 | `agents/pve-host-agent.py` | Proxmox host agent (host metrics + guest list) |
@@ -37,7 +37,7 @@ a main column (Jump back in, Launchpad, All tools) and a Network rail. There is 
 | `/api/metrics/summary` | GET | per-device availability, averages, events, disk trend and a CPU sparkline |
 | `/api/metrics` | GET | one device's bucketed history: `?device=<id>&window=1h\|6h\|24h\|7d\|30d&step=<s>` |
 | `/api/hit` | POST | record a bookmark click (`{"url": "..."}` → `204`, no body) |
-| `/api/push/<name>` | POST | agent heartbeat, needs `X-Dash-Token` |
+| `/api/push/<name>` | POST | agent heartbeat, needs `X-Dash-Token`; optionally carries `disks` |
 
 Reads are behind the Caddy basic-auth password on the tailnet. `/api/push/*` is the only
 path exempt from that password and uses `X-Dash-Token` instead — a leaked push token can
@@ -111,6 +111,12 @@ overflow. At the target desktop sizes every core section fits in one screen.
 | All tools | every category in store order, numbered rows, live search count |
 | Network | `n/m online · x% avg CPU`, kind-average chips, compact device rows with 24 h availability, and a **Metrics →** link |
 
+A device that reports more than one volume gets a compact breakdown under its row
+(label, size, bar, percentage). The `DSK` cell stays a single gauge and shows the
+**fullest** volume, so a nearly full data or external drive cannot hide behind a roomy
+system disk. Single-volume devices render no extra line, keeping the rail at its old
+height.
+
 - Search filters title, description and category case-insensitively, shows `x of N tools`
   and names the query when nothing matches. `/` focuses the field; `Esc` clears and blurs.
 - Health is amber when any device is offline and green only when all are. Device status is
@@ -127,6 +133,23 @@ Responsive rules:
 - `≤600px`: All tools uses one column; the Launchpad auto-fits four tiles per row.
 - `≤850px` height: tighter shell/card padding, a shorter usage list and tighter device rows
   so **1280×800** still fits without page scroll.
+
+### Disk reporting
+
+`/api/push/<name>` accepts an optional `disks` array alongside `disk_pct`:
+
+```json
+"disks": [
+  {"mount": "C:\\", "label": "Windows", "total": 1000204886016, "used": 987000000000, "pct": 98.7}
+]
+```
+
+`dash-agent.ps1` reports every fixed and removable Windows volume, not just `C:`.
+`dash-agent.py` reports every real local Linux/macOS filesystem, root first, skipping
+pseudo filesystems, snap loops and duplicate mounts. The server drops malformed entries,
+caps the list at 16 and recomputes `disk_pct` as the fullest volume. Agents that have not
+been updated keep working: they send only `disk_pct`, so they get no breakdown and their
+single gauge stays as it was.
 
 ## Jump back in (click scores)
 
@@ -199,9 +222,9 @@ docker compose up -d
 
 `server/deploy.sh [ref]` (run as root on `docker01`) fetches the ref, preflights for
 third-party references, backs up `/opt/stack`, preserves or creates `DASH_AUTH_HASH`,
-installs the server, static files and fonts, runs `docker compose up -d`, and smoke-tests
-both the rendered page and the unauthenticated 401. It prints the exact rollback command.
-No CI.
+installs the server, static files, fonts and the served copies of the agents, runs
+`docker compose up -d`, and smoke-tests both the rendered page and the unauthenticated
+401. It prints the exact rollback command. No CI.
 
 `/opt/stack/dash/data/bookmarks.json` is the single source of truth for bookmarks, and is
 read per request: edit it, reload the page, no restart. `/api/bookmarks` returns that

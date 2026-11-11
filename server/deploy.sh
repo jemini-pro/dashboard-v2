@@ -72,6 +72,14 @@ install -m 0644 "$BUILD/metrics.css" "$STACK/dash/static/metrics.css"
 rm -rf "$STACK/dash/static/fonts"
 mkdir -p "$STACK/dash/static/fonts"
 cp -a "$BUILD/fonts/." "$STACK/dash/static/fonts/"
+# The installers fetch these from /agents/..., so publish the current agent
+# files with every deploy instead of leaving a hand-copied stale version on the
+# box. Existing unrelated files in that directory are left alone.
+install -d "$STACK/dash/static/agents"
+for f in dash-agent.py dash-agent.ps1 pve-host-agent.py \
+         com.jem.dashagent.plist install-windows-agent.ps1 install-pve-host-agent.sh; do
+    install -m 0644 "$BUILD/agents/$f" "$STACK/dash/static/agents/$f"
+done
 install -m 0644 "$BUILD/server/Caddyfile" "$STACK/caddy/Caddyfile"
 install -m 0644 "$BUILD/server/docker-compose.yml" "$STACK/docker-compose.yml"
 

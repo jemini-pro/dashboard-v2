@@ -312,6 +312,9 @@ class PushTokenTest(ApiTestCase):
         self._old_token, self._old_agents_file = app.TOKEN, app.AGENTS_FILE
         app.TOKEN = self.TOKEN
         app.AGENTS_FILE = self.data / "agents.json"
+        # stats() caches for 5 s, which would leak one test's devices into the
+        # next one's /api/stats assertion.
+        app._cache = {"at": 0.0, "body": None}
 
     def tearDown(self):
         app.TOKEN, app.AGENTS_FILE = self._old_token, self._old_agents_file
@@ -324,6 +327,17 @@ class PushTokenTest(ApiTestCase):
             path="/api/push/" + name,
             headers=headers,
         )
+
+    def push_payload(self, payload, name="JEM-PC"):
+        return self.post(
+            json.dumps(payload).encode(),
+            path="/api/push/" + name,
+            headers={"X-Dash-Token": self.TOKEN},
+        )
+
+    def stored_device(self, name):
+        _, body = self.get_json("/api/stats")
+        return next(d for d in body["devices"] if d["id"] == "agent:" + name)
 
     def test_correct_token_is_accepted_and_the_agent_is_stored(self):
         status, body = self.push(self.TOKEN)
@@ -345,6 +359,65 @@ class PushTokenTest(ApiTestCase):
         with mock.patch("app.hmac.compare_digest", wraps=hmac.compare_digest) as spy:
             self.assertEqual(self.push(self.TOKEN)[0], 200)
         self.assertTrue(spy.called, "push token is compared with a plain ==")
+
+    def test_every_volume_is_stored_and_the_fullest_drives_the_summary(self):
+        status, _ = self.push_payload({
+            "kind": "pc",
+            "disk_pct": 12.0,
+            "disks": [
+                {"mount": "C:\\", "label": "Windows", "total": 1000, "used": 120, "pct": 12.0},
+                {"mount": "D:\\", "label": "Data", "total": 1000, "used": 987, "pct": 98.7},
+                {"mount": "E:\\", "label": "External", "total": 2000, "used": 400, "pct": 20.0},
+            ],
+        })
+        self.assertEqual(status, 200)
+        device = self.stored_device("JEM-PC")
+        self.assertEqual([d["mount"] for d in device["disks"]], ["C:\\", "D:\\", "E:\\"])
+        self.assertEqual([d["label"] for d in device["disks"]], ["Windows", "Data", "External"])
+        # The single DSK gauge must not stay pinned to C: when D: is nearly full.
+        self.assertEqual(device["disk_pct"], 98.7)
+        stored = json.loads((self.data / "agents.json").read_text())["JEM-PC"]
+        self.assertEqual(len(stored["disks"]), 3)
+
+    def test_malformed_disk_entries_are_dropped_and_values_clamped(self):
+        status, _ = self.push_payload({
+            "kind": "pc",
+            "disks": [
+                {"mount": "/good", "label": "Good", "total": 100, "used": 250, "pct": 250},
+                {"mount": "", "label": "empty mount", "total": 100, "used": 1, "pct": 1},
+                {"mount": "/negative", "total": -1, "used": 0, "pct": 0},
+                {"mount": "/nan", "total": 100, "used": 10, "pct": float("nan")},
+                {"mount": "/string", "total": 100, "used": 10, "pct": "high"},
+                "not a dict",
+                {"mount": "/missing", "label": "Computed", "total": 100, "used": 10},
+            ],
+        })
+        self.assertEqual(status, 200)
+        device = self.stored_device("JEM-PC")
+        self.assertEqual([d["mount"] for d in device["disks"]], ["/good", "/nan", "/string", "/missing"])
+        self.assertEqual(device["disks"][0]["used"], 100)  # clamped to total
+        self.assertEqual(device["disks"][0]["pct"], 100.0)
+        # A missing or non-numeric pct is recovered from used/total.
+        self.assertEqual([d["pct"] for d in device["disks"][1:]], [10.0, 10.0, 10.0])
+
+    def test_disk_list_is_capped_so_one_heartbeat_cannot_flood_the_panel(self):
+        status, _ = self.push_payload({
+            "kind": "pc",
+            "disks": [
+                {"mount": "/disk%d" % i, "total": 100, "used": 1, "pct": 1}
+                for i in range(app.MAX_DISKS + 20)
+            ],
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(len(self.stored_device("JEM-PC")["disks"]), app.MAX_DISKS)
+
+    def test_an_old_agent_without_disks_still_works(self):
+        # Single-volume agents keep pushing only disk_pct; the page must not
+        # invent a breakdown for them.
+        self.assertEqual(self.push(self.TOKEN)[0], 200)
+        device = self.stored_device("pve")
+        self.assertEqual(device["disks"], [])
+        self.assertIsNone(device["disk_pct"])
 
 
 class FrontEndSourceTest(unittest.TestCase):
@@ -1489,3 +1562,64 @@ class MetricsPageSourceTest(FrontEndSourceTest):
         # live, not just that the static page was installed.
         self.assertIn("--force-recreate", deploy)
         self.assertIn("/api/metrics/summary", smoke)
+class MultiDiskTest(FrontEndSourceTest):
+    """A PC with more than one drive must show every volume, not just root.
+
+    Single-volume devices keep the compact three-metric row; the breakdown is
+    added only when the payload carries more than one disk.
+    """
+
+    def test_breakdown_only_appears_for_more_than_one_volume(self):
+        body = function_body(self.js, "deviceDisks")
+
+        self.assertIn("Array.isArray(d.disks)", body)
+        self.assertIn("disks.length < 2", body)
+        self.assertIn("disks.map(diskRow)", body)
+        self.assertIn("deviceDisks(d)", function_body(self.js, "deviceRow"))
+
+    def test_disk_row_shows_label_size_bar_and_percentage(self):
+        body = function_body(self.js, "diskRow")
+
+        self.assertIn("diskLabel(disk)", body)
+        self.assertIn("escapeHtml(", body)
+        self.assertIn("fmtBytes(disk.total)", body)
+        self.assertIn('data-mount="', body)
+        self.assertIn('class="disk-fill"', body)
+        self.assertIn("clampPct(disk.pct)", body)
+        self.assertIn("METRIC_WARN_PCT", body)
+        self.assertIn("'—'", body)
+
+        fmt = function_body(self.js, "fmtBytes")
+        self.assertIn("1024", fmt)
+        self.assertIn("'TB'", fmt)
+
+    def test_disk_identity_is_part_of_the_row_key_so_names_cannot_go_stale(self):
+        key = function_body(self.js, "diskKey")
+
+        self.assertIn("disk.mount", key)
+        self.assertIn("disk.label", key)
+        self.assertIn("diskKey(d)", function_body(self.js, "networkKey"))
+        self.assertIn("deviceKey(d)", function_body(self.js, "networkKey"))
+
+    def test_poll_patches_disk_values_in_place_without_rebuilding_the_rows(self):
+        body = function_body(self.js, "patchDisk")
+
+        self.assertNotIn("innerHTML", body)
+        self.assertIn("style.width", body)
+        self.assertIn("disk-value", body)
+        self.assertIn("disk-size", body)
+
+        patch = function_body(self.js, "patchNetwork")
+        self.assertIn(".disk-row", patch)
+        self.assertIn("patchDisk(", patch)
+
+    def test_each_volume_reads_as_a_compact_line_under_the_device(self):
+        self.assertRegex(
+            self.css, r"\.device-disks\s*\{[^}]*grid-column:\s*1 / -1"
+        )
+        self.assertRegex(self.css, r"\.disk-row\s*\{[^}]*grid-template-columns:")
+        self.assertRegex(self.css, r"\.disk-bar\s*\{[^}]*height:\s*3px")
+        self.assertRegex(self.css, r"\.disk-row\.is-warn \.disk-fill\s*\{[^}]*#ed8936")
+        # The base row keeps its three fixed metric cells, so single-disk
+        # devices are no taller than before.
+        self.assertRegex(self.css, r"\.device-row\s*\{[^}]*repeat\(3,\s*46px\)")

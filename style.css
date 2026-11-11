@@ -834,6 +834,68 @@ body {
     background: #ed8936;
 }
 
+/* Multi-volume devices get one compact line per disk beneath the metric row.
+   Single-volume rows render nothing here, so the rail keeps its old height. */
+.device-disks {
+    grid-column: 1 / -1;
+    display: grid;
+    gap: 3px;
+    margin: 1px 0;
+}
+
+.disk-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1.3fr) 48px minmax(24px, 1fr) 32px;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+}
+
+.disk-name {
+    font-size: 0.55rem;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.disk-size {
+    font-size: 0.5rem;
+    color: var(--faint);
+    text-align: right;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+}
+
+.disk-bar {
+    height: 3px;
+    border-radius: 999px;
+    background: var(--icon-bg);
+    overflow: hidden;
+}
+
+.disk-fill {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--accent-color);
+    transition: width 0.5s ease;
+}
+
+.disk-value {
+    font-size: 0.58rem;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+.disk-row.is-warn .disk-value {
+    color: #ed8936;
+}
+
+.disk-row.is-warn .disk-fill {
+    background: #ed8936;
+}
+
 .device-empty {
     font-size: 0.75rem;
     color: var(--muted);
