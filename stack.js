@@ -40,8 +40,12 @@
         const guests = list.filter((device) =>
             device !== host && device !== dockerHost &&
             (device.kind === 'lxc' || device.kind === 'lxc-guest'));
+        // Containers belong inside the Docker block. Listing them again as
+        // free-standing cards put every container on the page twice.
         const others = list.filter((device) =>
-            device !== host && device !== dockerHost && guests.indexOf(device) === -1);
+            device !== host && device !== dockerHost &&
+            device.kind !== 'container' &&
+            guests.indexOf(device) === -1);
         const containers = described && Array.isArray(topology.containers)
             ? topology.containers
             : [];
@@ -59,24 +63,33 @@
 
     // State is carried by the text as well as the dot; a colour alone would
     // leave the container's health unreadable to assistive tech.
-    function containerRow(container) {
+    //
+    // Given the matching device, the row becomes the button that opens that
+    // container's series. The Docker block is the only place a container is
+    // listed, so this is the sole handle on its metrics.
+    function containerRow(container, device) {
         const item = container && typeof container === 'object' ? container : {};
         const name = String(item.name || 'container');
         const role = String(item.role || '');
         const state = String(item.state || 'running');
         const detail = state + (role ? ' · ' + role : '');
-        return '<div class="docker-container" title="' +
-            escapeHtml(name + ' · ' + detail) + '">' +
+        const body =
             '<span class="device-dot ' +
             (state === 'running' ? 'online' : 'offline') +
             '" aria-hidden="true"></span>' +
             '<span class="docker-container-name">' + escapeHtml(name) + '</span>' +
-            '<span class="docker-container-role">' + escapeHtml(detail) + '</span>' +
-            '</div>';
+            '<span class="docker-container-role">' + escapeHtml(detail) + '</span>';
+        const title = escapeHtml(name + ' · ' + detail);
+        if (!device) {
+            return '<div class="docker-container" title="' + title + '">' + body + '</div>';
+        }
+        return '<button type="button" class="docker-container is-selectable" title="' +
+            title + '" data-device="' + escapeHtml(keyOf(device)) + '">' + body + '</button>';
     }
 
-    function dockerEngine(containers) {
+    function dockerEngine(containers, resolveDevice) {
         if (!Array.isArray(containers) || !containers.length) return '';
+        const find = typeof resolveDevice === 'function' ? resolveDevice : function () { return null; };
         const running = containers.filter((container) =>
             container && container.state === 'running').length;
         return '<div class="docker-engine">' +
@@ -91,7 +104,8 @@
             '<span class="docker-engine-count">' + running + ' running</span>' +
             '</h4>' +
             '<div class="docker-containers">' +
-            containers.map(containerRow).join('') +
+            containers.map((container) =>
+                containerRow(container, find(container && container.name))).join('') +
             '</div></div>';
     }
 

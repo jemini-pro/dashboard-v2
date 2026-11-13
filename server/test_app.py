@@ -2246,7 +2246,10 @@ class MetricsPageSourceTest(FrontEndSourceTest):
         body = function_body(self.metrics_js, "metricsTree")
 
         self.assertIn("dashboardStack.group(devices, summary && summary.topology)", body)
-        self.assertIn("dashboardStack.dockerEngine(stack.containers)", body)
+        # A container row is the only handle on a container's series, so the
+        # tree resolves each Docker row back to its device.
+        self.assertIn("dashboardStack.dockerEngine(stack.containers,", body)
+        self.assertIn("device.kind === 'container'", body)
         self.assertIn("'PVE host'", body)
         self.assertIn("'LXC guests'", body)
         self.assertIn("'Elsewhere'", body)
@@ -2550,3 +2553,40 @@ class MetricsAnnotationsWarningsSourceTest(FrontEndSourceTest):
         self.assertIn("device-warn", row)
         self.assertIn("warning_count", function_body(self.source, "networkKey"))
         self.assertRegex(self.css, r"\.device-warn\s*\{")
+
+
+class DockerContainerRailTest(FrontEndSourceTest):
+    """A container is listed once: in the Docker block, never as a card too.
+
+    There is no JS runtime in this suite, so these assert the seams: the group
+    filter, the selectable row markup, and the resolver the metrics tree passes
+    in. The rendered result was checked against a live payload separately.
+    """
+
+    def setUp(self):
+        super().setUp()
+        root = APP_JS.parent
+        self.stack = (root / "stack.js").read_text()
+        self.metrics = (root / "metrics.js").read_text()
+
+    def test_containers_are_excluded_from_the_free_standing_cards(self):
+        self.assertIn("device.kind !== 'container'", self.stack)
+        # The filter that builds `others` is the one that has to carry it.
+        others = self.stack.split("const others =", 1)[1].split(";", 1)[0]
+        self.assertIn("container", others)
+
+    def test_a_container_row_becomes_a_series_selector_when_it_has_a_device(self):
+        row = self.stack.split("function containerRow", 1)[1].split("function dockerEngine", 1)[0]
+        self.assertIn("device", row)
+        self.assertIn("data-device=", row)
+        self.assertIn("is-selectable", row)
+
+    def test_the_metrics_tree_resolves_each_container_to_its_device(self):
+        self.assertIn("dockerEngine(stack.containers,", self.metrics)
+        self.assertIn("device.kind === 'container'", self.metrics)
+
+    def test_the_selectable_row_is_styled_not_like_a_default_button(self):
+        self.assertIn(".docker-container.is-selectable", self.css)
+        block = self.css.split(".docker-container.is-selectable {", 1)[1].split("}", 1)[0]
+        self.assertIn("border: 0", block)
+        self.assertIn("background: none", block)
