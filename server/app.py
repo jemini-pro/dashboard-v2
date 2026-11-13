@@ -221,13 +221,28 @@ DOCKER_CONTAINERS = (
     {"name": "dash", "role": "this dashboard · :8000", "state": "running"},
 )
 
+# Display-only strings a container agent may report. They are never charted,
+# so they get their own short allowlist rather than joining EXTRA_METRICS.
+CONTAINER_FIELDS = ("state", "role")
+MAX_CONTAINER_TEXT = 64
+
+
+def clean_text(value, limit=MAX_CONTAINER_TEXT):
+    """Trim an agent string into something safe to re-serve to every browser."""
+    if not isinstance(value, str):
+        return None
+    value = "".join(ch for ch in value if ch.isprintable()).strip()[:limit]
+    return value or None
+
 
 def stack_topology(devices):
     """Describe where this dashboard runs: pve -> docker01 LXC -> Docker.
 
     The page itself is served by the dash container through caddy, so both are
     running whenever this payload can be read. Their names and roles are
-    static; the device ids are matched against the live list.
+    static. Any device an agent reports with kind "container" is appended on
+    top, carrying its own state, so the Docker block is not a standing claim
+    that every container is up.
     """
     host = next(
         (d for d in devices if d.get("kind") == "host" and d.get("name") == "pve"),
@@ -236,10 +251,30 @@ def stack_topology(devices):
     if host is None:
         host = next((d for d in devices if d.get("kind") == "host"), None)
     docker_host = next((d for d in devices if d.get("id") == "docker01"), None)
+
+    containers = [dict(c) for c in DOCKER_CONTAINERS]
+    known = {c["name"] for c in containers}
+    for device in devices:
+        if device.get("kind") != "container":
+            continue
+        name = device.get("name") or str(device.get("id", "")).split(":")[-1]
+        if not name or name in known:
+            continue
+        known.add(name)
+        # A stored state goes stale when the container stops reporting, so
+        # freshness wins: a silent container is exited, whatever it last said.
+        online = bool(device.get("online"))
+        containers.append({
+            "name": name,
+            "role": device.get("role") or "container",
+            "state": (device.get("state") if online else None)
+            or ("running" if online else "exited"),
+        })
+
     return {
         "host_id": host.get("id") if host else None,
         "docker_host_id": docker_host.get("id") if docker_host else None,
-        "containers": [dict(c) for c in DOCKER_CONTAINERS] if docker_host else [],
+        "containers": containers if docker_host else [],
     }
 
 
@@ -372,6 +407,7 @@ def agent_devices():
             "uptime_s": rec.get("uptime_s"),
             **{metric: rec.get(metric) for metric in EXTRA_METRICS
                if metric in rec},
+            **{key: rec[key] for key in CONTAINER_FIELDS if key in rec},
             "online": age < 150,  # agents push every 60 s; allow two misses
             "last_seen": int(rec.get("last_seen", 0)),
         })
@@ -2056,6 +2092,10 @@ class Handler(BaseHTTPRequestHandler):
                 if k in payload})
             if "disks" in payload:
                 rec["disks"] = clean_disks(payload["disks"])
+            for key in CONTAINER_FIELDS:
+                cleaned = clean_text(payload.get(key))
+                if cleaned:
+                    rec[key] = cleaned
             rec["last_seen"] = int(time.time())
             agents[name] = rec
             save_agents(agents)

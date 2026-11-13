@@ -357,6 +357,66 @@ class PushTokenTest(ApiTestCase):
     def test_missing_token_is_rejected(self):
         self.assertEqual(self.push()[0], 401)
 
+    def test_a_container_agent_is_listed_in_the_docker_block(self):
+        self.push_payload(
+            {
+                "kind": "container",
+                "name": "sams-uwu-gf",
+                "cpu_pct": 0.4,
+                "mem_pct": 5.1,
+                "mem_used": 104857600,
+                "mem_total": 2048000000,
+                "state": "running",
+                "role": "discord bot · healthy",
+            },
+            name="sams-uwu-gf",
+        )
+        app._cache.update(at=0.0, body=None)
+
+        with frozen_time():
+            body = app.stats()
+
+        containers = {c["name"]: c for c in body["topology"]["containers"]}
+        self.assertIn("sams-uwu-gf", containers)
+        self.assertEqual(containers["sams-uwu-gf"]["state"], "running")
+        self.assertEqual(containers["sams-uwu-gf"]["role"], "discord bot · healthy")
+        # The static entries are still described alongside it.
+        self.assertIn("caddy", containers)
+        self.assertIn("dash", containers)
+
+        device = next(d for d in body["devices"] if d["id"] == "agent:sams-uwu-gf")
+        self.assertEqual(device["kind"], "container")
+        self.assertEqual(device["mem_used"], 104857600)
+
+    def test_a_container_that_stops_reporting_reads_as_exited(self):
+        self.push_payload(
+            {"kind": "container", "name": "uwu", "state": "running"}, name="uwu"
+        )
+        stored = json.loads((self.data / "agents.json").read_text())
+        stored["uwu"]["last_seen"] = int(time.time()) - 3600
+        (self.data / "agents.json").write_text(json.dumps(stored))
+
+        app._cache.update(at=0.0, body=None)
+        containers = {c["name"]: c for c in app.stats()["topology"]["containers"]}
+
+        # A stored "running" must not outlive the heartbeat.
+        self.assertEqual(containers["uwu"]["state"], "exited")
+
+    def test_container_state_and_role_are_sanitised(self):
+        self.push_payload(
+            {"kind": "container", "name": "odd", "state": "run\x00ning",
+             "role": "r" * 200},
+            name="odd",
+        )
+        app._cache.update(at=0.0, body=None)
+
+        with frozen_time():
+            body = app.stats()
+
+        container = next(c for c in body["topology"]["containers"] if c["name"] == "odd")
+        self.assertNotIn("\x00", container["state"])
+        self.assertEqual(len(container["role"]), app.MAX_CONTAINER_TEXT)
+
     def test_stats_describes_the_pve_docker_stack(self):
         self.push_payload({"name": "pve", "kind": "host"}, name="pve")
         app._cache.update(at=0.0, body=None)
