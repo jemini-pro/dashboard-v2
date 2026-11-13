@@ -786,6 +786,28 @@ body {
     text-overflow: ellipsis;
 }
 
+/* A container row doubles as its series selector on the metrics page, so the
+   button has to disappear into the list it sits in. */
+.docker-container.is-selectable {
+    width: 100%;
+    font: inherit;
+    color: inherit;
+    text-align: left;
+    background: none;
+    border: 0;
+    border-radius: 5px;
+    cursor: pointer;
+}
+
+.docker-container.is-selectable:hover {
+    background: rgba(127, 127, 127, 0.14);
+}
+
+.docker-container.is-selectable:focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: 1px;
+}
+
 .device-grid {
     display: grid;
     grid-template-columns: 1fr;

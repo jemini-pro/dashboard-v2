@@ -420,7 +420,9 @@ function metricsTree(devices) {
     if (stack.dockerHost) {
         guests += '<div class="network-node is-docker">' +
             deviceItem(stack.dockerHost) +
-            window.dashboardStack.dockerEngine(stack.containers) +
+            window.dashboardStack.dockerEngine(stack.containers, (name) =>
+                devices.find((device) =>
+                    device.kind === 'container' && device.name === name)) +
             '</div>';
     }
     stack.guests.forEach((guest) => {
