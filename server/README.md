@@ -173,9 +173,12 @@ The Metrics page (`/metrics.html`) uses the same data:
   Network rail shows the same live-only chip from `/api/stats`;
 - dashed chart markers for every annotation in the window, with the note on
   the SVG `<title>`, and an Events row for each manual annotation;
-- a fleet summary (online count, average availability, peak CPU, disk
+- a fleet summary (device online count, average availability, peak CPU, disk
   pressure), a device list with 5-minute CPU sparklines, and an events rail
-  (offline / back online / restarted, newest first).
+  (offline / back online / restarted, newest first). Docker containers are
+  charted under their host but are not devices: the `n/m online` tallies on
+  both pages skip `kind="container"`, so one stopped container cannot turn the
+  fleet amber.
 
 The dashboard's Network rail links to it and shows a compact `24h <n>%` chip
 on each device row once the first samples exist. The page and its CSS/JS are served from

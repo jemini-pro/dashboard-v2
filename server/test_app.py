@@ -2615,3 +2615,51 @@ class DockerContainerRailTest(FrontEndSourceTest):
         block = self.css.split(".docker-container.is-selectable {", 1)[1].split("}", 1)[0]
         self.assertIn("border: 0", block)
         self.assertIn("background: none", block)
+
+
+class DeviceCountTest(FrontEndSourceTest):
+    """Containers run on the counted Docker host, so n/m online stays a device count.
+
+    The container agent pushes each container as a device so its CPU/RAM can be
+    charted. That device row must not make the fleet look two machines bigger,
+    nor turn the health dot amber when a container exits. Both rails share the
+    filter so the dashboard and metrics page cannot drift apart.
+    """
+
+    def setUp(self):
+        super().setUp()
+        root = APP_JS.parent
+        self.stack = (root / "stack.js").read_text()
+        self.metrics = (root / "metrics.js").read_text()
+
+    def test_the_shared_helper_drops_container_kind(self):
+        body = function_body(self.stack, "countedDevices")
+        self.assertIn("device.kind !== 'container'", body)
+        self.assertIn("Array.isArray", body)
+        self.assertIn("countedDevices: countedDevices", self.stack)
+
+    def test_dashboard_counts_through_the_shared_helper(self):
+        for name in ("deviceCounts", "averageSample"):
+            self.assertIn(
+                "dashboardStack.countedDevices(",
+                function_body(self.js, name),
+                name,
+            )
+        # Both the rail summary and the toolbar health read deviceCounts, so
+        # filtering there fixes the status and the device count together.
+        self.assertIn("deviceCounts(devices)",
+                      function_body(self.js, "networkSummary"))
+        self.assertIn("deviceCounts(devices)",
+                      function_body(self.js, "renderHealth"))
+
+    def test_metrics_page_counts_through_the_shared_helper(self):
+        for name in ("renderTiles", "renderDevices", "renderHealth"):
+            self.assertIn(
+                "dashboardStack.countedDevices(",
+                function_body(self.metrics, name),
+                name,
+            )
+        # The tree still receives every device so a container row can select
+        # its own series; only the tallies are filtered.
+        self.assertIn("metricsTree(devices)",
+                      function_body(self.metrics, "renderDevices"))
