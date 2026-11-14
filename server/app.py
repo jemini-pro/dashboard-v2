@@ -1894,6 +1894,13 @@ CONTENT_TYPES = {
     ".png": "image/png",
     ".ico": "image/x-icon",
     ".woff2": "font/woff2",
+    # Agents fetch these over HTTP and, in the PowerShell case, compare the
+    # response text with the installed copy. octet-stream would hand it a byte
+    # array instead of a string, so keep them textual.
+    ".ps1": "text/plain; charset=utf-8",
+    ".py": "text/plain; charset=utf-8",
+    ".sh": "text/plain; charset=utf-8",
+    ".plist": "text/plain; charset=utf-8",
 }
 
 

@@ -18,6 +18,29 @@ $DashUrl   = if ($env:DASH_URL)   { $env:DASH_URL }   else { "https://pve.tail73
 $DashToken = $env:DASH_TOKEN
 $Name      = if ($env:DASH_NAME)  { $env:DASH_NAME }  else { $env:COMPUTERNAME }
 
+# Nobody revisits an installed agent: the scheduled task keeps running whatever
+# the installer downloaded, so a fix on the server would otherwise never reach
+# this machine. Pull the served copy each run and swap it in when it differs,
+# then keep going with the code already loaded; the next run uses the new file.
+# Best effort: an unreachable server must never stop the heartbeat.
+# Set DASH_AGENT_UPDATE=0 to pin a development copy.
+if ($PSCommandPath -and $env:DASH_AGENT_UPDATE -ne "0") {
+    try {
+        # identity keeps Caddy from gzipping it: .Content must be text, not a
+        # compressed byte array, for the comparison below to mean anything.
+        $served = (Invoke-WebRequest -Uri "$DashUrl/agents/dash-agent.ps1" `
+            -UseBasicParsing -TimeoutSec 15 -Headers @{ "Accept-Encoding" = "identity" }).Content
+        $current = Get-Content -LiteralPath $PSCommandPath -Raw
+        if ($served -and $served.Trim() -ne $current.Trim()) {
+            $next = "$PSCommandPath.new"
+            [IO.File]::WriteAllText($next, $served)
+            Move-Item -LiteralPath $next -Destination $PSCommandPath -Force
+        }
+    } catch {
+        # Offline or a transient error: report with the copy we already have.
+    }
+}
+
 # Fall back to a token file, so a hidden task needs no environment variable.
 if (-not $DashToken) {
     $tokenFile = Join-Path $env:USERPROFILE "dash\.token"

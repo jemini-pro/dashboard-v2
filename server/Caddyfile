@@ -18,6 +18,16 @@
 		reverse_proxy dash:8000
 	}
 
+	# The installers and the agent copies they fetch carry no secrets (the token
+	# lives in a separate file on the device). They are read by machines, which
+	# cannot answer a password prompt, and an installed agent re-reads its own
+	# copy from here to stay current. Publishing them is what makes install and
+	# self-update work.
+	@agents path /agents/*
+	handle @agents {
+		reverse_proxy dash:8000
+	}
+
 	# Everything else: one password, asked once per browser session.
 	handle {
 		basic_auth {

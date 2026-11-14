@@ -6,12 +6,30 @@ table and disk usage stubbed: the interesting rules are which mounts count as
 drives, deduplication and the summary percentage.
 """
 import importlib.util
+import os
+import tempfile
 import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
 AGENTS = Path(__file__).resolve().parent.parent / "agents"
+
+
+class FakeResponse:
+    """Enough of an http.client response for the agent's urlopen context."""
+
+    def __init__(self, body):
+        self.body = body
+
+    def read(self):
+        return self.body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 def load_agent(filename, module_name):
@@ -194,6 +212,89 @@ class UnixSignalReportingTest(unittest.TestCase):
 
         for key in ("load_1", "swap_used", "net_rx_bps", "cpu_iowait"):
             self.assertNotIn(key, empty)
+
+
+class UnixSelfUpdateTest(unittest.TestCase):
+    """The installed copy is not a pin: the served agent is the source of truth.
+
+    Without this the disk fix only ever reached machines somebody reinstalled
+    by hand, which is exactly how a stale agent kept reporting one drive.
+    """
+
+    def setUp(self):
+        self.agent = load_unix_agent()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "dash-agent.py"
+        self.path.write_text("# installed old copy\n")
+        patcher = mock.patch.object(self.agent, "__file__", str(self.path))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def update(self, served, error=None):
+        opener = mock.Mock(side_effect=error) if error else \
+            mock.Mock(return_value=FakeResponse(served.encode()))
+        with mock.patch.object(self.agent, "DASH_URL", "https://dash.example"), \
+                mock.patch.object(self.agent.urllib.request, "urlopen", opener):
+            return self.agent.self_update(), opener
+
+    def test_a_changed_served_agent_replaces_the_installed_copy(self):
+        changed, opener = self.update("# new agent\n")
+
+        self.assertTrue(changed)
+        self.assertEqual(self.path.read_text(), "# new agent\n")
+        self.assertEqual(opener.call_args[0][0], "https://dash.example/agents/dash-agent.py")
+        # The replacement has to stay executable or cron cannot run it.
+        self.assertTrue(self.path.stat().st_mode & 0o111)
+
+    def test_an_identical_agent_is_left_untouched(self):
+        self.path.write_text("# same agent\n")
+        changed, _ = self.update("# same agent\n\n")
+
+        self.assertFalse(changed)
+        self.assertEqual(self.path.read_text(), "# same agent\n")
+
+    def test_an_unreachable_server_keeps_the_heartbeat_working(self):
+        changed, _ = self.update("", error=OSError("offline"))
+
+        self.assertFalse(changed)
+        self.assertEqual(self.path.read_text(), "# installed old copy\n")
+
+    def test_a_development_copy_can_opt_out(self):
+        with mock.patch.dict(os.environ, {"DASH_AGENT_UPDATE": "0"}):
+            changed, opener = self.update("# new agent\n")
+
+        self.assertFalse(changed)
+        self.assertFalse(opener.called)
+        self.assertEqual(self.path.read_text(), "# installed old copy\n")
+
+
+class WindowsSelfUpdateTest(unittest.TestCase):
+    def setUp(self):
+        self.src = (AGENTS / "dash-agent.ps1").read_text()
+
+    def test_the_scheduled_copy_pulls_the_served_agent_and_swaps_itself(self):
+        self.assertIn('"$DashUrl/agents/dash-agent.ps1"', self.src)
+        self.assertIn("$PSCommandPath", self.src)
+        self.assertIn("Move-Item", self.src)
+        self.assertIn('$env:DASH_AGENT_UPDATE -ne "0"', self.src)
+
+    def test_only_a_different_agent_is_written(self):
+        # Comparing the text also keeps this from rewriting the file every
+        # minute, which Defender would not enjoy.
+        self.assertRegex(self.src, r"\$served\.Trim\(\) -ne \$current\.Trim\(\)")
+
+    def test_a_failed_fetch_never_aborts_the_heartbeat(self):
+        block = self.src[self.src.index("Invoke-WebRequest"):self.src.index("$os = Get-CimInstance")]
+        self.assertIn("catch", block)
+
+
+class ServedAgentsTest(unittest.TestCase):
+    def test_agent_files_need_no_browser_password(self):
+        # Machines cannot answer Caddy's basic-auth prompt, and an installed
+        # agent re-reads its own copy from here to stay current.
+        caddy = (AGENTS.parent / "server" / "Caddyfile").read_text()
+        self.assertRegex(caddy, r"@agents path /agents/\*")
 
 
 class WindowsDiskReportingTest(unittest.TestCase):

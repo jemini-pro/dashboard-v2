@@ -13,6 +13,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import time
 import urllib.request
 
@@ -343,6 +344,54 @@ def collect():
     return payload
 
 
+AGENT_PATH = "/agents/dash-agent.py"
+
+
+def self_update():
+    """Replace this file with the served agent when the two differ.
+
+    Nobody revisits an installed agent: the cron job or LaunchAgent keeps
+    running whatever the installer downloaded, so a fix on the server would
+    otherwise only reach machines somebody logs into by hand. The served copy
+    is the source of truth. Returns True when the file on disk changed.
+
+    Never raises: an unreachable server or a read-only install must not stop
+    the heartbeat. DASH_AGENT_UPDATE=0 opts a development copy out entirely.
+    """
+    if os.environ.get("DASH_AGENT_UPDATE") == "0":
+        return False
+    path = os.path.abspath(globals().get("__file__") or "")
+    if not path:
+        return False
+    try:
+        with urllib.request.urlopen(f"{DASH_URL}{AGENT_PATH}", timeout=10) as response:
+            served = response.read().decode()
+        with open(path) as f:
+            current = f.read()
+    except Exception:  # noqa: BLE001 - offline is normal
+        return False
+    if not served.strip() or served.strip() == current.strip():
+        return False
+    tmp = path + ".new"
+    try:
+        with open(tmp, "w") as f:
+            f.write(served)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def restart():
+    """Exec the file on disk, which self_update may just have replaced."""
+    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
+
+
 def push(payload):
     req = urllib.request.Request(
         f"{DASH_URL}/api/push/{NAME}",
@@ -364,12 +413,18 @@ def push(payload):
 
 
 if __name__ == "__main__":
-    import sys
-    if "--loop" in sys.argv:
-        while True:
-            try:
-                print(push(collect()), flush=True)
-            except Exception as exc:  # noqa: BLE001
-                print("push failed:", exc, flush=True)
-            time.sleep(60)
-    print(push(collect()))
+    if self_update():
+        restart()
+    if "--loop" not in sys.argv:
+        print(push(collect()))
+        sys.exit(0)
+    while True:
+        try:
+            print(push(collect()), flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print("push failed:", exc, flush=True)
+        time.sleep(60)
+        # A loop can run for weeks, so look for a new agent between pushes
+        # rather than waiting for a reboot.
+        if self_update():
+            restart()

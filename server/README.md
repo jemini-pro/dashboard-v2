@@ -41,10 +41,14 @@ a main column (Jump back in, Launchpad, All tools) and a Network rail. There is 
 | `/api/push/<name>` | POST | agent heartbeat, needs `X-Dash-Token`; optionally carries `disks` and extra signals |
 | `/api/annotations` | POST | record a deploy/restart/backup/note marker, needs `X-Dash-Token` |
 
-Reads are behind the Caddy basic-auth password on the tailnet. `/api/push/*` is the only
-path exempt from that password and uses `X-Dash-Token` instead — a leaked push token can
-fake a metric, nothing more. `/api/hit` accepts any non-empty URL string, including one
-no longer in the store; missing, non-string and empty/whitespace values get a 4xx.
+Reads are behind the Caddy basic-auth password on the tailnet. `/api/push/*` is exempt
+from that password and uses `X-Dash-Token` instead — a leaked push token can fake a
+metric, nothing more. `/agents/*` is exempt too: those are the installer and agent scripts
+themselves, which carry no secrets (the token lives in a separate file on the device) and
+are fetched by machines that cannot answer a password prompt. That is also how an
+installed agent re-reads its own current copy; see [Agent updates](#agent-updates).
+`/api/hit` accepts any non-empty URL string, including one no longer in the store;
+missing, non-string and empty/whitespace values get a 4xx.
 
 The front end is served with `Cache-Control: no-cache` and a weak ETag; static assets
 revalidate with 304s, `/api/stats` is `no-store`, and the versioned font is immutable.
@@ -269,6 +273,25 @@ Signals are raw-only and the API caps their series at the last 24 hours
 (`SIGNAL_WINDOW_S`). A 90d/1y range does not scan signal history just to draw a
 sparkline; the strip says which window it is showing. Missing signals are omitted
 from `signals`, never filled with zero.
+
+## Agent updates
+
+An installed agent is never revisited by hand — the Windows task, cron entry or LaunchAgent
+keeps running whatever the installer downloaded. So the served copy is the source of truth:
+
+- At the start of every run, `dash-agent.ps1` and `dash-agent.py` fetch
+  `GET /agents/dash-agent.<ext>`, compare it with the file on disk, and replace the file
+  when the text differs. The next run (or, in `--loop` mode, an immediate `execv`) runs the
+  new code. A failed fetch, an unreadable file or a read-only install is ignored: the agent
+  keeps reporting with the copy it already has.
+- `DASH_AGENT_UPDATE=0` pins a development copy so editing it is not immediately undone
+  by the server's version.
+- Deploy publishes the repository's agent files to `static/agents/` (see `deploy.sh`), so a
+  merged agent fix reaches every device within a minute of the deploy, with no reinstall.
+- This is deliberately a remote-code path for the dashboard host: a token holder already
+  controls what the device reports. Keep the server, `/opt/stack/dash/.env` and the tailnet
+  itself as the trust boundary. A device installed **before** this mechanism existed still
+  needs the installer run once; after that it updates itself.
 
 ## Jump back in (click scores)
 

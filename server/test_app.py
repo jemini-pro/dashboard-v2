@@ -528,6 +528,21 @@ class PushTokenTest(ApiTestCase):
         self.assertIsNone(device["disk_pct"])
 
 
+class AgentDownloadTest(ApiTestCase):
+    """An installed agent re-reads its own copy from /agents to stay current."""
+
+    def test_agent_scripts_are_served_as_text(self):
+        # The PowerShell agent compares the response with the file on disk, so
+        # octet-stream (which .ps1 would otherwise get) would hand it bytes.
+        agents = self.static / "agents"
+        agents.mkdir()
+        (agents / "dash-agent.ps1").write_text("# agent\n")
+
+        with urllib.request.urlopen(self.base + "/agents/dash-agent.ps1", timeout=5) as resp:
+            self.assertEqual(resp.headers.get_content_type(), "text/plain")
+            self.assertEqual(resp.read(), b"# agent\n")
+
+
 class FrontEndSourceTest(unittest.TestCase):
     """Shared harness for browser-only code, which has no JS runtime here."""
 
