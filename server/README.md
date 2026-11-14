@@ -153,6 +153,10 @@ can answer "is this normal, and since when?" rather than only "what is it now?".
 The Metrics page (`/metrics.html`) uses the same data:
 
 - range tabs for **1h / 6h / 24h / 7d / 30d / 90d / 1y**;
+- a landing device when the URL has no `?device=`: the worst active warning
+  first, then a physical machine, and a container last. Without that the page
+  opened on whichever container the summary listed first, whose single volume
+  also hides the volume table;
 - a three-line chart (CPU, RAM, disk, fixed 0–100% axis) with a legend, a
   crosshair tooltip, surface-ringed end dots, a faint min/max peak band behind
   each line, and a table view for exact values (each cell reads

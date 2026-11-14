@@ -2269,6 +2269,16 @@ class MetricsPageSourceTest(FrontEndSourceTest):
         self.assertIn("'LXC guests'", body)
         self.assertIn("'Elsewhere'", body)
 
+    def test_page_opens_on_the_device_that_needs_attention_not_a_container(self):
+        # Arriving from the dashboard has no ?device=, and the summary is
+        # ordered by first sighting, so ids[0] was a container whose single
+        # volume hid the Volumes table.
+        body = function_body(self.metrics_js, "defaultDeviceId")
+        self.assertIn("warning.level === 'critical'", body)
+        self.assertIn("device.kind === 'container' ? 3 : 2", body)
+        self.assertIn("selectedId = defaultDeviceId(summary.devices)", self.metrics_js)
+        self.assertNotIn("selectedId = ids[0]", self.metrics_js)
+
     def test_page_has_range_tabs_a_chart_a_table_view_and_the_device_rail(self):
         self.assertIn('id="range-tabs"', self.metrics_html)
         for window in ("1h", "6h", "24h", "7d", "30d"):
