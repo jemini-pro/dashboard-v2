@@ -473,6 +473,26 @@ function renderDevices() {
     devicesSubEl.textContent = online + '/' + devices.length + ' online';
 }
 
+// The dashboard's "Metrics →" link carries no device, and the summary is
+// ordered by first sighting, so the page used to open on whichever container
+// registered first. A container has one volume, which hides the Volumes table,
+// so the machine with the disk problem was never the one on screen. Open on the
+// device that needs attention: worst active warning first, then a physical
+// machine, and only then a container.
+function defaultDeviceId(devices) {
+    const rank = (device) => {
+        const warnings = Array.isArray(device.warnings) ? device.warnings : [];
+        if (warnings.some((warning) => warning.level === 'critical')) return 0;
+        if (warnings.length) return 1;
+        return device.kind === 'container' ? 3 : 2;
+    };
+    let best = null;
+    devices.forEach((device) => {
+        if (!best || rank(device) < rank(best)) best = device;
+    });
+    return best ? best.id : null;
+}
+
 function renderHealth() {
     const devices = (summary && summary.devices) || [];
     if (!devices.length) {
@@ -885,7 +905,9 @@ async function load(full) {
             if (token !== loadToken) return;
             summary = data;
             const ids = summary.devices.map((device) => device.id);
-            if (!selectedId || !ids.includes(selectedId)) selectedId = ids[0] || null;
+            if (!selectedId || !ids.includes(selectedId)) {
+                selectedId = defaultDeviceId(summary.devices);
+            }
             renderTiles();
             renderWarnings();
             renderDevices();
