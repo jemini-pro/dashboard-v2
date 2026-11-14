@@ -476,8 +476,10 @@ function kindRank(kind) {
 
 // Kind and summary averages include online devices with a real numeric sample
 // only; offline readings and nulls never drag the average toward zero.
+// Containers are a layer of the Docker host, not devices, so their CPU stays
+// out of the fleet average.
 function averageSample(devices, field) {
-    const samples = devices
+    const samples = window.dashboardStack.countedDevices(devices)
         .filter((d) => d.online && isNumericSample(d[field]))
         .map((d) => clampPct(d[field]));
     if (!samples.length) return null;
@@ -489,9 +491,12 @@ function avgText(value) {
 }
 
 // One count feeds both the Network summary and the toolbar health text.
+// The shared helper drops Docker containers, which belong to the docker01
+// card rather than counting as separate machines.
 function deviceCounts(devices) {
-    const total = devices.length;
-    const online = devices.filter((d) => d.online).length;
+    const counted = window.dashboardStack.countedDevices(devices);
+    const total = counted.length;
+    const online = counted.filter((d) => d.online).length;
     return { online, total };
 }
 

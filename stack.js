@@ -22,6 +22,15 @@
         return device.id || device.name;
     }
 
+    // Containers are a layer inside the Docker host, not devices of their own:
+    // the PVE tree already counts the machine they run on. Both rails tally
+    // "n/m online" with this filter so one stopped container cannot turn the
+    // fleet amber or inflate the device count.
+    function countedDevices(list) {
+        return (Array.isArray(list) ? list : [])
+            .filter((device) => device && device.kind !== 'container');
+    }
+
     function group(devices, topology) {
         const list = Array.isArray(devices) ? devices : [];
         const described = topology && typeof topology === 'object';
@@ -111,6 +120,7 @@
 
     window.dashboardStack = {
         group: group,
+        countedDevices: countedDevices,
         branch: branch,
         containerRow: containerRow,
         dockerEngine: dockerEngine,

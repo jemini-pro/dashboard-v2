@@ -293,7 +293,9 @@ function statTile(label, value, note, flag) {
 }
 
 function renderTiles() {
-    const devices = (summary && summary.devices) || [];
+    // Fleet tiles describe machines, not the containers stacked on them; the
+    // shared filter keeps the count in step with the dashboard's health text.
+    const devices = window.dashboardStack.countedDevices((summary && summary.devices) || []);
     if (!devices.length) {
         statGridEl.innerHTML =
             statTile('Devices online', '—', 'history starts on the server') +
@@ -469,12 +471,15 @@ function renderDevices() {
         return;
     }
     deviceListEl.innerHTML = metricsTree(devices);
-    const online = devices.filter((device) => device.online).length;
-    devicesSubEl.textContent = online + '/' + devices.length + ' online';
+    // Containers still appear in the Docker block, but the sub-line counts
+    // devices: they are not extra machines on the PVE.
+    const counted = window.dashboardStack.countedDevices(devices);
+    const online = counted.filter((device) => device.online).length;
+    devicesSubEl.textContent = online + '/' + counted.length + ' online';
 }
 
 function renderHealth() {
-    const devices = (summary && summary.devices) || [];
+    const devices = window.dashboardStack.countedDevices((summary && summary.devices) || []);
     if (!devices.length) {
         healthDotEl.className = 'health-dot unknown';
         healthTextEl.textContent = 'no devices';
