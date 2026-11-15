@@ -5,18 +5,23 @@
  * Proxmox host. The API describes that stack in `topology`; this file turns a
  * flat device list plus that description into the four groups both pages draw:
  * host, Docker host, sibling guests, and everything off the PVE tree.
+ *
+ * The interface is the pure model plus one render entry:
+ *
+ *   window.dashboardStack.group / countedDevices / keyOf
+ *   window.dashboardStack.render.branch / dockerEngine
+ *
+ * `group` and friends return plain data and never touch the DOM. The render
+ * adapter is the only markup in this file; each page supplies its own device
+ * row renderer, so the dashboard's compact row and the metrics rail's
+ * selectable row stay page concerns.
  */
 (function () {
     'use strict';
 
-    function escapeHtml(value) {
-        return String(value === null || value === undefined ? '' : value)
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&#39;');
-    }
+    const escapeHtml = window.dashboardUI.escapeHtml;
+
+    // ---------- containment model (pure) ----------
 
     function keyOf(device) {
         return device.id || device.name;
@@ -61,6 +66,8 @@
 
         return { host, dockerHost, guests, others, containers };
     }
+
+    // ---------- render adapter (DOM only) ----------
 
     function branch(label, note, body, tone) {
         if (!body) return '';
@@ -118,11 +125,15 @@
             '</div></div>';
     }
 
+    const render = {
+        branch: branch,
+        dockerEngine: dockerEngine,
+    };
+
     window.dashboardStack = {
         group: group,
         countedDevices: countedDevices,
-        branch: branch,
-        containerRow: containerRow,
-        dockerEngine: dockerEngine,
+        keyOf: keyOf,
+        render: render,
     };
 })();

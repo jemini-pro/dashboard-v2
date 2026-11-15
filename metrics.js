@@ -1,5 +1,7 @@
-const WORK_START_HOUR = 9;
-const WORK_END_HOUR = 17;
+// The shared runtime owns escaping, kind labels, formatting, the clock/theme
+// controls and the polling loop.
+const { escapeHtml, isNumber, kindLabel, fmtBytes, fmtDuration } = window.dashboardUI;
+
 const DEFAULT_RANGE = '24h';
 const RANGES = ['1h', '6h', '24h', '7d', '30d', '90d', '1y'];
 const REFRESH_MS = 60000;
@@ -24,15 +26,6 @@ const SIGNAL_DEFS = [
     { key: 'cpu_iowait', label: 'I/O wait' },
     { key: 'cpu_steal', label: 'Steal' }
 ];
-
-const KIND_DEFS = [
-    { key: 'host', label: 'Hosts' },
-    { key: 'lxc', label: 'LXC' },
-    { key: 'lxc-guest', label: 'LXC guests' },
-    { key: 'pc', label: 'PC' },
-    { key: 'mac', label: 'Mac' }
-];
-const KIND_LABELS = Object.fromEntries(KIND_DEFS.map((kind) => [kind.key, kind.label]));
 
 const clockEl = document.getElementById('clock');
 const healthDotEl = document.getElementById('health-dot');
@@ -66,94 +59,27 @@ const resetTimeBtn = document.getElementById('reset-time');
 const debugMenuBtn = document.getElementById('debug-menu-btn');
 const debugControls = document.getElementById('debug-controls');
 
-let debugTimeOffset = null;
-let currentTheme = null;
 let activeRange = DEFAULT_RANGE;
 let selectedId = null;
 let summary = null;
 let series = null;
-let refreshTimer = null;
 let loadToken = 0;
 let chartGeometry = null;
 
-// ---------- clock, theme and debug controls (same rules as the dashboard) ----------
+// ---------- clock, theme and debug controls ----------
 
-debugMenuBtn.addEventListener('click', (event) => {
-    event.stopPropagation();
-    debugControls.classList.toggle('visible');
-    debugMenuBtn.classList.toggle('active');
-});
-
-document.addEventListener('click', (event) => {
-    if (!debugControls.contains(event.target) && !debugMenuBtn.contains(event.target)) {
-        debugControls.classList.remove('visible');
-        debugMenuBtn.classList.remove('active');
-    }
-});
-
-function getCurrentTime() {
-    if (debugTimeOffset !== null) {
-        return new Date(Date.now() + debugTimeOffset);
-    }
-    return new Date();
-}
-
-function updateClock() {
-    const now = getCurrentTime();
-    const hours = now.getHours();
-    const minutes = now.getMinutes();
-    const timeString = String(hours).padStart(2, '0') + ':' + String(minutes).padStart(2, '0');
-    if (clockEl.textContent !== timeString) clockEl.textContent = timeString;
-    if (clockEl.dateTime !== timeString) clockEl.dateTime = timeString;
-
-    const theme = (hours >= WORK_START_HOUR && hours < WORK_END_HOUR) ? 'work' : 'personal';
-    if (theme !== currentTheme) {
-        currentTheme = theme;
-        if (theme === 'work') {
-            document.documentElement.removeAttribute('data-theme');
-        } else {
-            document.documentElement.setAttribute('data-theme', 'personal');
-        }
-    }
-}
-
-debugTimeInput.addEventListener('change', (event) => {
-    if (!event.target.value) return;
-    const [h, m] = event.target.value.split(':').map(Number);
-    const now = new Date();
-    const debugDate = new Date();
-    debugDate.setHours(h, m, 0, 0);
-    debugTimeOffset = debugDate.getTime() - now.getTime();
-    updateClock();
-});
-
-resetTimeBtn.addEventListener('click', () => {
-    debugTimeOffset = null;
-    debugTimeInput.value = '';
-    updateClock();
+const clock = window.dashboardUI.createClock({
+    clock: clockEl,
+    debugMenu: debugMenuBtn,
+    debugControls: debugControls,
+    debugTime: debugTimeInput,
+    resetTime: resetTimeBtn,
 });
 
 // ---------- helpers ----------
 
-function escapeHtml(value) {
-    return String(value ?? '').replace(/[&<>"']/g, (c) => ({
-        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-    }[c]));
-}
-
-function isNumber(value) {
-    return typeof value === 'number' && Number.isFinite(value);
-}
-
 function clamp(value, low, high) {
     return Math.max(low, Math.min(high, value));
-}
-
-function kindLabel(kind) {
-    if (KIND_LABELS[kind]) return KIND_LABELS[kind];
-    const text = String(kind || '').replace(/[-_]+/g, ' ').trim();
-    if (!text) return 'Other';
-    return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 function pct(value) {
@@ -182,17 +108,6 @@ function fullTime(ts) {
     return day + ' · ' + hhmm(ts);
 }
 
-function fmtDuration(seconds) {
-    if (!isNumber(seconds)) return '';
-    const s = Math.max(0, Math.round(seconds));
-    const d = Math.floor(s / 86400);
-    const h = Math.floor((s % 86400) / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    if (d) return d + 'd ' + h + 'h';
-    if (h) return h + 'h ' + m + 'm';
-    return Math.max(1, m) + 'm';
-}
-
 function fmtDays(value) {
     if (!isNumber(value)) return null;
     if (value < 1) return '<1d';
@@ -204,19 +119,6 @@ function stepLabel(seconds) {
     if (!isNumber(seconds)) return '';
     if (seconds < 3600) return Math.round(seconds / 60) + 'm';
     return Math.round(seconds / 3600) + 'h';
-}
-
-function fmtBytes(value) {
-    if (!isNumber(value) || value <= 0) return '—';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    let size = value;
-    let unit = 0;
-    while (size >= 1024 && unit < units.length - 1) {
-        size /= 1024;
-        unit += 1;
-    }
-    const digits = unit === 0 || size >= 100 ? 0 : (size >= 10 ? 1 : 2);
-    return size.toFixed(digits) + ' ' + units[unit];
 }
 
 function fmtGrowth(value) {
@@ -246,12 +148,6 @@ function volumeRow(volume) {
         '<td>' + escapeHtml(fmtGrowth(volume.growth_per_day)) + '</td>' +
         '<td>' + (days ? '~' + escapeHtml(days) : '—') + '</td>' +
         '</tr>';
-}
-
-async function getJson(path) {
-    const response = await fetch(path, { cache: 'no-store' });
-    if (!response.ok) throw new Error('HTTP ' + response.status);
-    return response.json();
 }
 
 function setStale(stale) {
@@ -422,7 +318,7 @@ function metricsTree(devices) {
     if (stack.dockerHost) {
         guests += '<div class="network-node is-docker">' +
             deviceItem(stack.dockerHost) +
-            window.dashboardStack.dockerEngine(stack.containers, (name) =>
+            window.dashboardStack.render.dockerEngine(stack.containers, (name) =>
                 devices.find((device) =>
                     device.kind === 'container' && device.name === name)) +
             '</div>';
@@ -434,25 +330,25 @@ function metricsTree(devices) {
     if (stack.host) {
         let hostBody = item(stack.host);
         if (guests) {
-            hostBody += window.dashboardStack.branch(
+            hostBody += window.dashboardStack.render.branch(
                 'LXC guests',
                 'on ' + stack.host.name,
                 guests,
                 'is-guests'
             );
         }
-        html += window.dashboardStack.branch(
+        html += window.dashboardStack.render.branch(
             'PVE host',
             'physical · ' + stack.host.name,
             hostBody,
             'is-host'
         );
     } else if (guests) {
-        html += window.dashboardStack.branch('LXC guests', 'on pve', guests, 'is-guests');
+        html += window.dashboardStack.render.branch('LXC guests', 'on pve', guests, 'is-guests');
     }
 
     if (stack.others.length) {
-        html += window.dashboardStack.branch(
+        html += window.dashboardStack.render.branch(
             'Elsewhere',
             'standalone',
             stack.others.map(item).join(''),
@@ -906,9 +802,16 @@ async function load(full) {
     const token = ++loadToken;
     try {
         if (full) {
-            const data = await getJson('/api/metrics/summary?window=' + encodeURIComponent(activeRange));
+            const result = await window.dashData.read(
+                '/api/metrics/summary?window=' + encodeURIComponent(activeRange),
+                'metrics summary'
+            );
             if (token !== loadToken) return;
-            summary = data;
+            if (!result.ok) {
+                setStale(true);
+                return;
+            }
+            summary = result.data;
             const ids = summary.devices.map((device) => device.id);
             if (!selectedId || !ids.includes(selectedId)) {
                 selectedId = defaultDeviceId(summary.devices);
@@ -920,10 +823,17 @@ async function load(full) {
             syncUrl();
         }
         if (selectedId) {
-            const data = await getJson('/api/metrics?device=' + encodeURIComponent(selectedId) +
-                '&window=' + encodeURIComponent(activeRange));
+            const result = await window.dashData.read(
+                '/api/metrics?device=' + encodeURIComponent(selectedId) +
+                    '&window=' + encodeURIComponent(activeRange),
+                'metrics series'
+            );
             if (token !== loadToken) return;
-            series = data;
+            if (!result.ok) {
+                setStale(true);
+                return;
+            }
+            series = result.data;
         } else {
             series = null;
         }
@@ -937,22 +847,20 @@ async function load(full) {
         setStale(false);
     } catch (error) {
         if (token !== loadToken) return;
-        console.warn('metrics unreachable, keeping the last good reading', error);
+        console.warn('metrics render failed, keeping the last good reading', error);
         setStale(true);
     }
 }
 
-function scheduleRefresh(delay) {
-    clearTimeout(refreshTimer);
-    refreshTimer = setTimeout(async () => {
-        if (document.hidden) {
-            refreshTimer = null;
-            return;
-        }
-        await load(true);
-        scheduleRefresh(REFRESH_MS);
-    }, delay);
-}
+// The history refreshes once a minute; maxInterval equal to interval keeps
+// that cadence even after a failed read. The shared loop pauses while the tab
+// is hidden.
+const metricsPoller = window.dashboardUI.createPoller({
+    interval: REFRESH_MS,
+    maxInterval: REFRESH_MS,
+    initialDelay: REFRESH_MS,
+    run: () => load(true),
+});
 
 // ---------- wiring ----------
 
@@ -995,18 +903,8 @@ if (typeof ResizeObserver !== 'undefined') {
     }).observe(chartEl);
 }
 
-document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-        clearTimeout(refreshTimer);
-        refreshTimer = null;
-    } else {
-        scheduleRefresh(0);
-    }
-});
-
 readState();
 syncRangeButtons();
-updateClock();
-setInterval(updateClock, 1000);
+clock.start();
 load(true);
-scheduleRefresh(REFRESH_MS);
+metricsPoller.start();

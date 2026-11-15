@@ -1,5 +1,14 @@
-const WORK_START_HOUR = 9;
-const WORK_END_HOUR = 17;
+// The shared runtime owns escaping, kind labels, formatting, the clock/theme
+// controls and the polling loop. The dashboard uses the compact byte policy.
+const {
+    escapeHtml,
+    isNumber,
+    kindLabel,
+    KIND_ORDER,
+    fmtBytesCompact,
+    fmtUptime,
+} = window.dashboardUI;
+
 // One fresh click scores 1.0 (a single exp(0) term), so any clicked link already
 // clears this 0.5 bar. The spec's "~3 clicks" wording describes typical use, not
 // a gate: the threshold and 14-day half-life are the actual rule.
@@ -17,17 +26,6 @@ const PINNED_FALLBACK_TITLES = [
 // Network metrics turn amber at this percentage. Status is carried by the
 // number as well as the colour, so the value is never colour-only.
 const METRIC_WARN_PCT = 80;
-// One definition drives both the labels and the ordering, so adding a kind
-// means editing one list rather than two constants that can drift apart.
-const KIND_DEFS = [
-    { key: 'host', label: 'Hosts' },
-    { key: 'lxc', label: 'LXC' },
-    { key: 'lxc-guest', label: 'LXC guests' },
-    { key: 'pc', label: 'PC' },
-    { key: 'mac', label: 'Mac' }
-];
-const KIND_LABELS = Object.fromEntries(KIND_DEFS.map((kind) => [kind.key, kind.label]));
-const KIND_ORDER = KIND_DEFS.map((kind) => kind.key);
 // One metric definition drives both the row markup and the in-place poll patch.
 const DEVICE_METRICS = [
     { label: 'CPU', key: 'cpu', field: 'cpu_pct' },
@@ -53,8 +51,6 @@ const resetTimeBtn = document.getElementById('reset-time');
 const debugMenuBtn = document.getElementById('debug-menu-btn');
 const debugControls = document.getElementById('debug-controls');
 
-let debugTimeOffset = null;
-let currentTheme = null;
 let bookmarksRendered = false;
 let bookmarkStore = [];
 let networkDevices = [];
@@ -66,30 +62,17 @@ let networkTopology = null;
 let networkDeviceKey = null;
 let networkUpdatedAt = null;
 let searchQuery = '';
-let statsFailures = 0;
-let refreshTimer = null;
-let pollingStarted = false;
+// Created on the first start, after refreshDevices is defined.
+let devicePoller = null;
 
-// Debug Menu Toggle
-debugMenuBtn.addEventListener('click', (e) => {
-    e.stopPropagation();
-    debugControls.classList.toggle('visible');
-    debugMenuBtn.classList.toggle('active');
+const clock = window.dashboardUI.createClock({
+    clock: clockEl,
+    date: dateEl,
+    debugMenu: debugMenuBtn,
+    debugControls: debugControls,
+    debugTime: debugTimeInput,
+    resetTime: resetTimeBtn,
 });
-
-document.addEventListener('click', (e) => {
-    if (!debugControls.contains(e.target) && !debugMenuBtn.contains(e.target)) {
-        debugControls.classList.remove('visible');
-        debugMenuBtn.classList.remove('active');
-    }
-});
-
-function getCurrentTime() {
-    if (debugTimeOffset !== null) {
-        return new Date(Date.now() + debugTimeOffset);
-    }
-    return new Date();
-}
 
 // The server injects the scored bookmark store into index.html, so the first
 // paint needs no second request. Static-only hosting leaves the placeholder
@@ -106,32 +89,7 @@ function injectedBookmarks() {
 }
 
 function updateDashboard() {
-    const now = getCurrentTime();
-    const hours = now.getHours();
-    const minutes = now.getMinutes();
-
-    // Update the toolbar clock and date.
-    const timeString = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
-    if (clockEl.textContent !== timeString) clockEl.textContent = timeString;
-    if (clockEl.dateTime !== timeString) clockEl.dateTime = timeString;
-
-    const dateString = now.toLocaleDateString('en-GB', {
-        weekday: 'short', day: 'numeric', month: 'short'
-    });
-    if (dateEl.textContent !== dateString) dateEl.textContent = dateString;
-
-    // Determine theme: work 09:00-17:00, personal otherwise.
-    const isWorkHours = hours >= WORK_START_HOUR && hours < WORK_END_HOUR;
-    const newTheme = isWorkHours ? 'work' : 'personal';
-
-    if (newTheme !== currentTheme) {
-        currentTheme = newTheme;
-        if (isWorkHours) {
-            document.documentElement.removeAttribute('data-theme');
-        } else {
-            document.documentElement.setAttribute('data-theme', 'personal');
-        }
-    }
+    clock.update();
 
     if (!bookmarksRendered) {
         bookmarksRendered = true;
@@ -147,12 +105,6 @@ function updateDashboard() {
         }
         startDevicePolling();
     }
-}
-
-function escapeHtml(value) {
-    return String(value ?? '').replace(/[&<>"']/g, (c) => ({
-        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-    }[c]));
 }
 
 // Icons are monograms only: no emoji and no third-party icon requests.
@@ -385,59 +337,27 @@ searchInput.addEventListener('keydown', (e) => {
     searchInput.blur();
 });
 
-// Debug Controls
-debugTimeInput.addEventListener('change', (e) => {
-    if (!e.target.value) return;
-    const [h, m] = e.target.value.split(':').map(Number);
-    const now = new Date();
-    const debugDate = new Date();
-    debugDate.setHours(h, m, 0, 0);
-
-    debugTimeOffset = debugDate.getTime() - now.getTime();
-    updateDashboard();
-});
-
-resetTimeBtn.addEventListener('click', () => {
-    debugTimeOffset = null;
-    debugTimeInput.value = '';
-    updateDashboard();
-});
-
 // Initial Run & Interval
 updateDashboard();
-setInterval(updateDashboard, 1000);
+clock.start();
 
 // ---------- server data ----------
 
 async function loadBookmarks() {
-    try {
-        const res = await fetch('/api/bookmarks');
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const data = await res.json();
-        if (data && Array.isArray(data.work) && data.work.length) {
-            bookmarkStore = data.work;
-            renderAllTools(bookmarkStore);
-            renderLaunchpad(bookmarkStore);
-            renderMostUsed(data.work);
-            return;
-        }
-        throw new Error('empty bookmark store');
-    } catch (e) {
-        console.warn('bookmark store unreachable', e);
-        // No scored store: paint the Workbench empty states rather than
-        // leaving the cards blank.
+    const result = await window.dashData.read('/api/bookmarks', 'bookmark store');
+    const data = result.ok ? result.data : null;
+    if (data && Array.isArray(data.work) && data.work.length) {
+        bookmarkStore = data.work;
         renderAllTools(bookmarkStore);
         renderLaunchpad(bookmarkStore);
-        renderMostUsed(bookmarkStore);
+        renderMostUsed(data.work);
+        return;
     }
-}
-
-function fmtUptime(s) {
-    if (s === null || s === undefined) return '—';
-    const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
-    if (d) return d + 'd ' + h + 'h';
-    if (h) return h + 'h ' + m + 'm';
-    return m + 'm';
+    // No scored store: paint the Workbench empty states rather than leaving
+    // the cards blank.
+    renderAllTools(bookmarkStore);
+    renderLaunchpad(bookmarkStore);
+    renderMostUsed(bookmarkStore);
 }
 
 function fmtAgo(ts) {
@@ -449,24 +369,11 @@ function fmtAgo(ts) {
 
 // ---------- Network card ----------
 
-function isNumericSample(value) {
-    return typeof value === 'number' && Number.isFinite(value);
-}
-
 // Metric values are clamped to 0-100 for the bar; a missing sample stays null
 // so it can render as an em dash instead of a false zero.
 function clampPct(value) {
-    if (!isNumericSample(value)) return null;
+    if (!isNumber(value)) return null;
     return Math.max(0, Math.min(100, value));
-}
-
-// Known kinds get their proper plural label; anything else is made readable
-// ("nas-box" -> "Nas box") instead of leaking a raw slug into the UI.
-function kindLabel(kind) {
-    if (KIND_LABELS[kind]) return KIND_LABELS[kind];
-    const text = String(kind || '').replace(/[-_]+/g, ' ').trim();
-    if (!text) return 'Other';
-    return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 function kindRank(kind) {
@@ -480,7 +387,7 @@ function kindRank(kind) {
 // out of the fleet average.
 function averageSample(devices, field) {
     const samples = window.dashboardStack.countedDevices(devices)
-        .filter((d) => d.online && isNumericSample(d[field]))
+        .filter((d) => d.online && isNumber(d[field]))
         .map((d) => clampPct(d[field]));
     if (!samples.length) return null;
     return samples.reduce((sum, value) => sum + value, 0) / samples.length;
@@ -527,21 +434,6 @@ function metricCell(metric, raw) {
         '</span>';
 }
 
-// Disk sizes read as "931 GB" / "1.8 TB". Binary units match what the OS shows
-// (a 1 TB drive is 931 GB here), which is less surprising than marketing units.
-function fmtBytes(bytes) {
-    if (!isNumericSample(bytes) || bytes <= 0) return '';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    let value = bytes;
-    let unit = 0;
-    while (value >= 1024 && unit < units.length - 1) {
-        value /= 1024;
-        unit += 1;
-    }
-    const digits = unit === 0 || value >= 100 ? 0 : 1;
-    return value.toFixed(digits) + ' ' + units[unit];
-}
-
 function diskLabel(disk) {
     return disk.label || disk.mount || 'disk';
 }
@@ -552,7 +444,7 @@ function diskRow(disk) {
     const mount = escapeHtml(disk.mount || '');
     return '<div class="disk-row' + warn + '" data-mount="' + mount + '" title="' + mount + '">' +
         '<span class="disk-name">' + escapeHtml(diskLabel(disk)) + '</span>' +
-        '<span class="disk-size">' + escapeHtml(fmtBytes(disk.total)) + '</span>' +
+        '<span class="disk-size">' + escapeHtml(fmtBytesCompact(disk.total)) + '</span>' +
         '<span class="disk-bar"><i class="disk-fill" style="width:' + (pct === null ? 0 : pct) + '%"></i></span>' +
         '<span class="disk-value">' + (pct === null ? '—' : Math.round(pct) + '%') + '</span>' +
         '</div>';
@@ -636,7 +528,7 @@ function networkTree(devices, topology) {
     let html = '<div class="network-tree">';
 
     if (stack.host) {
-        html += window.dashboardStack.branch(
+        html += window.dashboardStack.render.branch(
             'PVE host',
             'physical · ' + stack.host.name,
             deviceRow(stack.host),
@@ -648,14 +540,14 @@ function networkTree(devices, topology) {
     if (stack.dockerHost) {
         guests += '<div class="network-node is-docker">' +
             deviceRow(stack.dockerHost) +
-            window.dashboardStack.dockerEngine(stack.containers) +
+            window.dashboardStack.render.dockerEngine(stack.containers) +
             '</div>';
     }
     stack.guests.forEach((guest) => {
         guests += '<div class="network-node">' + deviceRow(guest) + '</div>';
     });
     if (guests) {
-        html += window.dashboardStack.branch(
+        html += window.dashboardStack.render.branch(
             'LXC guests',
             stack.host ? 'on ' + stack.host.name : 'on pve',
             guests,
@@ -665,7 +557,7 @@ function networkTree(devices, topology) {
 
     const others = sortNetworkDevices(stack.others);
     if (others.length) {
-        html += window.dashboardStack.branch(
+        html += window.dashboardStack.render.branch(
             'Elsewhere',
             'standalone',
             others.map(deviceRow).join(''),
@@ -717,7 +609,7 @@ function patchDisk(row, disk) {
     row.classList.toggle('is-warn', value !== null && value >= METRIC_WARN_PCT);
     row.querySelector('.disk-value').textContent = value === null ? '—' : Math.round(value) + '%';
     row.querySelector('.disk-fill').style.width = (value === null ? 0 : value) + '%';
-    row.querySelector('.disk-size').textContent = fmtBytes(disk.total);
+    row.querySelector('.disk-size').textContent = fmtBytesCompact(disk.total);
 }
 
 // The 10s poll changes values, not structure: existing rows keep their
@@ -774,56 +666,34 @@ function renderHealth(devices) {
 }
 
 async function refreshDevices() {
-    try {
-        const res = await fetch('/api/stats');
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const data = await res.json();
-        networkDevices = sortNetworkDevices(data.devices || []);
-        networkTopology = data.topology || null;
-        networkUpdatedAt = data.generated || Math.floor(Date.now() / 1000);
-        networkUpdatedEl.textContent = updatedLabel(networkUpdatedAt);
-        setNetworkStale(false);
-        applyNetworkDevices(networkDevices);
-        renderHealth(networkDevices);
-        statsFailures = 0;
-        return true;
-    } catch (e) {
+    const result = await window.dashData.read('/api/stats', 'stats');
+    if (!result.ok) {
         // Keep the last good reading and label it stale: a failed poll must
         // never erase the panel or report a false all-clear.
-        statsFailures += 1;
-        console.warn('stats unreachable, keeping the last good reading', e);
         setNetworkStale(true);
         renderHealth(networkDevices);
         return false;
     }
+    const data = result.data;
+    networkDevices = sortNetworkDevices(data.devices || []);
+    networkTopology = data.topology || null;
+    networkUpdatedAt = data.generated || Math.floor(Date.now() / 1000);
+    networkUpdatedEl.textContent = updatedLabel(networkUpdatedAt);
+    setNetworkStale(false);
+    applyNetworkDevices(networkDevices);
+    renderHealth(networkDevices);
+    return true;
 }
 
-function scheduleRefresh(delay) {
-    clearTimeout(refreshTimer);
-    refreshTimer = setTimeout(async () => {
-        if (document.hidden) {
-            refreshTimer = null;
-            return;
-        }
-        const ok = await refreshDevices();
-        const next = ok
-            ? 10000
-            : Math.min(60000, 10000 * 2 ** Math.min(statsFailures, 3));
-        scheduleRefresh(next);
-    }, delay);
-}
-
+// The shared poller refreshes every 10 s and backs off to a minute after
+// repeated failures, pausing while the tab is hidden.
 function startDevicePolling() {
-    if (pollingStarted) return;
-    pollingStarted = true;
-    scheduleRefresh(0);
-}
-
-document.addEventListener('visibilitychange', () => {
-    if (document.hidden) {
-        clearTimeout(refreshTimer);
-        refreshTimer = null;
-    } else if (pollingStarted && !refreshTimer) {
-        scheduleRefresh(0);
+    if (!devicePoller) {
+        devicePoller = window.dashboardUI.createPoller({
+            interval: 10000,
+            maxInterval: 60000,
+            run: refreshDevices,
+        });
     }
-});
+    devicePoller.start();
+}
