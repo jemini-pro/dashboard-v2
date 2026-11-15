@@ -46,6 +46,8 @@ const deviceGridEl = document.getElementById('device-grid');
 const networkSummaryEl = document.getElementById('network-summary');
 const networkUpdatedEl = document.getElementById('network-updated');
 const networkStaleEl = document.getElementById('network-stale');
+const servicesSummaryEl = document.getElementById('services-summary');
+const servicesListEl = document.getElementById('services-list');
 const debugTimeInput = document.getElementById('debug-time');
 const resetTimeBtn = document.getElementById('reset-time');
 const debugMenuBtn = document.getElementById('debug-menu-btn');
@@ -62,6 +64,13 @@ let networkTopology = null;
 let networkDeviceKey = null;
 let networkUpdatedAt = null;
 let searchQuery = '';
+// Latest /api/checks payload keyed by check id. Null until the first response
+// so the launcher can tell "not loaded yet" apart from "check id is missing".
+let checkState = null;
+// Verdicts only change the launcher badges; the Services card still refreshes
+// latency and uptime every poll. Rebuilding All tools each time would reset
+// its scroll position for no visible change.
+let checkSignature = null;
 // Created on the first start, after refreshDevices is defined.
 let devicePoller = null;
 
@@ -114,6 +123,74 @@ function monogram(item) {
     return '<span class="monogram" aria-hidden="true">' + escapeHtml(initial) + '</span>';
 }
 
+// ---------- service checks ----------
+// One vocabulary for the launcher badges and the Services card. The dot's
+// glyph and shape carry the verdict without hue; the label and the
+// visually-hidden text carry it without sight. `mark` is that glyph.
+const VERDICT_DEFS = {
+    ok: { label: 'ok', mark: '' },
+    service_down: { label: 'service down', mark: '!' },
+    host_down: { label: 'host offline', mark: '!' },
+    path_down: { label: 'path down', mark: '~' },
+    unknown: { label: 'no data', mark: '?' }
+};
+
+function checksOf(payload) {
+    return payload && Array.isArray(payload.checks) ? payload.checks : [];
+}
+
+function verdictKey(check) {
+    const verdict = check && check.verdict;
+    return Object.prototype.hasOwnProperty.call(VERDICT_DEFS, verdict)
+        ? verdict
+        : 'unknown';
+}
+
+function checkMap(payload) {
+    const map = new Map();
+    checksOf(payload).forEach((check) => {
+        if (check && check.id) map.set(check.id, check);
+    });
+    return map;
+}
+
+// A reference that the store does not answer is still worth surfacing: the
+// badge reads "no data" instead of quietly hiding a broken config.
+function checkFor(item) {
+    if (!checkState || !item || !item.check) return null;
+    return checkState.get(item.check) || { id: item.check, verdict: 'unknown' };
+}
+
+function verdictLabel(check) {
+    return VERDICT_DEFS[verdictKey(check)].label;
+}
+
+function verdictClass(check) {
+    return 'is-' + verdictKey(check).replace(/_/g, '-');
+}
+
+// A failing dot carries "!" (service) or "~" (path); an unknown one "?"; a
+// healthy one is plain. CSS gives host_down a square and path_down a ring.
+function statusDotHTML(check) {
+    return '<span class="status-dot ' + verdictClass(check) + '" aria-hidden="true">' +
+        VERDICT_DEFS[verdictKey(check)].mark + '</span>';
+}
+
+function checkBadge(item) {
+    const check = checkFor(item);
+    if (!check) return '';
+    const label = verdictLabel(check);
+    const text = check.verdict === 'ok'
+        ? ''
+        : '<span class="check-text">' + escapeHtml(label) + '</span>';
+    return '<span class="check-status ' + verdictClass(check) +
+        '" data-check="' + escapeHtml(item.check) +
+        '" title="Service: ' + escapeHtml(label) + '">' +
+        statusDotHTML(check) + text +
+        '<span class="visually-hidden">Service ' + escapeHtml(label) + '</span>' +
+        '</span>';
+}
+
 // ---------- All tools ----------
 // Every category and item from the store, in store order. The toolbar search
 // filters title, description and category name; categories only ever disappear
@@ -146,6 +223,7 @@ function toolRow(item, index) {
                     <span class="tool-link-title">${escapeHtml(item.title)}</span>
                     <span class="tool-link-desc">${escapeHtml(item.desc || '')}</span>
                 </span>
+                ${checkBadge(item)}
                 <span class="tool-link-arrow" aria-hidden="true">↗</span>
             </a>
         </li>
@@ -227,6 +305,7 @@ function launchpadTile(item) {
         (desc ? ' — ' + desc : '') + '">' +
         '<span class="launchpad-icon">' + monogram(item) + '</span>' +
         '<span class="launchpad-tile-label">' + title + '</span>' +
+        checkBadge(item) +
         '</a>';
 }
 
@@ -669,8 +748,81 @@ function renderHealth(devices) {
     healthTextEl.textContent = total ? online + '/' + total + ' online' : 'no devices';
 }
 
+// ---------- Services card ----------
+// Compact rows below Network: current verdict, latency, 24 h uptime and the
+// certificate's remaining life. Missing numbers read as words, never zero.
+
+function serviceMeta(check) {
+    const parts = [
+        isNumber(check.latency_ms) ? check.latency_ms + ' ms' : '— ms',
+        isNumber(check.uptime_24h)
+            ? check.uptime_24h.toFixed(1) + '% 24h'
+            : 'no 24h data'
+    ];
+    if (isNumber(check.cert_days)) {
+        parts.push(Math.round(check.cert_days) + 'd cert');
+    }
+    return parts.join(' · ');
+}
+
+function serviceRow(check) {
+    const label = verdictLabel(check);
+    const name = check.name || check.id;
+    return '<div class="service-row ' + verdictClass(check) +
+        '" data-check="' + escapeHtml(check.id) + '">' +
+        statusDotHTML(check) +
+        '<span class="service-main">' +
+        '<span class="service-name" title="' + escapeHtml(name) + '">' +
+        escapeHtml(name) + '</span>' +
+        '<span class="service-meta">' + escapeHtml(serviceMeta(check)) + '</span>' +
+        '</span>' +
+        '<span class="service-verdict">' + escapeHtml(label) + '</span>' +
+        '</div>';
+}
+
+function servicesSummary(checks) {
+    if (!checks.length) return 'no checks';
+    const up = checks.filter((check) => check && check.verdict === 'ok').length;
+    return up + '/' + checks.length + ' up';
+}
+
+function renderServices(payload) {
+    const checks = checksOf(payload);
+    if (servicesSummaryEl) servicesSummaryEl.textContent = servicesSummary(checks);
+    if (!servicesListEl) return;
+    servicesListEl.innerHTML = checks.length
+        ? checks.map(serviceRow).join('')
+        : '<div class="services-empty">No service checks</div>';
+}
+
+function checkSignatureOf(payload) {
+    return checksOf(payload).map((check) => (check && check.id) + ':' +
+        (check && check.verdict)).join('|');
+}
+
+// The first paint has the bookmark store but not the checks. Once the poll
+// lands, refresh the Services card every time; rebuild the launcher surfaces
+// only when a verdict actually changed, so list scroll and selection survive.
+function applyChecks(payload) {
+    checkState = checkMap(payload);
+    renderServices(payload);
+    const signature = checkSignatureOf(payload);
+    const changed = signature !== checkSignature;
+    checkSignature = signature;
+    if (changed && bookmarksRendered) {
+        renderAllTools(bookmarkStore);
+        renderLaunchpad(bookmarkStore);
+    }
+}
+
 async function refreshDevices() {
-    const result = await window.dashData.read('/api/stats', 'stats');
+    const [result, checks] = await Promise.all([
+        window.dashData.read('/api/stats', 'stats'),
+        window.dashData.read('/api/checks', 'service checks'),
+    ]);
+    // A failed checks poll keeps the last good card; only the stats failure
+    // drives the poller's backoff and the stale label.
+    if (checks.ok) applyChecks(checks.data);
     if (!result.ok) {
         // Keep the last good reading and label it stale: a failed poll must
         // never erase the panel or report a false all-clear.

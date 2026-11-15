@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Black-box acceptance check for click history, decayed bookmark scores and
-# Workbench deployment documentation. Spec #16 ticket #37; spec #40 ticket #46.
+# Black-box acceptance check for click history, decayed bookmark scores,
+# service checks and Workbench deployment documentation.
+# Spec #16 ticket #37; spec #40 ticket #46; service checks.
 #
 # Dependencies: bash, curl, coreutils, and python3 (stdlib only -- the server is
 # stdlib Python as well). No docker, node or pip. Starts the real server on a
@@ -19,6 +20,7 @@ TMP="$(mktemp -d)"
 DATA_DIR="$TMP/data"
 HITS="$DATA_DIR/hits.json"
 BOOKMARKS="$DATA_DIR/bookmarks.json"
+CHECKS="$DATA_DIR/checks.json"
 PORT=""
 BASE=""
 PID=""
@@ -67,10 +69,37 @@ s.close()
 PY
 }
 
+write_checks() {
+    # The server probes its own /api/health, so acceptance exercises config,
+    # probe, SQLite sample, verdict and API without reaching the network.
+    python3 - "$CHECKS" "$BASE/api/health" "$BASE/api/does-not-exist" <<'PY'
+import json, sys
+path, health, missing = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path, "w") as f:
+    json.dump({"checks": [
+        {
+            "id": "self",
+            "name": "Dashboard health",
+            "url": health,
+            "timeout_s": 2,
+        },
+        {
+            "id": "missing",
+            "name": "Missing route",
+            "url": missing,
+            "expect_status": "2xx",
+            "timeout_s": 2,
+        },
+    ]}, f)
+PY
+}
+
 start_server() {
     PORT="$(free_port)"
     BASE="http://127.0.0.1:$PORT"
+    write_checks
     DASH_DATA_DIR="$DATA_DIR" DASH_PORT="$PORT" DASH_TOKEN= DASH_SAMPLE_SECONDS=1 \
+        DASH_CHECKS_SECONDS=10 DASH_CHECK_BUCKET_SECONDS=10 \
         python3 -u "$APP" >>"$TMP/server.log" 2>&1 &
     PID=$!
     local i
@@ -120,6 +149,42 @@ for category_list in categories:
                 print(item.get(field, ""))
                 raise SystemExit(0)
 raise SystemExit(f"{field} absent from /api/bookmarks: {url}")
+PY
+}
+
+get_checks() {
+    curl -fsS "$BASE/api/checks" -o "$TMP/checks.json"
+}
+
+json_check_field() { # json_check_field <file> <check-id> <field>
+    python3 - "$1" "$2" "$3" <<'PY'
+import json, sys
+path, check_id, field = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    data = json.load(f)
+for check in data.get("checks", []):
+    if check.get("id") == check_id:
+        print(check.get(field, ""))
+        raise SystemExit(0)
+raise SystemExit(f"{field} absent from /api/checks: {check_id}")
+PY
+}
+
+attach_check() { # attach_check <url> <check-id> - reference a check from a bookmark
+    python3 - "$BOOKMARKS" "$1" "$2" <<'PY'
+import json, sys
+path, url, check_id = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    store = json.load(f)
+for category_list in store.values():
+    if not isinstance(category_list, list):
+        continue
+    for category in category_list:
+        for item in category.get("items", []):
+            if item.get("url") == url:
+                item["check"] = check_id
+with open(path, "w") as f:
+    json.dump(store, f)
 PY
 }
 
@@ -423,6 +488,71 @@ get_bookmarks
 [[ "$(json_item_field "$TMP/bookmarks.json" "$W_MAIL" pinned)" == "True" ]] \
     || fail "a pinned flag did not survive /api/bookmarks"
 ok "/api/bookmarks passes a pinned flag through unchanged"
+
+# 1b. A bookmark may reference a check, and the reference survives the API.
+# The injected first-paint payload is the same store (see the unit tests, which
+# can point app.STATIC at a fixture); this script has no installed static tree.
+attach_check "$W_MAIL" self
+get_bookmarks
+[[ "$(json_item_field "$TMP/bookmarks.json" "$W_MAIL" check)" == "self" ]] \
+    || fail "a bookmark check reference did not survive /api/bookmarks"
+ok "/api/bookmarks passes a check reference through unchanged"
+
+# 1c. The local check probes the server's own health route end to end: config,
+# probe, SQLite sample, uptime and verdict. A deliberately missing route proves
+# the failing side reaches /api/checks and /api/stats warnings.
+verdict=""
+missing_verdict=""
+for _ in $(seq 1 120); do
+    if get_checks 2>/dev/null; then
+        verdict="$(json_check_field "$TMP/checks.json" self verdict 2>/dev/null || true)"
+        missing_verdict="$(json_check_field "$TMP/checks.json" missing verdict 2>/dev/null || true)"
+        [[ "$verdict" == "ok" && "$missing_verdict" == "service_down" ]] && break
+    fi
+    sleep 0.1
+done
+[[ "$verdict" == "ok" ]] \
+    || fail "the local /api/health check never reported verdict ok (got '$verdict')"
+[[ "$(json_check_field "$TMP/checks.json" self ok)" == "True" ]] \
+    || fail "a passing local check did not report ok=true"
+[[ "$(json_check_field "$TMP/checks.json" self uptime_24h)" == "100.0" ]] \
+    || fail "a passing local check did not report 100% 24h uptime"
+[[ "$(json_check_field "$TMP/checks.json" self latency_ms)" =~ ^[0-9]+$ ]] \
+    || fail "a passing local check has no latency"
+[[ "$(json_check_field "$TMP/checks.json" self last_change)" != "" ]] \
+    || fail "a stored check has no last_change"
+[[ "$missing_verdict" == "service_down" ]] \
+    || fail "a 404 local check did not report service_down (got '$missing_verdict')"
+[[ "$(json_check_field "$TMP/checks.json" missing error)" == "HTTP 404" ]] \
+    || fail "a 404 local check did not keep its status error"
+ok "/api/checks probes, stores and classifies a local pass and a local failure"
+
+# 1d. The failing check reaches the cheap /api/stats warning surface.
+curl -fsS "$BASE/api/stats" -o "$TMP/stats.json" || fail "GET /api/stats failed"
+python3 - "$TMP/stats.json" <<'PY' || fail "the failing check is absent from /api/stats warnings"
+import json, sys
+with open(sys.argv[1]) as f:
+    stats = json.load(f)
+warnings = stats.get("warnings") or []
+assert any(w.get("code") == "service" and "Missing route" in w.get("text", "")
+           for w in warnings), warnings
+assert all({"code", "level", "value", "threshold", "text"} <= set(w)
+           for w in warnings), warnings
+PY
+ok "/api/stats carries the failing check in the existing warning shape"
+
+# 1e. A corrupt check store is an empty list, not a 500.
+printf '{not json' > "$CHECKS"
+code="$(curl -s -o "$TMP/checks-corrupt.json" -w '%{http_code}' "$BASE/api/checks")"
+[[ "$code" == "200" ]] || fail "/api/checks returned $code for a corrupt store"
+python3 - "$TMP/checks-corrupt.json" <<'PY' || fail "a corrupt check store was not an empty list"
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+assert data.get("checks") == [], data
+PY
+write_checks
+ok "/api/checks treats a corrupt check store as zero checks"
 
 # 2. POST /api/hit -> 204, no body, timestamp stored.
 code="$(post_hit "$W_MAIL")"
@@ -1096,5 +1226,26 @@ grep -Fq 'renderHealthSection' "$REPO/metrics.js" \
 grep -Fq 'health-table' "$REPO/metrics.js" \
     || fail "health section has no SMART/ZFS tables"
 ok "README documents rollups/signals/health/annotations and the page exposes their UI"
+
+# 16. Service checks are documented and wired into the launcher and rail.
+for needle in '## Service checks' 'checks.json' 'check_samples' '/api/checks' \
+        'DASH_CHECKS_SECONDS' 'DASH_CHECK_HISTORY_DAYS' 'DASH_WARN_CERT_DAYS' \
+        'service_down' 'host_down' 'path_down' 'last_change'; do
+    grep -Fq "$needle" "$README" \
+        || fail "README does not document $needle"
+done
+grep -Fq 'class="services-panel card"' "$REPO/index.html" \
+    || fail "the rail has no Services card"
+grep -Fq 'id="services-list"' "$REPO/index.html" \
+    || fail "the Services card has no list region"
+grep -Fq "dashData.read('/api/checks'" "$REPO/app.js" \
+    || fail "the dashboard does not poll /api/checks"
+grep -Fq 'checkBadge(' "$REPO/app.js" \
+    || fail "the launcher rows/tiles have no check badge"
+grep -Fq 'status-dot' "$REPO/style.css" \
+    || fail "the check badge has no status dot"
+grep -Fq 'visually-hidden' "$REPO/style.css" \
+    || fail "the check badge has no screen-reader text"
+ok "README documents service checks and the dashboard wires badges and the rail card"
 
 echo "all $COUNT checks passed"

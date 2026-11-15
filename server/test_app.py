@@ -73,14 +73,17 @@ class ApiTestCase(unittest.TestCase):
         self.data = Path(self._tmp.name)
         self._old_data, self._old_hits, self._old_static = app.DATA, app.HITS_FILE, app.STATIC
         self._old_agents, self._old_metrics = app.AGENTS_FILE, app.METRICS_FILE
+        self._old_checks = app.CHECKS_FILE
         app.DATA = self.data
         app.HITS_FILE = self.data / "hits.json"
         app.AGENTS_FILE = self.data / "agents.json"
         app.METRICS_FILE = self.data / "metrics.db"
+        app.CHECKS_FILE = self.data / "checks.json"
         app._cache.update(at=0.0, body=None)
         app._availability_cache.update(at=0.0, by_id={})
         app._summary_cache.update(at=0.0, window=None, body=None)
         app._last_prune["at"] = 0.0
+        app._check_state.update(results={})
         self.static = self.data / "static"
         self.static.mkdir()
         (self.static / "index.html").write_text(
@@ -99,14 +102,19 @@ class ApiTestCase(unittest.TestCase):
         self.thread.join(timeout=5)
         app.DATA, app.HITS_FILE, app.STATIC = self._old_data, self._old_hits, self._old_static
         app.AGENTS_FILE, app.METRICS_FILE = self._old_agents, self._old_metrics
+        app.CHECKS_FILE = self._old_checks
         app._cache.update(at=0.0, body=None)
         app._availability_cache.update(at=0.0, by_id={})
         app._summary_cache.update(at=0.0, window=None, body=None)
         app._last_prune["at"] = 0.0
+        app._check_state.update(results={})
         self._tmp.cleanup()
 
     def write_bookmarks(self, store):
         (self.data / "bookmarks.json").write_text(json.dumps(store))
+
+    def write_checks(self, checks):
+        (self.data / "checks.json").write_text(json.dumps({"checks": checks}))
 
     def post(self, body, path="/api/hit", headers=None):
         req = urllib.request.Request(self.base + path, data=body, method="POST")
@@ -2887,6 +2895,914 @@ class DeviceCountTest(FrontEndSourceTest):
         # its own series; only the tallies are filtered.
         self.assertIn("metricsTree(devices)",
                       function_body(self.metrics_js, "renderDevices"))
+
+
+# ---------- service checks ----------
+# The store is a JSON file beside bookmarks.json. These test the reader, not a
+# live probe: every entry must normalise to one shape the sampler and API share.
+
+class ServiceCheckConfigTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data = Path(self._tmp.name)
+        self._old_data = app.DATA
+        self._old_checks = app.CHECKS_FILE
+        app.DATA = self.data
+        app.CHECKS_FILE = self.data / "checks.json"
+
+    def tearDown(self):
+        app.DATA = self._old_data
+        app.CHECKS_FILE = self._old_checks
+        self._tmp.cleanup()
+
+    def write(self, payload):
+        app.CHECKS_FILE.write_text(
+            payload if isinstance(payload, str) else json.dumps(payload)
+        )
+
+    def test_a_valid_entry_is_normalised_with_defaults(self):
+        self.write({"checks": [{
+            "id": "gitea",
+            "url": "https://git.example/",
+            "device_id": "agent:pve",
+        }]})
+
+        checks = app.load_checks()
+
+        self.assertEqual(len(checks), 1)
+        check = checks[0]
+        self.assertEqual(check["id"], "gitea")
+        self.assertEqual(check["name"], "gitea")
+        self.assertEqual(check["method"], "GET")
+        self.assertEqual(check["timeout_s"], 5.0)
+        self.assertIsNone(check["interval_s"])
+        self.assertEqual(check["device_id"], "agent:pve")
+        self.assertFalse(check["external"])
+        self.assertIsNone(check["expect_body"])
+        self.assertEqual(check["status_ranges"], ((200, 299),))
+
+    def test_missing_empty_and_corrupt_stores_are_empty_not_fatal(self):
+        # Zero checks must work, and a bad file must never take the API down.
+        self.assertEqual(app.load_checks(), [])
+
+        self.write("{not json")
+        self.assertEqual(app.load_checks(), [])
+
+        self.write({"checks": []})
+        self.assertEqual(app.load_checks(), [])
+
+        self.write({"checks": "nope"})
+        self.assertEqual(app.load_checks(), [])
+
+        self.write({"other": [{"id": "x"}]})
+        self.assertEqual(app.load_checks(), [])
+
+    def test_invalid_entries_are_dropped_and_duplicate_ids_keep_the_first(self):
+        self.write({"checks": [
+            "not a dict",
+            {"name": "no id", "url": "https://example.com/"},
+            {"id": "", "url": "https://example.com/"},
+            {"id": "no-url"},
+            {"id": "bad-scheme", "url": "ftp://example.com/"},
+            {"id": "relative", "url": "/api/health"},
+            {"id": "first", "name": "First", "url": "https://one.example/"},
+            {"id": "first", "name": "Duplicate", "url": "https://two.example/"},
+        ]})
+
+        checks = app.load_checks()
+
+        self.assertEqual([check["id"] for check in checks], ["first"])
+        self.assertEqual(checks[0]["name"], "First")
+        self.assertEqual(checks[0]["url"], "https://one.example/")
+
+    def test_status_expectations_methods_and_bounds_are_normalised(self):
+        self.write({"checks": [
+            {"id": "exact", "url": "https://example.com/", "expect_status": 204},
+            {"id": "class", "url": "https://example.com/", "expect_status": "3xx"},
+            {"id": "range", "url": "https://example.com/",
+             "expect_status": "200-299"},
+            {"id": "union", "url": "https://example.com/",
+             "expect_status": [200, "3xx"]},
+            {"id": "bad", "url": "https://example.com/", "expect_status": "nope"},
+            {"id": "head", "url": "https://example.com/", "method": "head",
+             "timeout_s": 999, "interval_s": 1},
+            {"id": "post", "url": "https://example.com/", "method": "post"},
+        ]})
+
+        checks = {check["id"]: check for check in app.load_checks()}
+
+        self.assertEqual(checks["exact"]["status_ranges"], ((204, 204),))
+        self.assertEqual(checks["class"]["status_ranges"], ((300, 399),))
+        self.assertEqual(checks["range"]["status_ranges"], ((200, 299),))
+        self.assertEqual(
+            checks["union"]["status_ranges"], ((200, 200), (300, 399))
+        )
+        self.assertEqual(checks["bad"]["status_ranges"], ((200, 299),))
+        self.assertEqual(checks["head"]["method"], "HEAD")
+        self.assertEqual(checks["head"]["timeout_s"], 60.0)
+        self.assertEqual(checks["head"]["interval_s"], 10)
+        # An unsupported method falls back to a harmless GET rather than
+        # letting a config typo issue a mutating request.
+        self.assertEqual(checks["post"]["method"], "GET")
+
+
+class FakeProbeTransport:
+    """A stand-in for urllib: records the call and returns or raises."""
+
+    def __init__(self, result=(200, b"ok", None), error=None):
+        self.result = result
+        self.error = error
+        self.calls = []
+
+    def __call__(self, url, method, timeout):
+        self.calls.append((url, method, timeout))
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+class ServiceCheckProbeTest(unittest.TestCase):
+    def check(self, **overrides):
+        raw = {"id": "svc", "name": "Service", "url": "https://example.com/"}
+        raw.update(overrides)
+        return app._normalise_check(raw)
+
+    def test_a_matching_probe_records_status_and_latency(self):
+        transport = FakeProbeTransport((200, b"hello", None))
+
+        result = app.probe_check(self.check(), transport=transport)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], 200)
+        self.assertIsNone(result["error"])
+        self.assertIsNone(result["cert_days"])
+        self.assertIsInstance(result["latency_ms"], int)
+        self.assertGreaterEqual(result["latency_ms"], 0)
+        self.assertEqual(
+            transport.calls, [("https://example.com/", "GET", 5.0)]
+        )
+
+    def test_a_status_outside_the_expectation_fails_with_its_code(self):
+        transport = FakeProbeTransport((503, b"down", None))
+
+        result = app.probe_check(self.check(), transport=transport)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], 503)
+        self.assertEqual(result["error"], "HTTP 503")
+
+    def test_an_explicit_status_class_is_honoured(self):
+        transport = FakeProbeTransport((301, b"", None))
+
+        result = app.probe_check(
+            self.check(expect_status="3xx"), transport=transport
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], 301)
+
+    def test_expect_body_must_appear_in_the_response(self):
+        transport = FakeProbeTransport((200, b"healthy dashboard", None))
+
+        good = app.probe_check(
+            self.check(expect_body="healthy"), transport=transport
+        )
+        bad = app.probe_check(
+            self.check(expect_body="maintenance"), transport=transport
+        )
+
+        self.assertTrue(good["ok"])
+        self.assertFalse(bad["ok"])
+        self.assertTrue(bad["error"].startswith("body did not contain"))
+
+    def test_a_network_error_is_a_failed_sample_not_an_exception(self):
+        transport = FakeProbeTransport(error=TimeoutError("timed out"))
+
+        result = app.probe_check(self.check(), transport=transport)
+
+        self.assertFalse(result["ok"])
+        self.assertIsNone(result["status"])
+        self.assertIn("TimeoutError", result["error"])
+        self.assertIn("timed out", result["error"])
+
+    def test_certificate_not_after_becomes_days_remaining(self):
+        now = NOW
+        not_after = now + 10 * 86400
+        transport = FakeProbeTransport((200, b"", not_after))
+
+        result = app.probe_check(self.check(), now=now, transport=transport)
+
+        self.assertEqual(result["cert_days"], 10.0)
+
+    def test_ssl_not_after_text_is_parsed_with_the_stdlib(self):
+        # Expected value comes from ssl.cert_time_to_seconds, not from the
+        # implementation's own arithmetic.
+        import ssl
+        not_after = ssl.cert_time_to_seconds("Jun  1 12:00:00 2027 GMT")
+
+        parsed = app._cert_not_after({"notAfter": "Jun  1 12:00:00 2027 GMT"})
+
+        self.assertEqual(parsed, not_after)
+
+    def test_an_expired_certificate_reports_negative_days(self):
+        now = NOW
+        transport = FakeProbeTransport((200, b"", now - 2 * 86400))
+
+        result = app.probe_check(self.check(), now=now, transport=transport)
+
+        self.assertEqual(result["cert_days"], -2.0)
+
+    def test_method_and_timeout_reach_the_transport(self):
+        transport = FakeProbeTransport((200, b"", None))
+
+        app.probe_check(
+            self.check(method="HEAD", timeout_s=2), transport=transport
+        )
+
+        self.assertEqual(transport.calls, [("https://example.com/", "HEAD", 2.0)])
+
+    def test_a_redirect_is_observed_rather_than_followed(self):
+        handler = app._NoRedirect()
+
+        self.assertIsNone(handler.redirect_request(
+            None, None, 301, "Moved", None, "https://elsewhere.example/"
+        ))
+
+    def test_certificate_lifetime_is_read_from_the_annotated_response(self):
+        not_after = NOW + 5 * 86400
+        response = mock.Mock()
+        response.dash_connection = mock.Mock(cert_not_after=not_after)
+
+        self.assertEqual(app._cert_from_response(response), not_after)
+        self.assertIsNone(app._cert_from_response(object()))
+
+
+class CheckSampleStoreTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data = Path(self._tmp.name)
+        self._old_data = app.DATA
+        self._old_metrics = app.METRICS_FILE
+        app.DATA = self.data
+        app.METRICS_FILE = self.data / "metrics.db"
+        app._last_prune["at"] = 0.0
+
+    def tearDown(self):
+        app.DATA = self._old_data
+        app.METRICS_FILE = self._old_metrics
+        app._last_prune["at"] = 0.0
+        self._tmp.cleanup()
+
+    def rows(self):
+        con = app._connect_metrics()
+        try:
+            return con.execute(
+                "SELECT check_id, ts, ok, status, latency_ms, cert_days, error "
+                "FROM check_samples ORDER BY check_id"
+            ).fetchall()
+        finally:
+            con.close()
+
+    def sample(self, check_id, ok=True, status=200, **extra):
+        return {
+            "id": check_id, "ok": ok, "status": status,
+            "latency_ms": extra.get("latency_ms", 12),
+            "cert_days": extra.get("cert_days"),
+            "error": extra.get("error"),
+        }
+
+    def test_a_probe_lands_in_its_bucket_with_every_field(self):
+        app.record_check_samples(
+            [self.sample("a", cert_days=9.5)], now=NOW
+        )
+
+        bucket = int(NOW) - (int(NOW) % app.CHECK_BUCKET_SECONDS)
+        self.assertEqual(
+            self.rows(), [("a", bucket, 1, 200, 12, 9.5, None)]
+        )
+
+    def test_a_repeat_inside_a_bucket_replaces_the_sample(self):
+        app.record_check_samples([self.sample("a")], now=NOW)
+        app.record_check_samples(
+            [self.sample("a", ok=False, status=503, error="HTTP 503",
+                         latency_ms=99)],
+            now=NOW + 10,
+        )
+
+        bucket = int(NOW) - (int(NOW) % app.CHECK_BUCKET_SECONDS)
+        self.assertEqual(
+            self.rows(), [("a", bucket, 0, 503, 99, None, "HTTP 503")]
+        )
+
+    def test_the_next_bucket_appends_rather_than_overwriting(self):
+        app.record_check_samples([self.sample("a")], now=NOW)
+        app.record_check_samples([self.sample("a")], now=NOW + 60)
+
+        buckets = [row[1] for row in self.rows()]
+        self.assertEqual(len(buckets), 2)
+        self.assertEqual(buckets[1] - buckets[0], app.CHECK_BUCKET_SECONDS)
+
+    def test_retention_prunes_raw_check_samples_on_the_shared_pass(self):
+        app.record_check_samples([self.sample("recent")], now=NOW)
+        old = int(NOW) - (app.CHECK_RETENTION_DAYS + 1) * 86400
+        con = app._connect_metrics()
+        try:
+            con.execute(
+                "INSERT INTO check_samples "
+                "(check_id, ts, ok, status, latency_ms, cert_days, error) "
+                "VALUES (?, ?, 1, 200, 5, NULL, NULL)",
+                ("old", old),
+            )
+            con.commit()
+        finally:
+            con.close()
+        self.assertEqual(len(self.rows()), 2)
+
+        app.prune_metrics(NOW)
+
+        self.assertEqual([row[0] for row in self.rows()], ["recent"])
+
+
+class ServiceCheckVerdictTest(unittest.TestCase):
+    def check(self, **overrides):
+        raw = {"id": "svc", "url": "https://example.com/"}
+        raw.update(overrides)
+        return app._normalise_check(raw)
+
+    def test_verdict_precedence(self):
+        # unknown: no samples at all, whatever the device says.
+        self.assertEqual(app.check_verdict(self.check(), None, None), "unknown")
+        self.assertEqual(app.check_verdict(self.check(), None, False), "unknown")
+
+        # host_down: a tied device that is known offline outranks the sample.
+        self.assertEqual(
+            app.check_verdict(self.check(device_id="agent:pve"), True, False),
+            "host_down",
+        )
+        self.assertEqual(
+            app.check_verdict(
+                self.check(device_id="agent:pve", external=True), False, False
+            ),
+            "host_down",
+        )
+
+        # ok: the newest sample passed while its host is up (or untied).
+        self.assertEqual(app.check_verdict(self.check(), True, None), "ok")
+        self.assertEqual(
+            app.check_verdict(self.check(device_id="agent:pve"), True, True),
+            "ok",
+        )
+
+        # service_down: the host is online (or unknown) and the probe failed.
+        self.assertEqual(
+            app.check_verdict(self.check(device_id="agent:pve"), False, True),
+            "service_down",
+        )
+        self.assertEqual(app.check_verdict(self.check(), False, None),
+                         "service_down")
+        # An untied failing check that is not external is still a service.
+        self.assertEqual(
+            app.check_verdict(self.check(device_id="gone"), False, None),
+            "service_down",
+        )
+
+        # path_down: an external probe failed.
+        self.assertEqual(
+            app.check_verdict(self.check(external=True), False, None),
+            "path_down",
+        )
+
+
+class ServiceCheckSamplerTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data = Path(self._tmp.name)
+        self._old_data = app.DATA
+        self._old_metrics = app.METRICS_FILE
+        self._old_checks = app.CHECKS_FILE
+        self._old_agents = app.AGENTS_FILE
+        app.DATA = self.data
+        app.METRICS_FILE = self.data / "metrics.db"
+        app.CHECKS_FILE = self.data / "checks.json"
+        app.AGENTS_FILE = self.data / "agents.json"
+        app._last_prune["at"] = 0.0
+        app._check_state.update(results={})
+
+    def tearDown(self):
+        app.DATA = self._old_data
+        app.METRICS_FILE = self._old_metrics
+        app.CHECKS_FILE = self._old_checks
+        app.AGENTS_FILE = self._old_agents
+        app._last_prune["at"] = 0.0
+        app._check_state.update(results={})
+        self._tmp.cleanup()
+
+    def write_checks(self, checks):
+        app.CHECKS_FILE.write_text(json.dumps({"checks": checks}))
+
+    def test_a_pass_probes_every_due_check_and_stores_the_samples(self):
+        self.write_checks([
+            {"id": "one", "url": "https://one.example/"},
+            {"id": "two", "url": "https://two.example/"},
+        ])
+        transport = FakeProbeTransport((200, b"ok", None))
+
+        probed = app.run_checks_once(now=NOW, transport=transport)
+
+        self.assertEqual(probed, 2)
+        self.assertEqual(len(transport.calls), 2)
+        con = app._connect_metrics()
+        try:
+            rows = con.execute(
+                "SELECT check_id, ok, status FROM check_samples ORDER BY check_id"
+            ).fetchall()
+        finally:
+            con.close()
+        self.assertEqual(rows, [("one", 1, 200), ("two", 1, 200)])
+        self.assertEqual(app._check_state["results"]["one"]["verdict"], "ok")
+
+    def test_a_per_check_interval_skips_a_recent_sample(self):
+        self.write_checks([
+            {"id": "slow", "url": "https://slow.example/", "interval_s": 300},
+        ])
+        first = FakeProbeTransport((200, b"", None))
+        early = FakeProbeTransport((500, b"", None))
+
+        self.assertEqual(
+            app.run_checks_once(now=NOW, transport=first), 1
+        )
+        self.assertEqual(
+            app.run_checks_once(now=NOW + 60, transport=early), 0
+        )
+        self.assertEqual(early.calls, [])
+        self.assertEqual(
+            app.run_checks_once(now=NOW + 300, transport=early), 1
+        )
+
+    def test_an_offline_tied_device_yields_host_down(self):
+        self.write_checks([
+            {"id": "pve-web", "url": "https://pve.example/",
+             "device_id": "agent:pve"},
+        ])
+        app.AGENTS_FILE.write_text(json.dumps({
+            "pve": {"name": "pve", "kind": "host", "last_seen": NOW - 1000},
+        }))
+
+        with frozen_time():
+            app.run_checks_once(
+                now=NOW, transport=FakeProbeTransport((200, b"", None))
+            )
+
+        self.assertEqual(
+            app._check_state["results"]["pve-web"]["verdict"], "host_down"
+        )
+
+    def test_zero_checks_does_not_create_a_store(self):
+        self.assertEqual(app.run_checks_once(now=NOW), 0)
+        self.assertFalse(app.METRICS_FILE.exists())
+        self.assertEqual(app._check_state["results"], {})
+
+    def test_a_not_due_check_rehydrates_stored_state_after_restart(self):
+        self.write_checks([{
+            "id": "slow", "url": "https://slow.example/", "interval_s": 3600,
+        }])
+        app.record_check_samples(
+            [{"id": "slow", "ok": False, "status": 503, "latency_ms": 9,
+              "cert_days": 5.0, "error": "HTTP 503"}],
+            now=NOW,
+        )
+        app._check_state["results"] = {}  # simulate a process restart
+        transport = FakeProbeTransport((200, b"", None))
+
+        probed = app.run_checks_once(now=NOW + 60, transport=transport)
+
+        self.assertEqual(probed, 0)
+        self.assertEqual(transport.calls, [])
+        state = app._check_state["results"]["slow"]
+        self.assertFalse(state["ok"])
+        self.assertEqual(state["verdict"], "service_down")
+        codes = [warning["code"] for warning in app.check_warnings()]
+        self.assertIn("service", codes)
+        self.assertIn("cert", codes)
+
+    def test_a_not_due_check_still_follows_the_live_host_state(self):
+        self.write_checks([{
+            "id": "pve-web", "url": "https://pve.example/",
+            "device_id": "agent:pve", "interval_s": 3600,
+        }])
+        app.record_check_samples(
+            [{"id": "pve-web", "ok": True, "status": 200, "latency_ms": 9,
+              "cert_days": None, "error": None}],
+            now=NOW,
+        )
+        app.AGENTS_FILE.write_text(json.dumps({
+            "pve": {"name": "pve", "kind": "host", "last_seen": NOW - 1000},
+        }))
+        transport = FakeProbeTransport((200, b"", None))
+
+        with frozen_time():
+            probed = app.run_checks_once(now=NOW + 60, transport=transport)
+
+        self.assertEqual(probed, 0)
+        self.assertEqual(
+            app._check_state["results"]["pve-web"]["verdict"], "host_down"
+        )
+        self.assertIn(
+            "service", [warning["code"] for warning in app.check_warnings()]
+        )
+
+
+class ServiceChecksPayloadTest(ApiTestCase):
+    REQUIRED = {
+        "id", "name", "url", "device_id", "ok", "status", "latency_ms",
+        "cert_days", "error", "last_change", "uptime_24h", "uptime_7d",
+        "verdict",
+    }
+
+    def sample(self, check_id, ok, status=200, error=None, cert_days=None):
+        return {
+            "id": check_id, "ok": ok, "status": status, "latency_ms": 12,
+            "cert_days": cert_days, "error": error,
+        }
+
+    def test_empty_store_returns_an_empty_checks_list(self):
+        status, data = self.get_json("/api/checks")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(data["checks"], [])
+        self.assertIn("generated", data)
+
+    def test_a_corrupt_store_is_an_empty_list_not_a_500(self):
+        (self.data / "checks.json").write_text("{not json")
+
+        status, data = self.get_json("/api/checks")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(data["checks"], [])
+
+    def test_the_endpoint_serves_the_documented_shape(self):
+        self.write_checks([{
+            "id": "web", "name": "Web", "url": "https://web.example/health",
+            "device_id": "docker01",
+        }])
+        now = time.time()
+        app.record_check_samples(
+            [{"id": "web", "ok": True, "status": 200, "latency_ms": 12,
+              "cert_days": 9.0, "error": None}],
+            now=now,
+        )
+
+        status, data = self.get_json("/api/checks")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(len(data["checks"]), 1)
+        entry = data["checks"][0]
+        self.assertEqual(set(entry), self.REQUIRED)
+        self.assertEqual(entry["id"], "web")
+        self.assertEqual(entry["name"], "Web")
+        self.assertEqual(entry["url"], "https://web.example/health")
+        self.assertEqual(entry["device_id"], "docker01")
+        self.assertIs(entry["ok"], True)
+        self.assertEqual(entry["status"], 200)
+        self.assertEqual(entry["uptime_24h"], 100.0)
+        self.assertEqual(entry["uptime_7d"], 100.0)
+        self.assertEqual(entry["verdict"], "ok")
+
+    def payload(self, check, samples, now=NOW):
+        self.write_checks([check])
+        for sample, ts in samples:
+            app.record_check_samples([sample], now=ts)
+        with frozen_time():
+            return app.checks_payload(now=now)["checks"][0]
+
+    def test_uptime_math_uses_the_24h_and_7d_windows(self):
+        entry = self.payload(
+            {"id": "web", "url": "https://web.example/"},
+            [
+                (self.sample("web", True), NOW - 2 * 86400),
+                (self.sample("web", False), NOW - 3 * 3600),
+                (self.sample("web", True), NOW - 2 * 3600),
+                (self.sample("web", True), NOW - 3600),
+            ],
+        )
+
+        # 2 of 3 samples inside 24 h, 3 of 4 inside 7 d.
+        self.assertEqual(entry["uptime_24h"], 66.7)
+        self.assertEqual(entry["uptime_7d"], 75.0)
+
+    def test_last_change_is_when_the_current_run_began(self):
+        entry = self.payload(
+            {"id": "web", "url": "https://web.example/"},
+            [
+                (self.sample("web", True), NOW - 4 * 3600),
+                (self.sample("web", True), NOW - 3 * 3600),
+                (self.sample("web", False), NOW - 2 * 3600),
+                (self.sample("web", True), NOW - 3600),
+            ],
+        )
+
+        change = int(NOW - 3600)
+        change -= change % app.CHECK_BUCKET_SECONDS
+        self.assertEqual(entry["last_change"], change)
+
+    def test_a_check_with_no_samples_is_unknown(self):
+        entry = self.payload(
+            {"id": "new", "url": "https://new.example/"}, []
+        )
+
+        self.assertIsNone(entry["ok"])
+        self.assertIsNone(entry["status"])
+        self.assertIsNone(entry["latency_ms"])
+        self.assertIsNone(entry["cert_days"])
+        self.assertIsNone(entry["error"])
+        self.assertIsNone(entry["last_change"])
+        self.assertIsNone(entry["uptime_24h"])
+        self.assertIsNone(entry["uptime_7d"])
+        self.assertEqual(entry["verdict"], "unknown")
+
+    def test_an_offline_host_turns_the_tied_check_host_down(self):
+        app.AGENTS_FILE.write_text(json.dumps({
+            "off": {"name": "off", "kind": "host", "last_seen": NOW - 1000},
+        }))
+        entry = self.payload(
+            {"id": "web", "url": "https://web.example/", "device_id": "agent:off"},
+            [(self.sample("web", True), NOW)],
+        )
+
+        self.assertEqual(entry["verdict"], "host_down")
+
+    def test_an_external_failure_is_path_down_and_keeps_the_error(self):
+        entry = self.payload(
+            {"id": "wan", "url": "https://wan.example/", "external": True},
+            [(self.sample("wan", False, status=None,
+                          error="TimeoutError: timed out"), NOW)],
+        )
+
+        self.assertEqual(entry["verdict"], "path_down")
+        self.assertEqual(entry["error"], "TimeoutError: timed out")
+
+    def test_a_tied_online_host_failing_is_service_down(self):
+        entry = self.payload(
+            {"id": "web", "url": "https://web.example/",
+             "device_id": "docker01"},
+            [(self.sample("web", False, status=503,
+                          error="HTTP 503"), NOW)],
+        )
+
+        self.assertEqual(entry["verdict"], "service_down")
+        self.assertEqual(entry["status"], 503)
+
+
+class ServiceCheckWarningsTest(ApiTestCase):
+    def run_check(self, check, transport):
+        self.write_checks([check])
+        app.run_checks_once(now=time.time(), transport=transport)
+        app._cache.update(at=0.0, body=None)
+
+    def test_a_failing_check_appears_in_stats_warnings(self):
+        self.run_check(
+            {"id": "web", "name": "Web", "url": "https://web.example/"},
+            FakeProbeTransport((503, b"down", None)),
+        )
+
+        warnings = app.stats()["warnings"]
+
+        self.assertEqual(len(warnings), 1)
+        warning = warnings[0]
+        self.assertEqual(
+            set(warning), {"code", "level", "value", "threshold", "text"}
+        )
+        self.assertEqual(warning["code"], "service")
+        self.assertEqual(warning["level"], "critical")
+        self.assertEqual(warning["value"], 503)
+        self.assertIn("Web", warning["text"])
+        self.assertIn("HTTP 503", warning["text"])
+
+    def test_a_certificate_inside_fourteen_days_is_a_warning(self):
+        now = time.time()
+        self.run_check(
+            {"id": "web", "name": "Web", "url": "https://web.example/"},
+            FakeProbeTransport((200, b"", now + 10 * 86400)),
+        )
+
+        warnings = app.stats()["warnings"]
+
+        self.assertEqual(len(warnings), 1)
+        warning = warnings[0]
+        self.assertEqual(warning["code"], "cert")
+        self.assertEqual(warning["level"], "warning")
+        self.assertEqual(warning["value"], 10.0)
+        self.assertEqual(warning["threshold"], app.WARN_CERT_DAYS)
+        self.assertIn("Web", warning["text"])
+        self.assertIn("10d", warning["text"])
+
+    def test_a_certificate_inside_half_the_window_is_critical(self):
+        now = time.time()
+        self.run_check(
+            {"id": "web", "name": "Web", "url": "https://web.example/"},
+            FakeProbeTransport((200, b"", now + 2 * 86400)),
+        )
+
+        warning = app.stats()["warnings"][0]
+
+        self.assertEqual(warning["code"], "cert")
+        self.assertEqual(warning["level"], "critical")
+
+    def test_a_healthy_certificate_and_check_produce_no_warning(self):
+        now = time.time()
+        self.run_check(
+            {"id": "web", "name": "Web", "url": "https://web.example/"},
+            FakeProbeTransport((200, b"", now + 60 * 86400)),
+        )
+
+        self.assertEqual(app.stats()["warnings"], [])
+
+    def test_a_host_down_check_is_a_warning_naming_the_host(self):
+        app.AGENTS_FILE.write_text(json.dumps({
+            "pve": {"name": "pve", "kind": "host", "last_seen": 0},
+        }))
+        self.run_check(
+            {"id": "web", "name": "Web", "url": "https://web.example/",
+             "device_id": "agent:pve"},
+            FakeProbeTransport((200, b"", None)),
+        )
+
+        warning = app.stats()["warnings"][0]
+
+        self.assertIn("host offline", warning["text"])
+
+    def test_the_stats_endpoint_carries_the_warning_list(self):
+        self.run_check(
+            {"id": "web", "name": "Web", "url": "https://web.example/"},
+            FakeProbeTransport((500, b"", None)),
+        )
+
+        status, data = self.get_json("/api/stats")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(data["warnings"][0]["code"], "service")
+
+    def test_no_checks_means_an_empty_warning_list(self):
+        self.assertEqual(app.stats()["warnings"], [])
+
+    def test_stats_reads_the_live_check_state_not_the_history(self):
+        # The rail polls every 5 s; a check-history scan there would be a cost
+        # the device warnings deliberately avoid.
+        source = Path(app.__file__).read_text()
+        start = source.index("def check_warnings(")
+        end = source.index("\ndef ", start + 1)
+        body = source[start:end]
+
+        self.assertIn("_check_state", body)
+        self.assertNotIn("check_samples", body)
+        self.assertNotIn("_connect_metrics", body)
+
+
+class BookmarkCheckReferenceTest(ApiTestCase):
+    STORE = {
+        "work": [{
+            "category": "Services",
+            "items": [
+                {"title": "Gitea", "url": "https://git.example/",
+                 "check": "gitea"},
+                {"title": "Docs", "url": "https://docs.example.com"},
+            ],
+        }]
+    }
+
+    def test_api_passes_the_check_reference_through_unchanged(self):
+        self.write_bookmarks(self.STORE)
+
+        status, data = self.get_json("/api/bookmarks")
+
+        self.assertEqual(status, 200)
+        items = data["work"][0]["items"]
+        self.assertEqual(items[0]["check"], "gitea")
+        self.assertNotIn("check", items[1])
+
+    def test_the_injected_first_paint_payload_keeps_the_reference(self):
+        self.write_bookmarks(self.STORE)
+
+        with urllib.request.urlopen(self.base + "/", timeout=5) as resp:
+            html = resp.read().decode()
+
+        self.assertIn('"check": "gitea"', html)
+        # The injected copy is the same store the API serves, not a stripped
+        # projection that would need a second request to learn the check id.
+        self.assertNotIn("__BOOKMARKS_JSON__", html)
+
+
+class ServiceChecksUiTest(FrontEndSourceTest):
+    """The dashboard is health-aware: rows, tiles and the Services rail card.
+
+    No JS runtime here, so these pin the seams: one check lookup, one badge
+    renderer, one Services renderer and the poll that feeds them.
+    """
+
+    def test_all_tools_rows_and_launchpad_tiles_render_a_check_badge(self):
+        self.assertIn("checkBadge(", function_body(self.js, "toolRow"))
+        self.assertIn("checkBadge(", function_body(self.js, "launchpadTile"))
+
+    def test_the_badge_is_not_colour_only(self):
+        badge = function_body(self.js, "checkBadge")
+        dot = function_body(self.js, "statusDotHTML")
+        defs = self.js[self.js.index("const VERDICT_DEFS"):]
+        defs = defs[:defs.index("\n};") + 3]
+
+        # Every verdict names a distinct-ish glyph; unknown must not borrow the
+        # failure mark, and path_down must differ from service_down on a tile.
+        self.assertRegex(defs, r"unknown:\s*\{\s*label:\s*'no data',\s*mark:\s*'\?'")
+        self.assertRegex(defs, r"service_down:\s*\{[^}]*mark:\s*'!'")
+        self.assertRegex(defs, r"path_down:\s*\{[^}]*mark:\s*'~'")
+        self.assertIn("aria-hidden", dot)
+        self.assertIn(".mark", dot)
+
+        # Screen-reader text plus a hover title name the state.
+        self.assertIn("visually-hidden", badge)
+        self.assertIn("title=", badge)
+        self.assertIn("verdictLabel(", badge)
+
+    def test_the_check_payload_is_fetched_by_the_existing_poller(self):
+        refresh = function_body(self.js, "refreshDevices")
+
+        self.assertIn("dashData.read('/api/checks'", refresh)
+        self.assertIn("applyChecks(", refresh)
+        self.assertIn("checkMap(", function_body(self.js, "applyChecks"))
+        # Rendering is refreshed once the check state arrives, because the
+        # first paint only has the bookmark store.
+        apply = function_body(self.js, "applyChecks")
+        self.assertIn("renderAllTools(", apply)
+        self.assertIn("renderLaunchpad(", apply)
+        # Latency and uptime change every poll; the All tools list must not be
+        # rebuilt (and its scroll reset) unless a verdict changed.
+        self.assertIn("checkSignatureOf(", apply)
+        self.assertIn("signature !== checkSignature", apply)
+
+    def test_the_services_card_shows_latency_uptime_cert_and_verdict(self):
+        meta = function_body(self.js, "serviceMeta")
+        self.assertIn("latency_ms", meta)
+        self.assertIn("uptime_24h", meta)
+        self.assertIn("cert_days", meta)
+
+        row = function_body(self.js, "serviceRow")
+        self.assertIn("service-verdict", row)
+        self.assertIn("verdictLabel(", row)
+        self.assertIn("serviceMeta(", row)
+
+        render = function_body(self.js, "renderServices")
+        self.assertIn("servicesListEl", render)
+        self.assertIn("servicesSummary(", render)
+        self.assertIn("services-empty", render)
+
+    def test_every_verdict_has_a_label(self):
+        labels = function_body(self.js, "verdictLabel")
+        source = self.js[self.js.index("VERDICT_DEFS"):]
+        for verdict in ("ok", "service_down", "host_down", "path_down", "unknown"):
+            with self.subTest(verdict=verdict):
+                self.assertIn(verdict + ":", source)
+        self.assertIn("VERDICT_DEFS[", labels)
+
+    def test_the_services_card_sits_below_network_in_the_rail(self):
+        aside = self.html.index('<aside class="rail">')
+        network = self.html.index('id="network-title"', aside)
+        services = self.html.index('class="services-panel card"', aside)
+
+        self.assertGreater(services, network)
+        panel = self.html[services:self.html.index("</section>", services)]
+        self.assertIn('id="services-title"', panel)
+        self.assertIn('id="services-summary"', panel)
+        self.assertIn('id="services-list"', panel)
+        self.assertIn('aria-labelledby="services-title"', panel)
+
+    def test_service_css_is_compact_presentational_and_shape_coded(self):
+        self.assertIn(".services-panel {", self.css)
+        self.assertIn(".service-row {", self.css)
+        self.assertIn(".service-meta {", self.css)
+        self.assertIn(".status-dot {", self.css)
+        self.assertIn(".visually-hidden {", self.css)
+
+        # host_down is a square, path_down a ring, and the unknown dot is
+        # hollow: the state is readable without relying on hue.
+        self.assertRegex(
+            self.css,
+            r"\.status-dot\.is-host-down\s*\{[^}]*border-radius:\s*2px",
+        )
+        self.assertRegex(
+            self.css,
+            r"\.status-dot\.is-path-down\s*\{[^}]*border:\s*2px solid",
+        )
+        self.assertRegex(
+            self.css,
+            r"\.status-dot\.is-unknown\s*\{[^}]*border:\s*1px dashed",
+        )
+        # The rail stays a scroll container, so the page itself never scrolls.
+        self.assertRegex(self.css, r"\.rail\s*\{[^}]*overflow-y:\s*auto")
+
+    def test_no_new_icon_or_font_request_was_added(self):
+        for source in (self.html, self.js):
+            self.assertNotIn("fonts.googleapis.com", source)
+            self.assertNotIn("<img", source)
+            self.assertNotIn("@font-face", source)
 
 
 class HealthPayloadCleaningTest(unittest.TestCase):
