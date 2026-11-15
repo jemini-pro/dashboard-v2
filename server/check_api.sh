@@ -988,6 +988,29 @@ assert events, data["events"]
 PY
 ok "a deploy annotation appears as a chart marker and an Events row"
 
+# 9f. The brief read model names that annotation once, with the documented
+# shape, and rejects a window it does not offer.
+curl -fsS "$BASE/api/brief?window=1h" -o "$TMP/brief.json" \
+    || fail "GET /api/brief failed"
+brief_code="$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/api/brief?window=2h")"
+[[ "$brief_code" == "400" ]] || fail "brief accepted an unknown window: $brief_code"
+python3 - "$TMP/brief.json" <<'PY' || fail "brief payload is missing the seeded annotation"
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+assert data["window"] == "1h" and data["window_s"] == 3600, data
+assert set(data["counts"]) == {"critical", "warning", "info"}, data["counts"]
+for item in data["items"]:
+    for key in ("kind", "level", "device_id", "device_name", "ts", "text"):
+        assert key in item, item
+notes = [item for item in data["items"]
+         if item["kind"] == "annotation" and "check_api deploy" in item["text"]]
+assert len(notes) == 1, data["items"]
+assert notes[0]["device_id"] == "docker01", notes[0]
+assert data["quiet"] is False, data
+PY
+ok "/api/brief names the seeded annotation once and rejects unknown windows"
+
 cat > "$TMP/warn-push.json" <<'JSON'
 {"name": "warnagent", "kind": "pc", "cpu_pct": 1.0, "mem_pct": 95.0,
  "disk_pct": 96.0, "uptime_s": 10}
