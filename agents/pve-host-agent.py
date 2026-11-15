@@ -1,141 +1,39 @@
 #!/usr/bin/env python3
 """Push pve host stats (and its guests) to the homelab dashboard.
 
-Runs on the host as root, from a systemd timer. Reads /proc for itself and
-`pvesh` for the guest list, then POSTs each device to the dashboard API.
+Runs on the host as root, from a systemd timer. The host readings and the
+wire live in dash_common.py, installed beside this file; what stays here is
+the Proxmox guest list, which only this agent has. Reads /proc for itself and
+`pvesh` for the guests, then POSTs each device to the dashboard API.
 No Proxmox API token, no firewall hole: the host reaches the container, which
 is the direction that already works.
 """
 import json
 import os
-import shutil
 import subprocess
-import time
-import urllib.request
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(globals().get("__file__") or "dash-pve-agent.py"))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+import dash_common as common  # noqa: E402
 
 URL = os.environ.get("DASH_URL", "http://10.10.10.20:8448").rstrip("/")
-TOKEN = os.environ.get("DASH_TOKEN", "")
 SKIP = {n.strip() for n in os.environ.get("DASH_SKIP", "docker01").split(",") if n.strip()}
+HOST = common.LinuxHost()
 
 
-def push(name, payload):
-    req = urllib.request.Request(
-        f"{URL}/api/push/{name}",
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", "X-Dash-Token": TOKEN},
-        method="POST",
+def self_update():
+    """Pull a changed agent or shared module, so a deploy reaches this host.
+
+    The service runs once a minute, so a replaced file is picked up by the
+    next run even without the re-exec below. Never raises.
+    """
+    files = common.installed_files(
+        "pve-host-agent.py", globals().get("__file__") or ""
     )
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return r.status
-
-
-def cpu_pct():
-    def sample():
-        with open("/proc/stat") as f:
-            v = [float(x) for x in f.readline().split()[1:]]
-        return v[3] + (v[4] if len(v) > 4 else 0.0), sum(v)
-    i1, t1 = sample()
-    time.sleep(1)
-    i2, t2 = sample()
-    return round(100.0 * (1 - (i2 - i1) / (t2 - t1)), 1) if t2 > t1 else None
-
-
-def meminfo():
-    d = {}
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                k, _, rest = line.partition(":")
-                try:
-                    d[k] = int(rest.strip().split()[0]) * 1024
-                except (ValueError, IndexError):
-                    continue
-    except OSError:
-        return {}
-    return d
-
-
-def mem():
-    d = meminfo()
-    total = d.get("MemTotal", 0)
-    return total - d.get("MemAvailable", d.get("MemFree", 0)), total
-
-
-def swap():
-    """(used, total) swap bytes, or (None, None) when the host has no swap."""
-    d = meminfo()
-    total = d.get("SwapTotal", 0)
-    if not total:
-        return None, None
-    return max(0, total - d.get("SwapFree", 0)), total
-
-
-def load_average():
-    try:
-        with open("/proc/loadavg") as f:
-            parts = f.read().split()
-        return tuple(round(float(value), 2) for value in parts[:3])
-    except (OSError, ValueError):
-        return None, None, None
-
-
-def net_counters():
-    """(rx_bytes, tx_bytes) across real interfaces, or (None, None)."""
-    rx = tx = 0
-    try:
-        with open("/proc/net/dev") as f:
-            for line in f.readlines()[2:]:
-                name, sep, rest = line.partition(":")
-                if not sep or name.strip() == "lo":
-                    continue
-                cols = rest.split()
-                if len(cols) < 9:
-                    continue
-                rx += int(cols[0])
-                tx += int(cols[8])
-    except (OSError, ValueError):
-        return None, None
-    return rx, tx
-
-
-def net_rates():
-    rx1, tx1 = net_counters()
-    at1 = time.time()
-    if rx1 is None or tx1 is None:
-        return None, None
-    time.sleep(1)
-    rx2, tx2 = net_counters()
-    at2 = time.time()
-    if (rx2 is None or tx2 is None or at2 <= at1
-            or rx2 < rx1 or tx2 < tx1):
-        return None, None
-    elapsed = at2 - at1
-    return round((rx2 - rx1) / elapsed), round((tx2 - tx1) / elapsed)
-
-
-def cpu_extra():
-    """(iowait %, steal %) over a one-second delta."""
-    def sample():
-        with open("/proc/stat") as f:
-            v = [float(x) for x in f.readline().split()[1:]]
-        return (v[4] if len(v) > 4 else 0.0,
-                v[7] if len(v) > 7 else 0.0, sum(v))
-
-    try:
-        i1, s1, t1 = sample()
-        time.sleep(1)
-        i2, s2, t2 = sample()
-    except (OSError, ValueError):
-        return None, None
-    if t2 <= t1 or i2 < i1 or s2 < s1:
-        return None, None
-    return (round(100.0 * (i2 - i1) / (t2 - t1), 1),
-            round(100.0 * (s2 - s1) / (t2 - t1), 1))
-
-
-def uptime():
-    with open("/proc/uptime") as f:
-        return int(float(f.read().split()[0]))
+    return bool(common.update_installed(URL, files))
 
 
 def guests():
@@ -153,75 +51,44 @@ def guests():
         return []
 
 
-def root_disks():
-    """The host's root filesystem as a volume list.
-
-    LXC guests have no per-volume data from pvesh, so only the host sends
-    this. The server rejects a malformed entry rather than storing it.
-    """
-    try:
-        du = shutil.disk_usage("/")
-    except OSError:
-        return []
-    if not du.total:
-        return []
-    return [{
-        "mount": "/",
-        "label": "System",
-        "total": du.total,
-        "used": du.used,
-        "pct": round(100.0 * du.used / du.total, 1),
-    }]
+def guest_payload(guest):
+    """One LXC guest. Guests have no host-level volumes or signals."""
+    name = guest.get("name") or f"ct{guest.get('vmid')}"
+    return {
+        "name": name,
+        "kind": "lxc-guest",
+        "cpu_pct": round(100.0 * guest.get("cpu", 0), 1),
+        "mem_pct": (round(100.0 * guest["mem"] / guest["maxmem"], 1)
+                    if guest.get("maxmem") else None),
+        "mem_used": guest.get("mem"),
+        "mem_total": guest.get("maxmem"),
+        "uptime_s": guest.get("uptime"),
+    }
 
 
 def main():
-    used, total = mem()
-    disks = root_disks()
-    load_1, load_5, load_15 = load_average()
-    swap_used, swap_total = swap()
-    net_rx, net_tx = net_rates()
-    iowait, steal = cpu_extra()
+    if self_update():
+        common.restart(__file__)
+    token = common.load_token()
     errors = []
 
     try:
-        host = {
-            "name": "pve",
-            "kind": "host",
-            "cpu_pct": cpu_pct(),
-            "mem_pct": round(100.0 * used / total, 1) if total else None,
-            "mem_used": used,
-            "mem_total": total,
-            "disk_pct": disks[0]["pct"] if disks else None,
-            "disks": disks,
-            "uptime_s": uptime(),
-        }
-        for key, value in (
-            ("load_1", load_1), ("load_5", load_5), ("load_15", load_15),
-            ("swap_used", swap_used), ("swap_total", swap_total),
-            ("net_rx_bps", net_rx), ("net_tx_bps", net_tx),
-            ("cpu_iowait", iowait), ("cpu_steal", steal),
-        ):
-            if value is not None:
-                host[key] = value
-        push("pve", host)
+        # The host reports its root filesystem only; /proc/mounts discovery
+        # would list container bind mounts that are not host drives.
+        common.push("pve", common.collect_host(
+            "pve", "host", host=HOST, volumes_from=HOST.root_volume
+        ), token, URL)
         print("pushed pve")
     except Exception as exc:  # noqa: BLE001
         errors.append(f"pve: {exc}")
 
-    for g in guests():
-        name = g.get("name") or f"ct{g.get('vmid')}"
+    for guest in guests():
+        payload = guest_payload(guest)
+        name = payload["name"]
         if name in SKIP:
             continue
         try:
-            push(name, {
-                "name": name,
-                "kind": "lxc-guest",
-                "cpu_pct": round(100.0 * g.get("cpu", 0), 1),
-                "mem_pct": round(100.0 * g["mem"] / g["maxmem"], 1) if g.get("maxmem") else None,
-                "mem_used": g.get("mem"),
-                "mem_total": g.get("maxmem"),
-                "uptime_s": g.get("uptime"),
-            })
+            common.push(name, payload, token, URL)
             print("pushed", name)
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{name}: {exc}")

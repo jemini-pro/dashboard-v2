@@ -77,7 +77,7 @@ cp -a "$BUILD/fonts/." "$STACK/dash/static/fonts/"
 # files with every deploy instead of leaving a hand-copied stale version on the
 # box. Existing unrelated files in that directory are left alone.
 install -d "$STACK/dash/static/agents"
-for f in dash-agent.py dash-agent.ps1 pve-host-agent.py \
+for f in dash-agent.py dash-agent.ps1 pve-host-agent.py dash_common.py \
          com.jem.dashagent.plist install-windows-agent.ps1 install-pve-host-agent.sh; do
     install -m 0644 "$BUILD/agents/$f" "$STACK/dash/static/agents/$f"
 done

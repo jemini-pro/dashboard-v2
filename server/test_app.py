@@ -4,6 +4,7 @@ Run from the repo root:
     python3 -m unittest discover -s server -p 'test_*.py' -v
 """
 import hmac
+import importlib.util
 import json
 import re
 import sys
@@ -541,6 +542,24 @@ class AgentDownloadTest(ApiTestCase):
         with urllib.request.urlopen(self.base + "/agents/dash-agent.ps1", timeout=5) as resp:
             self.assertEqual(resp.headers.get_content_type(), "text/plain")
             self.assertEqual(resp.read(), b"# agent\n")
+
+
+class AgentFieldAllowlistTest(unittest.TestCase):
+    """The agents' wire vocabulary has one home; the server still validates.
+
+    server/app.py deliberately does not import the agents, so the shared
+    module can stay a plain file installed beside them. This test is the pin:
+    if either side grows a signal the other has not heard of, it fails here
+    rather than silently dropping the value at the push endpoint.
+    """
+
+    def test_agent_extra_metrics_match_the_server_allowlist(self):
+        path = Path(__file__).resolve().parent.parent / "agents" / "dash_common.py"
+        spec = importlib.util.spec_from_file_location("dash_common_crosscheck", path)
+        common = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(common)
+
+        self.assertEqual(tuple(common.EXTRA_METRICS), tuple(app.EXTRA_METRICS))
 
 
 class FrontEndSourceTest(unittest.TestCase):

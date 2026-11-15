@@ -20,10 +20,15 @@ if ! command -v pct >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "== 1. agent binary =="
+echo "== 1. agent binary and shared module =="
 curl -fsSL "${BASE}/agents/pve-host-agent.py" -o /usr/local/bin/dash-pve-agent.py
 chmod 755 /usr/local/bin/dash-pve-agent.py
-python3 -m py_compile /usr/local/bin/dash-pve-agent.py && echo "agent installed and compiles"
+# The agent imports dash_common; it must live in the same directory. Both are
+# re-fetched by the agent when the served copy changes.
+curl -fsSL "${BASE}/agents/dash_common.py" -o /usr/local/bin/dash_common.py
+chmod 755 /usr/local/bin/dash_common.py
+python3 -m py_compile /usr/local/bin/dash-pve-agent.py \
+    /usr/local/bin/dash_common.py && echo "agent installed and compiles"
 
 echo
 echo "== 2. token, read from the container (never printed) =="
