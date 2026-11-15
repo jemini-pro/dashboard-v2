@@ -139,12 +139,15 @@ can answer "is this normal, and since when?" rather than only "what is it now?".
   `MAX_POINTS` still caps both arrays at 400.
 - **Derived, not stored.** Availability, downtime, offline events, restarts
   (an `uptime_s` drop), CPU/RAM averages and peaks, disk growth (least-squares
-  slope) and days-to-90% are computed when a request asks for them. For long
-  windows the same signals come from rollup buckets; downtime is the offline
-  share of each bucket and events are bucket-level transitions. The same
-  least-squares rule and days-to-90 projection run per volume, online-only, so
-  an offline agent's stale volume values never look like a trend. Offline runs
-  are detected from transitions, so no separate event table is needed.
+  slope) and days-to-90% are computed when a request asks for them. One window
+  reader runs the same rules over raw samples and over the rollup buckets that
+  answer long ranges: every recorded sample counts in the CPU/RAM averages (a
+  rollup cannot separate an offline sample's last-known value from a live
+  one), downtime is the offline share of each part's span, and events are
+  transitions between parts. The same least-squares rule and days-to-90
+  projection run per volume, online-only, so an offline agent's stale volume
+  values never look like a trend. Offline runs are detected from transitions,
+  so no separate event table is needed.
 - **Agent gaps are explicit.** An agent that stops pushing still has a row in
   `agents.json`; the sampler records it with `online = 0`. Charts break the line
   for those points instead of drawing a flat line. A gap in the *server* itself
