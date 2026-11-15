@@ -82,6 +82,7 @@ class ApiTestCase(unittest.TestCase):
         app._cache.update(at=0.0, body=None)
         app._availability_cache.update(at=0.0, by_id={})
         app._summary_cache.update(at=0.0, window=None, body=None)
+        app._brief_cache.update(at=0.0, window=None, body=None)
         app._last_prune["at"] = 0.0
         app._check_state.update(results={})
         self.static = self.data / "static"
@@ -106,6 +107,7 @@ class ApiTestCase(unittest.TestCase):
         app._cache.update(at=0.0, body=None)
         app._availability_cache.update(at=0.0, by_id={})
         app._summary_cache.update(at=0.0, window=None, body=None)
+        app._brief_cache.update(at=0.0, window=None, body=None)
         app._last_prune["at"] = 0.0
         app._check_state.update(results={})
         self._tmp.cleanup()
@@ -2509,6 +2511,437 @@ class MetricsHistoryTest(ApiTestCase):
         agent = next(d for d in payload["devices"] if d["id"] == "agent:warnpc")
         self.assertEqual(agent["warning_count"], 2)
         self.assertEqual(agent["warning_level"], "critical")
+
+
+class BriefTest(ApiTestCase):
+    """The "what changed" read model: one ranked list of recent events."""
+
+    BASE = int(NOW) - (int(NOW) % 3600)
+
+    def device(self, device_id="docker01", name=None, kind="lxc", online=True,
+               cpu=10.0, mem=40.0, disk=50.0, uptime=1000, **extra):
+        record = {
+            "id": device_id,
+            "name": name or device_id,
+            "kind": kind,
+            "online": online,
+            "cpu_pct": cpu,
+            "mem_pct": mem,
+            "mem_used": 400,
+            "mem_total": 1000,
+            "disk_pct": disk,
+            "uptime_s": uptime,
+            "last_seen": self.BASE,
+        }
+        record.update(extra)
+        return record
+
+    def sample(self, devices, now=None):
+        return app.record_samples(devices, now=self.BASE if now is None else now)
+
+    def write_agents(self, agents):
+        (self.data / "agents.json").write_text(json.dumps(agents))
+
+    def test_a_fresh_install_is_quiet_with_an_empty_item_list(self):
+        payload = app.brief("24h", now=self.BASE)
+
+        self.assertEqual(payload["generated"], self.BASE)
+        self.assertEqual(payload["window"], "24h")
+        self.assertEqual(payload["window_s"], 86400)
+        self.assertTrue(payload["quiet"])
+        self.assertEqual(payload["items"], [])
+        self.assertEqual(payload["counts"],
+                         {"critical": 0, "warning": 0, "info": 0})
+
+    def test_an_offline_episode_becomes_one_plain_language_item(self):
+        pve = "agent:pve"
+        for offset, online, uptime in (
+            (0, True, 1000), (60, True, 1060), (120, False, 1120),
+            (180, False, 1180), (240, True, 1240),
+        ):
+            self.sample([self.device(pve, "pve", "host", online=online,
+                                     uptime=uptime)], now=self.BASE + offset)
+
+        payload = app.brief("1h", now=self.BASE + 240)
+        offline = [item for item in payload["items"] if item["kind"] == "offline"]
+
+        self.assertEqual(len(offline), 1)
+        item = offline[0]
+        self.assertEqual(item["device_id"], pve)
+        self.assertEqual(item["device_name"], "pve")
+        self.assertEqual(item["level"], "info")
+        self.assertEqual(item["ts"], self.BASE + 120)
+        self.assertEqual(item["href"], "metrics.html?device=agent%3Apve")
+        self.assertRegex(item["text"], r"^pve was offline for 2m at \d\d:\d\d$")
+        self.assertIn("2m total", item["detail"])
+        self.assertFalse(payload["quiet"])
+
+    def test_a_restart_is_one_info_item(self):
+        pve = "agent:pve"
+        for offset, uptime in ((0, 5000), (60, 5050), (120, 40)):
+            self.sample([self.device(pve, "pve", "host", uptime=uptime)],
+                        now=self.BASE + offset)
+
+        payload = app.brief("1h", now=self.BASE + 120)
+        restarts = [item for item in payload["items"] if item["kind"] == "restart"]
+
+        self.assertEqual(len(restarts), 1)
+        self.assertEqual(restarts[0]["level"], "info")
+        self.assertEqual(restarts[0]["ts"], self.BASE + 120)
+        self.assertRegex(restarts[0]["text"], r"^pve restarted at \d\d:\d\d$")
+        self.assertFalse(payload["quiet"])
+
+    def test_a_warning_at_the_window_end_is_named_with_its_device(self):
+        self.sample([self.device(disk=86.0)], now=self.BASE)
+
+        payload = app.brief("1h", now=self.BASE + 60)
+        warnings = [item for item in payload["items"] if item["kind"] == "warning"]
+
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0]["level"], "warning")
+        self.assertEqual(warnings[0]["device_name"], "docker01")
+        self.assertEqual(warnings[0]["text"], "docker01: Disk 86% full")
+        self.assertEqual(warnings[0]["href"], "metrics.html?device=docker01")
+        self.assertEqual(payload["counts"]["warning"], 1)
+        self.assertEqual(payload["counts"]["critical"], 0)
+        self.assertFalse(payload["quiet"])
+
+    def post_annotation(self, device, text, ts, kind="note"):
+        return self.post(json.dumps({
+            "device": device, "text": text, "ts": ts, "kind": kind,
+        }).encode(), path="/api/annotations")
+
+    def test_manual_and_fleet_wide_annotations_appear_once_each(self):
+        self.sample([self.device("docker01"),
+                     self.device("agent:pve", "pve", "host")], now=self.BASE)
+        self.assertEqual(self.post_annotation(
+            "docker01", "root volume resized", self.BASE + 30)[0], 201)
+        self.assertEqual(self.post_annotation(
+            "", "cluster reboot", self.BASE + 60, kind="deploy")[0], 201)
+
+        payload = app.brief("1h", now=self.BASE + 120)
+        notes = [item for item in payload["items"] if item["kind"] == "annotation"]
+
+        self.assertEqual(len(notes), 2)
+        self.assertEqual(
+            [(note["device_id"], note["text"]) for note in notes],
+            [("", "fleet: cluster reboot"),
+             ("docker01", "docker01: root volume resized")],
+        )
+        fleet = notes[0]
+        self.assertEqual(fleet["device_name"], "fleet")
+        self.assertNotIn("href", fleet)
+        self.assertEqual(notes[1]["href"], "metrics.html?device=docker01")
+        self.assertIn("deploy", fleet["detail"])
+        self.assertFalse(payload["quiet"])
+
+    def test_volume_growth_names_the_mount_the_bytes_and_the_percentage(self):
+        total = 107374182400  # 100 GiB, so 1.5% is 1.5 GB on screen
+        for offset, pct in ((0, 78.0), (43200, 79.0), (86400, 79.5)):
+            self.sample([self.device(
+                uptime=None, disk=pct,
+                disks=[{"mount": "/", "label": "root", "total": total,
+                        "used": int(total * pct / 100), "pct": pct}],
+            )], now=self.BASE + offset)
+
+        payload = app.brief("24h", now=self.BASE + 86400)
+        disks = [item for item in payload["items"] if item["kind"] == "disk"]
+
+        self.assertEqual(len(disks), 1)
+        self.assertEqual(disks[0]["text"],
+                         "docker01 root grew 1.5 GB (78% → 79.5%)")
+        self.assertEqual(disks[0]["level"], "warning")
+        self.assertIn("7d to 90%", disks[0]["detail"])
+        # The aggregate disk/days/growth warnings would repeat this line.
+        self.assertEqual(
+            [item for item in payload["items"] if item["kind"] == "warning"], [])
+        self.assertEqual(payload["counts"]["warning"], 1)
+
+    def test_a_stale_agent_is_named_with_how_long_it_has_been_quiet(self):
+        pve = "agent:pve"
+        self.sample([self.device(pve, "pve", "host")], now=self.BASE)
+        # The agent stopped pushing 15 minutes ago; the sample above is older
+        # history, not evidence that it is alive now.
+        self.write_agents({"pve": {
+            "name": "pve", "kind": "host", "last_seen": self.BASE - 840,
+            "cpu_pct": 4.0, "mem_pct": 20.0,
+        }})
+
+        with frozen_time(self.BASE + 60):
+            payload = app.brief("1h", now=self.BASE + 60)
+        stale = [item for item in payload["items"] if item["kind"] == "stale"]
+
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0]["level"], "warning")
+        self.assertEqual(stale[0]["ts"], self.BASE - 840)
+        self.assertEqual(stale[0]["text"], "pve last reported 15m ago")
+        self.assertIn("Last seen at", stale[0]["detail"])
+        # The same fact is not repeated as an offline warning.
+        self.assertEqual(
+            [item for item in payload["items"] if item["kind"] == "warning"], [])
+        self.assertEqual(payload["counts"]["warning"], 1)
+
+    def test_availability_is_compared_with_the_previous_equal_window(self):
+        for offset in (-5400, -4800):
+            self.sample([self.device(online=True, uptime=1000)],
+                        now=self.BASE + offset)
+        for offset, online in ((0, True), (60, False), (120, False), (180, True)):
+            self.sample([self.device(online=online, uptime=1000 + offset)],
+                        now=self.BASE + offset)
+
+        payload = app.brief("1h", now=self.BASE + 180)
+        drops = [item for item in payload["items"] if item["kind"] == "availability"]
+
+        self.assertEqual(len(drops), 1)
+        self.assertEqual(drops[0]["level"], "warning")
+        self.assertEqual(drops[0]["text"],
+                         "docker01 availability fell to 50% (was 100%)")
+
+    def test_a_recovery_from_before_the_window_is_still_reported(self):
+        pve = "agent:pve"
+        for offset, online in ((0, False), (60, False), (120, True)):
+            self.sample([self.device(pve, "pve", "host", online=online,
+                                     uptime=1000)], now=self.BASE + offset)
+
+        payload = app.brief("1h", now=self.BASE + 120)
+        recovered = [item for item in payload["items"] if item["kind"] == "offline"]
+
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["ts"], self.BASE + 120)
+        self.assertEqual(recovered[0]["level"], "info")
+        self.assertRegex(recovered[0]["text"], r"^pve recovered at \d\d:\d\d$")
+        self.assertIn("before this window", recovered[0]["detail"])
+
+    def test_growth_critical_matches_the_shared_warning_rule(self):
+        total = 107374182400
+        for offset, pct in ((0, 58.0), (43200, 61.0), (86400, 64.0)):
+            self.sample([self.device(
+                uptime=None, disk=pct,
+                disks=[{"mount": "/", "label": "root", "total": total,
+                        "used": int(total * pct / 100), "pct": pct}],
+            )], now=self.BASE + offset)
+
+        disks = [item for item in app.brief("24h", now=self.BASE + 86400)["items"]
+                 if item["kind"] == "disk"]
+
+        self.assertEqual(len(disks), 1)
+        # 6%/day is above WARN_GROWTH * 5, so evaluate_warnings calls it critical.
+        self.assertEqual(disks[0]["level"], "critical")
+        self.assertEqual(disks[0]["text"],
+                         "docker01 root grew 6.0 GB (58% → 64%)")
+
+    def test_a_seven_day_brief_reads_volume_growth_from_rollups(self):
+        total = 107374182400
+        for offset, pct in ((0, 50.0), (300, 55.0), (600, 60.0)):
+            self.sample([self.device(
+                uptime=None, disk=pct,
+                disks=[{"mount": "/", "label": "root", "total": total,
+                        "used": int(total * pct / 100), "pct": pct}],
+            )], now=self.BASE + offset)
+
+        con = app._connect_metrics()
+        try:
+            con.execute("DELETE FROM samples")
+            con.execute("DELETE FROM disk_samples")
+            con.commit()
+        finally:
+            con.close()
+
+        disks = [item for item in app.brief("7d", now=self.BASE + 600)["items"]
+                 if item["kind"] == "disk"]
+        self.assertEqual(len(disks), 1)
+
+    def test_a_quiet_brief_can_still_carry_info_rows(self):
+        total = 107374182400
+        for offset, pct in ((0, 50.0), (3 * 86400, 50.5), (7 * 86400, 51.0)):
+            self.sample([self.device(
+                uptime=None, disk=pct,
+                disks=[{"mount": "/", "label": "root", "total": total,
+                        "used": int(total * pct / 100), "pct": pct}],
+            )], now=self.BASE + offset)
+
+        payload = app.brief("7d", now=self.BASE + 7 * 86400)
+
+        self.assertTrue(payload["quiet"])
+        self.assertEqual({item["level"] for item in payload["items"]}, {"info"})
+        self.assertIn("disk", {item["kind"] for item in payload["items"]})
+
+    def test_an_agent_push_invalidates_the_live_brief(self):
+        with frozen_time(self.BASE + 60):
+            first = app.brief("1h")
+            self.assertIs(app.brief("1h"), first)
+            status, _ = self.post(json.dumps({
+                "name": "pve", "kind": "host", "cpu_pct": 1.0,
+                "mem_pct": 40.0, "disk_pct": 96.0,
+            }).encode(), path="/api/push/pve")
+            self.assertEqual(status, 200)
+            self.assertIsNot(app.brief("1h"), first)
+
+    def get_status(self, path):
+        try:
+            with urllib.request.urlopen(self.base + path, timeout=5) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+
+    def test_the_endpoint_validates_the_window_and_returns_the_documented_shape(self):
+        self.sample([self.device(disk=86.0)], now=time.time())
+
+        self.assertEqual(self.get_status("/api/brief?window=2h")[0], 400)
+        # 30d is a valid metrics window but not a brief window.
+        self.assertEqual(self.get_status("/api/brief?window=30d")[0], 400)
+
+        status, body = self.get_status("/api/brief?window=1h")
+        payload = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["window"], "1h")
+        self.assertEqual(payload["window_s"], 3600)
+        self.assertEqual(set(payload["counts"]), {"critical", "warning", "info"})
+        self.assertTrue(payload["items"])
+        for item in payload["items"]:
+            for key in ("kind", "level", "device_id", "device_name", "ts", "text"):
+                self.assertIn(key, item)
+            self.assertIn(item["level"], {"critical", "warning", "info"})
+            if "href" in item:
+                self.assertTrue(item["href"].startswith("metrics.html"))
+
+        status, body = self.get_status("/api/brief")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["window"], "24h")
+
+    def test_items_sort_by_severity_before_recency(self):
+        self.sample([
+            self.device("z-critical", "z-critical", disk=96.0),
+            self.device("y-warn", "y-warn", disk=86.0),
+            self.device("x-restart", "x-restart", uptime=5000),
+        ], now=self.BASE)
+        self.sample([
+            self.device("x-restart", "x-restart", uptime=40),
+        ], now=self.BASE + 60)
+
+        items = app.brief("1h", now=self.BASE + 60)["items"]
+
+        self.assertEqual([item["level"] for item in items[:3]],
+                         ["critical", "warning", "info"])
+        self.assertEqual(items[0]["device_id"], "z-critical")
+        self.assertEqual(items[1]["device_id"], "y-warn")
+        self.assertEqual(items[2]["kind"], "restart")
+
+    def test_the_item_list_is_capped_but_the_counts_report_everything(self):
+        devices = [self.device(f"dev{index:02d}", f"dev{index:02d}", uptime=5000)
+                   for index in range(25)]
+        self.sample(devices, now=self.BASE)
+        self.sample([self.device(f"dev{index:02d}", f"dev{index:02d}", uptime=40)
+                     for index in range(25)], now=self.BASE + 60)
+
+        payload = app.brief("1h", now=self.BASE + 60)
+
+        self.assertEqual(len(payload["items"]), app.BRIEF_MAX_ITEMS)
+        self.assertEqual(payload["counts"]["info"], 25)
+        self.assertFalse(payload["quiet"])
+
+    def test_a_seven_day_brief_reads_rollups_and_not_raw_rows(self):
+        for minute in range(15):
+            online = not (5 <= minute < 10)
+            uptime = 1000 + minute * 60 if minute < 10 else 30 + minute * 60
+            self.sample([self.device(online=online, uptime=uptime)],
+                        now=self.BASE + minute * 60)
+
+        con = app._connect_metrics()
+        try:
+            con.execute("DELETE FROM samples")
+            con.commit()
+        finally:
+            con.close()
+
+        payload = app.brief("7d", now=self.BASE + 900)
+        kinds = {item["kind"] for item in payload["items"]}
+
+        self.assertIn("offline", kinds)
+        self.assertIn("restart", kinds)
+
+    def test_the_live_brief_is_cached_until_a_write_invalidates_it(self):
+        self.sample([self.device(disk=50.0)], now=self.BASE)
+        with frozen_time(self.BASE + 60):
+            first = app.brief("1h")
+            self.assertIs(app.brief("1h"), first)
+            # An explicit clock always computes a fresh payload.
+            self.assertIsNot(app.brief("1h", now=self.BASE + 60), first)
+            # A write drops the cache instead of hiding the new warning.
+            self.sample([self.device(disk=96.0)], now=self.BASE)
+            refreshed = app.brief("1h")
+
+        self.assertNotEqual(first["items"], refreshed["items"])
+        self.assertIn("critical", {item["level"] for item in refreshed["items"]})
+
+    def test_posting_an_annotation_invalidates_the_live_brief(self):
+        self.sample([self.device()], now=self.BASE)
+        with frozen_time(self.BASE + 60):
+            first = app.brief("1h")
+            self.assertEqual(self.post_annotation(
+                "docker01", "patching", self.BASE + 30)[0], 201)
+            refreshed = app.brief("1h")
+
+        self.assertNotEqual(first["items"], refreshed["items"])
+        self.assertIn("docker01: patching",
+                      {item["text"] for item in refreshed["items"]})
+
+
+class BriefSourceTest(FrontEndSourceTest):
+    """The Workbench "What changed" card, asserted at the source level."""
+
+    def test_the_card_sits_at_the_top_of_the_main_column_above_jump_back_in(self):
+        self.assertIn('id="brief-card"', self.html)
+        self.assertIn('id="brief-list"', self.html)
+        self.assertIn("What changed", self.html)
+        self.assertLess(self.html.index('id="brief-card"'),
+                        self.html.index('id="jump-back-in-title"'))
+        self.assertGreater(self.html.index('id="brief-card"'),
+                           self.html.index('<main class="main-column">'))
+
+    def test_the_card_reads_the_brief_from_the_shared_data_seam(self):
+        self.assertIn("/api/brief?window=24h", self.source)
+        self.assertIn("window.dashData.read", self.source)
+        self.assertIn("function renderBrief", self.source)
+        self.assertIn("payload.quiet", self.source)
+        self.assertIn("All clear", self.source)
+
+    def test_rows_show_time_device_text_and_a_level_marker(self):
+        for needle in ("brief-row", "brief-time", "brief-device", "brief-text",
+                       "brief-mark", "data-level"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, self.source)
+        self.assertIn("escapeHtml", self.source)
+        self.assertIn("device_name", self.source)
+        self.assertIn("clockLabel", self.source)
+
+    def test_device_items_link_to_the_metrics_page(self):
+        self.assertIn("item.href", self.source)
+        self.assertIn("briefSafeHref", self.source)
+        # Only a relative metrics deep link is trusted; the server URL-encodes
+        # the device id (agent ids contain a colon).
+        self.assertIn("metrics\\.html\\?device=", self.source)
+
+    def test_the_card_polls_slowly_and_starts_with_the_page(self):
+        self.assertIn("startBriefPolling", self.source)
+        self.assertIn("interval: 60000", self.source)
+        self.assertIn("startBriefPolling();", self.source)
+
+    def test_the_brief_does_not_push_all_tools_into_sideways_overflow(self):
+        card = self.css[self.css.index(".all-tools-card {"):]
+        self.assertIn("overflow-y: auto", card[:card.index("}")])
+        grid = self.css[self.css.index(".bookmarks-grid {"):]
+        self.assertIn("overflow: visible", grid[:grid.index("}")])
+
+    def test_the_list_scrolls_inside_the_card_and_has_level_colours(self):
+        self.assertIn(".brief-list", self.css)
+        self.assertIn("max-height", self.css)
+        self.assertIn("overflow-y: auto", self.css)
+        for level in ("brief-level-critical", "brief-level-warning"):
+            with self.subTest(level=level):
+                self.assertIn(level, self.css)
+        responsive = self.css[self.css.index("@media (max-height: 850px)"):]
+        self.assertIn(".brief-list", responsive)
 
 
 class MetricsPageSourceTest(FrontEndSourceTest):

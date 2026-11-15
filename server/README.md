@@ -42,6 +42,7 @@ a main column (Jump back in, Launchpad, All tools) and a Network rail. There is 
 | `/api/stats` | GET | devices array, cached 5 s; each device carries 24 h availability and warning counts, plus the pve → LXC → Docker `topology` and an additive service-check `warnings` list |
 | `/api/metrics/summary` | GET | per-device availability, averages, events, disk trend, warnings, compact volume/signal/health summaries, a CPU sparkline, plus the same `topology`; long windows read rollups |
 | `/api/metrics` | GET | one device's bucketed history, min/max bands, per-volume series, recent signals, annotations, the latest health blocks and a short health history: `?device=<id>&window=1h\|6h\|24h\|7d\|30d\|90d\|1y&step=<s>` |
+| `/api/brief` | GET | the "what changed" read model: ranked offline/restart/warning/annotation/stale/disk/availability items for `?window=1h\|6h\|24h\|7d` (default `24h`) |
 | `/api/hit` | POST | record a bookmark click (`{"url": "..."}` → `204`, no body) |
 | `/api/push/<name>` | POST | agent heartbeat, needs `X-Dash-Token`; optionally carries `disks`, extra signals and the failure-mode `smart`/`zfs`/`ups`/`backup`/`updates` blocks |
 | `/api/annotations` | POST | record a deploy/restart/backup/note marker, needs `X-Dash-Token` |
@@ -385,6 +386,56 @@ assistive tech.
   page still fits one screen at 1280×800 and the existing breakpoints are
   unchanged.
 
+## What changed brief
+
+`GET /api/brief?window=24h` answers "what happened since I last looked?" as one
+ranked list. Windows are `1h`, `6h`, `24h` (default) and `7d`; anything else is
+`400`. The payload is additive and stable:
+
+```json
+{
+  "generated": 1700000000,
+  "window": "24h",
+  "window_s": 86400,
+  "quiet": false,
+  "counts": {"critical": 1, "warning": 2, "info": 1},
+  "items": [
+    {
+      "kind": "offline",
+      "level": "warning",
+      "device_id": "agent:pve",
+      "device_name": "pve",
+      "ts": 1699999920,
+      "text": "pve was offline for 7m at 03:12",
+      "detail": "Recovered at 03:19; 7m total in this window",
+      "href": "metrics.html?device=agent%3Apve"
+    }
+  ]
+}
+```
+
+`kind` is one of `offline`, `restart`, `warning`, `annotation`, `stale`,
+`disk` or `availability`; `level` is `critical`, `warning` or `info`; `detail`
+and `href` are optional (a fleet-wide annotation has no device page). Times in
+`text` use the server's local clock, matching the dashboard's own HH:MM. Items
+sort by level (critical, warning, info) and then newest first, and the list is
+capped at 20. `counts` describes every item found before the cap, so it can
+exceed `len(items)`. `quiet` is true when no item is warning/critical and no
+offline, restart or annotation item exists.
+
+Sources, per device over the window: offline/recovery episodes and total
+downtime, restarts, `evaluate_warnings()` at the window end (the offline
+warning is represented by the stale-agent line instead), manual annotations
+(fleet-wide ones once), stale agents by `last_seen`, per-volume growth and
+days-to-90 (which supersede the aggregate disk warnings), and an availability
+drop of at least 5 points against the previous equal-length window. A source
+with no samples produces no item, so the brief never invents data.
+
+Long windows use the same raw/5-minute/hourly routing as the charts, and the
+live `24h` result is cached for `SUMMARY_CACHE_SECONDS`. A sample write, an
+agent push, or an annotation write drops the cache, so the brief never hides a
+change the device page already shows.
+
 ## Workbench UI
 
 The page never scrolls; the body grid, All tools list and Network rail own their own
@@ -393,6 +444,7 @@ overflow. At the target desktop sizes every core section fits in one screen.
 | Region | Contents |
 |---|---|
 | Toolbar | date, live clock, `Search all tools…` field, health dot + `n/m online` |
+| What changed | full-width brief: time, device, sentence and level marker per row, an **All clear** state, a **History →** link, and an internally scrolling list |
 | Jump back in | most-used rows from the scored API payload, with a normalised bar |
 | Launchpad | pinned tool tiles (monogram + two-line label) |
 | All tools | every category in store order, numbered rows, live search count |
@@ -771,12 +823,14 @@ probes the server's own `/api/health` (verdict `ok`, 100% 24 h uptime, latency,
 `last_change`) and a missing route (verdict `service_down`, `HTTP 404`); the
 failing check reaches `/api/stats` warnings in the shared shape; a corrupt check
 store returns an empty list; a deploy annotation becomes a marker and Events
-row; server-side warnings flag disk and RAM; a detected restart becomes an auto
-marker; unknown windows/devices are rejected; hits, metrics history, per-volume
-history, extra-signal history **and** annotations survive a full process restart;
-and the click feature sets no cookie and makes no third-party request. It also
-guards the compose/README path documentation below, the Workbench UI, breakpoint
-and check documentation above, and the Services card/check badges.
+row; `/api/brief` names that annotation once with the documented item shape and
+rejects a window it does not offer; server-side warnings flag disk and RAM; a
+detected restart becomes an auto marker; unknown windows/devices are rejected;
+hits, metrics history, per-volume history, extra-signal history **and**
+annotations survive a full process restart; and the click feature sets no cookie
+and makes no third-party request. It also guards the compose/README path
+documentation below, the Workbench UI, breakpoint and check documentation above,
+and the Services card/check badges.
 
 ## Click-history durability
 

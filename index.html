@@ -41,6 +41,20 @@
 
         <div class="body-grid">
             <main class="main-column">
+                <section id="brief-card" class="card brief-card" aria-labelledby="brief-title">
+                    <div class="card-head">
+                        <div class="card-title">
+                            <h2 id="brief-title" class="card-heading">What changed</h2>
+                            <span id="brief-sub" class="card-sub">Last 24 hours</span>
+                        </div>
+                        <a class="brief-link" href="metrics.html" title="Device metric history">History →</a>
+                    </div>
+                    <!-- Ranked offline/restart/warning/annotation/disk items from /api/brief. -->
+                    <ul id="brief-list" class="brief-list" aria-label="What changed in the last 24 hours">
+                        <li class="brief-empty">Checking…</li>
+                    </ul>
+                </section>
+
                 <div class="top-row">
                     <section class="card usage-card" aria-labelledby="jump-back-in-title">
                         <div class="card-head">

@@ -31,7 +31,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 BASE = Path(__file__).resolve().parent
 STATIC = BASE / "static"
@@ -101,6 +101,7 @@ _cache = {"at": 0.0, "body": None}
 _prev_cpu = {"usec": None, "at": None}
 _availability_cache = {"at": 0.0, "by_id": {}}
 _summary_cache = {"at": 0.0, "window": None, "body": None}
+_brief_cache = {"at": 0.0, "window": None, "body": None}
 _last_prune = {"at": 0.0}
 # Latest probe per check, kept for the cheap `/api/stats` warning surface. The
 # check history itself is never scanned there.
@@ -108,13 +109,14 @@ _check_state = {"results": {}}
 
 
 def _invalidate_summary():
-    """A write changes what the fleet summary would say; drop its cache.
+    """A write changes what the fleet summary or brief would say; drop both.
 
     Called after the write lock is released: stats() holds _lock and then
     takes _db_lock, so invalidating while holding _db_lock could deadlock.
     """
     with _lock:
         _summary_cache.update(at=0.0, window=None, body=None)
+        _brief_cache.update(at=0.0, window=None, body=None)
 
 
 # ---------- local machine ----------
@@ -350,6 +352,19 @@ WARN_ZFS_SCRUB_DAYS = float(os.environ.get("DASH_WARN_ZFS_SCRUB_DAYS", "30"))
 WARN_BACKUP_HOURS = float(os.environ.get("DASH_WARN_BACKUP_HOURS", "36"))
 WARN_UPS_CHARGE_PCT = float(os.environ.get("DASH_WARN_UPS_CHARGE_PCT", "30"))
 WARN_UPS_RUNTIME_S = int(os.environ.get("DASH_WARN_UPS_RUNTIME_S", "300"))
+
+# The brief answers "what happened since I last looked?", so it offers only the
+# short windows a person actually returns from. It is capped: a list longer than
+# one screen stops being a summary.
+BRIEF_WINDOWS = ("1h", "6h", "24h", "7d")
+BRIEF_MAX_ITEMS = 20
+# A move that crosses no configured warning line is still worth an info line
+# once the volume has moved this many percentage points over the window.
+BRIEF_DISK_JUMP_PCT = 1.0
+# Availability is compared with the previous equal-length window; smaller dips
+# are sampling noise, not news.
+BRIEF_AVAILABILITY_DROP_PCT = 5.0
+BRIEF_EVENT_KINDS = ("offline", "restart", "annotation")
 
 
 def _finite(value):
@@ -2450,6 +2465,7 @@ def read_window_summary(con, device_id, since, until, step):
         "source": source,
         "online": bool(last and _part_online(last)),
         "summary": _derive_summary(parts, until, part_s, events),
+        "events": events,
         "volumes": _volume_series(con, device_id, since, until, step, source),
     }
 
@@ -2891,6 +2907,323 @@ def metrics_series(device_id, window=DEFAULT_WINDOW, requested_step=None, now=No
     return payload
 
 
+# ---------- brief ----------
+# One item per thing a person would want named: an offline run, a restart, a
+# warning, a note, a stale agent, or a volume that moved. Every source is
+# derived from the same window view the charts use, so the brief cannot invent
+# a fact the device page does not also show.
+
+def _brief_clock(ts):
+    """Wall-clock time on the server's own clock, matching the dashboard."""
+    return time.strftime("%H:%M", time.localtime(int(ts)))
+
+
+def _brief_href(device_id):
+    """The device's page. The id is URL-encoded because agent ids carry a colon."""
+    return "metrics.html?device=" + quote(device_id, safe="")
+
+
+def _brief_item(kind, level, device_id, name, ts, text, detail=None, href=None):
+    """One item in the documented shape, omitting optional fields when absent."""
+    item = {"kind": kind, "level": level, "device_id": device_id,
+            "device_name": name, "ts": int(ts), "text": text}
+    if detail:
+        item["detail"] = detail
+    if href:
+        item["href"] = href
+    return item
+
+
+def _brief_bytes(value):
+    """Gigabyte-scale sizes read as '1.6 GB'; smaller units stay whole."""
+    size = float(value)
+    units = ("B", "KB", "MB", "GB", "TB")
+    index = 0
+    while size >= 1024 and index < len(units) - 1:
+        size /= 1024
+        index += 1
+    digits = 1 if index >= 3 else 0
+    return f"{size:.{digits}f} {units[index]}"
+
+
+def _brief_volume_item(name, device_id, volumes, now):
+    """The one volume worth naming: the most severe move over the window.
+
+    Growth is measured from the first to the last online point of the same
+    window the chart draws, so the line and the brief agree. A volume that is
+    merely steady but nearly full is still named; a flat, roomy one is not.
+    """
+    candidates = []
+    for volume in volumes:
+        pct = _finite(volume.get("pct"))
+        if pct is None:
+            continue
+        points = [value for _ts, value in volume.get("points", [])
+                  if _finite(value) is not None]
+        first = points[0] if points else None
+        delta = pct - first if first is not None else None
+        days = _finite(volume.get("days_to_90"))
+        growth = _finite(volume.get("growth_per_day"))
+        # The same warning rules as evaluate_warnings, so a volume cannot be
+        # called a warning while the aggregate gauge calls it critical. A move
+        # that crosses no configured line is still worth a line, but only info.
+        levels = (
+            _high_warning(pct, WARN_DISK_PCT, min(99.0, WARN_DISK_PCT + 10)),
+            _low_warning(days, WARN_DAYS_TO_90, max(1.0, WARN_DAYS_TO_90 / 4)),
+            _high_warning(growth, WARN_GROWTH, WARN_GROWTH * 5),
+        )
+        if "critical" in levels:
+            level = "critical"
+        elif "warning" in levels:
+            level = "warning"
+        elif delta is not None and delta >= BRIEF_DISK_JUMP_PCT:
+            level = "info"
+        else:
+            continue
+        label = volume.get("label") or volume.get("mount") or "disk"
+        total = volume.get("total")
+        if delta is not None and delta > 0 and total:
+            text = (f"{name} {label} grew {_brief_bytes(total * delta / 100.0)} "
+                    f"({first:g}% → {pct:g}%)")
+        elif pct >= WARN_DISK_PCT:
+            text = f"{name} {label} is {pct:g}% full"
+        elif growth is not None:
+            text = f"{name} {label} is growing {growth:g}%/day"
+        else:
+            text = f"{name} {label} is at {pct:g}%"
+        detail = (f"{days:g}d to 90%" if days is not None
+                  else (f"{growth:g}%/day" if growth is not None else None))
+        candidates.append(({"critical": 0, "warning": 1, "info": 2}[level],
+                           -(delta or 0.0),
+                           _brief_item("disk", level, device_id, name, now, text,
+                                       detail, _brief_href(device_id))))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
+    return candidates[0][2]
+
+
+def _brief_previous_availability(con, device_id, since, window_s):
+    """Online share of the equal-length window before this one, or None.
+
+    One aggregate query, routed through the same tier rule as the chart, so the
+    comparison never doubles the per-device scan.
+    """
+    start, end = int(since - window_s), int(since)
+    source = _window_source(window_s)
+    if source == "raw":
+        row = con.execute(
+            "SELECT AVG(online), COUNT(*) FROM samples "
+            "WHERE device_id = ? AND ts >= ? AND ts < ?",
+            (device_id, start, end),
+        ).fetchone()
+        share = row[0] if row and row[1] else None
+    else:
+        table = "rollup_5m" if source == "5m" else "rollup_1h"
+        row = con.execute(
+            f"SELECT SUM(online_samples), SUM(samples) FROM {table} "
+            "WHERE device_id = ? AND ts >= ? AND ts < ?",
+            (device_id, start, end),
+        ).fetchone()
+        share = (row[0] / row[1]) if row and row[1] else None
+    return round(100.0 * share, 1) if share is not None else None
+
+
+def _brief_availability_item(name, device_id, summary, previous, now):
+    """A drop worth naming, or None when either window has no samples."""
+    current = _finite(summary.get("availability_pct"))
+    if current is None or previous is None:
+        return None
+    drop = previous - current
+    if drop < BRIEF_AVAILABILITY_DROP_PCT:
+        return None
+    return _brief_item(
+        "availability",
+        "warning" if drop >= 2 * BRIEF_AVAILABILITY_DROP_PCT else "info",
+        device_id, name, now,
+        f"{name} availability fell to {current:g}% (was {previous:g}%)",
+        "Compared with the previous equal-length window",
+        _brief_href(device_id))
+
+
+def _brief_device_items(device_id, name, device, view, now):
+    """Offline runs, restarts and current warnings for one device."""
+    items = []
+    href = _brief_href(device_id)
+    downtime = max(0, int(round(device.get("downtime_s") or 0)))
+
+    # Events arrive newest first; walk them chronologically so an offline run
+    # pairs with the recovery that closed it. A recovery with no offline event
+    # began before the window, so only its end is certain.
+    episode_start = None
+    for event in reversed(view["events"]):
+        if event["type"] == "offline":
+            episode_start = int(event["ts"])
+        elif event["type"] == "online" and event.get("down_s") is not None:
+            down = max(0, int(event["down_s"]))
+            total = _duration_label(downtime)
+            if episode_start is None:
+                items.append(_brief_item(
+                    "offline", "info", device_id, name, event["ts"],
+                    f"{name} recovered at {_brief_clock(event['ts'])}",
+                    f"Outage began before this window; {total} total in it",
+                    href))
+            else:
+                items.append(_brief_item(
+                    "offline",
+                    _high_warning(down, WARN_OFFLINE_S, WARN_OFFLINE_S * 6) or "info",
+                    device_id, name, episode_start,
+                    f"{name} was offline for {_duration_label(down)} "
+                    f"at {_brief_clock(episode_start)}",
+                    f"Recovered at {_brief_clock(event['ts'])}; {total} total in this window",
+                    href))
+                episode_start = None
+    if episode_start is not None:
+        down = max(0, int(now) - episode_start)
+        items.append(_brief_item(
+            "offline",
+            _high_warning(down, WARN_OFFLINE_S, WARN_OFFLINE_S * 6) or "info",
+            device_id, name, episode_start,
+            f"{name} has been offline since {_brief_clock(episode_start)}",
+            f"Still offline at {_brief_clock(now)}; "
+            f"{_duration_label(downtime)} total in this window",
+            href))
+
+    # A detected restart is the codebase's auto annotation, so it appears once
+    # here rather than as a second annotation item.
+    for event in view["events"]:
+        if event["type"] == "restart":
+            items.append(_brief_item(
+                "restart", "info", device_id, name, event["ts"],
+                f"{name} restarted at {_brief_clock(event['ts'])}",
+                "Detected restart (auto annotation); uptime reset",
+                href))
+
+    # Warnings describe the state at the window end. The offline warning is
+    # represented by the stale-agent item instead, with last-seen wording, and
+    # a named volume supersedes the aggregate disk/days/growth warnings.
+    volume_item = _brief_volume_item(name, device_id, view["volumes"], now)
+    if volume_item:
+        items.append(volume_item)
+    covered = {"disk", "days_to_90", "growth"} if volume_item else set()
+    for warning in evaluate_warnings(device, now):
+        if warning["code"] == "offline" or warning["code"] in covered:
+            continue
+        items.append(_brief_item(
+            "warning", warning["level"], device_id, name, now,
+            f"{name}: {warning['text']}",
+            f"{warning['code']} crossing {warning['threshold']:g}", href))
+
+    # An agent that has been quiet for the whole window has no offline
+    # transition to report, so its last-seen age is the only evidence. An open
+    # episode above already says it better, so the two never both appear.
+    if not device.get("online", True) and episode_start is None:
+        last_seen = _finite(device.get("last_seen"))
+        age = max(0, int(now) - int(last_seen)) if last_seen is not None else 0
+        level = _high_warning(age, WARN_OFFLINE_S, WARN_OFFLINE_S * 6)
+        if level and last_seen is not None:
+            items.append(_brief_item(
+                "stale", level, device_id, name, last_seen,
+                f"{name} last reported {_duration_label(age)} ago",
+                f"Last seen at {_brief_clock(last_seen)}", href))
+
+    return items
+
+
+def _brief_annotations(con, since, until, names):
+    """Manual annotations once each, fleet-wide notes included exactly once.
+
+    The chart path reads annotations per device, so a fleet-wide note shows on
+    every chart. A single ranked list would duplicate it, so this reads the
+    table directly and resolves the device name from the same map the charts
+    use.
+    """
+    rows = con.execute(
+        "SELECT device_id, ts, kind, text FROM annotations "
+        "WHERE ts >= ? AND ts <= ? ORDER BY ts DESC LIMIT ?",
+        (int(since), int(until), MAX_ANNOTATIONS),
+    ).fetchall()
+    items = []
+    for device_id, ts, kind, text in rows:
+        name = names.get(device_id, device_id) if device_id else "fleet"
+        items.append(_brief_item(
+            "annotation", "info", device_id, name, ts,
+            f"{name}: {text}",
+            f"Manual {kind} annotation at {_brief_clock(ts)}",
+            _brief_href(device_id) if device_id else None))
+    return items
+
+
+def brief(window=DEFAULT_WINDOW, now=None):
+    """One ranked list of what changed over a window, newest concerns first.
+
+    Every device is read through `read_window_summary`, so a 7d brief uses the
+    same rollup routing as a 7d chart and never scans raw rows. The result is
+    cached for live requests exactly like the fleet summary and invalidated by
+    the same writes.
+    """
+    live_request = now is None
+    now = time.time() if now is None else now
+    window_s = _window_seconds(window) or METRIC_WINDOWS[DEFAULT_WINDOW]
+    if live_request:
+        with _lock:
+            if (_brief_cache["body"] is not None
+                    and _brief_cache["window"] == window
+                    and now - _brief_cache["at"] < SUMMARY_CACHE_SECONDS):
+                return _brief_cache["body"]
+    payload = {
+        "generated": int(now), "window": window, "window_s": window_s,
+        "quiet": True,
+        "counts": {"critical": 0, "warning": 0, "info": 0},
+        "items": [],
+    }
+    if METRICS_FILE.exists():
+        since = now - window_s
+        live = _live_state(now)
+        step = _step_for(window_s, None)
+        items = []
+        names = {}
+        con = _connect_metrics()
+        try:
+            for device_id, name, _kind, _first, last_seen in _known_devices(con):
+                names[device_id] = name
+                state = live.get(device_id, {})
+                view = read_window_summary(con, device_id, since, now, step)
+                device = {
+                    **view["summary"],
+                    "online": state.get("online", view["online"]),
+                    "last_seen": state.get("last_seen", int(last_seen)),
+                }
+                items.extend(_brief_device_items(device_id, name, device, view, now))
+                availability_item = _brief_availability_item(
+                    name, device_id, view["summary"],
+                    _brief_previous_availability(con, device_id, since, window_s),
+                    now)
+                if availability_item:
+                    items.append(availability_item)
+            items.extend(_brief_annotations(con, since, now, names))
+        finally:
+            con.close()
+        # Severity first, then recency: a critical warning outranks a newer
+        # restart, and equal levels read newest first.
+        rank = {"critical": 0, "warning": 1, "info": 2}
+        items.sort(key=lambda item: (rank.get(item["level"], 3), -int(item["ts"])))
+        counts = {
+            level: sum(1 for item in items if item["level"] == level)
+            for level in ("critical", "warning", "info")
+        }
+        payload["counts"] = counts
+        payload["quiet"] = (
+            counts["warning"] == 0 and counts["critical"] == 0
+            and not any(item["kind"] in BRIEF_EVENT_KINDS for item in items)
+        )
+        payload["items"] = items[:BRIEF_MAX_ITEMS]
+    if live_request:
+        with _lock:
+            _brief_cache.update(at=now, window=window, body=payload)
+    return payload
+
+
 # ---------- aggregate ----------
 
 def stats():
@@ -3103,6 +3436,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(stats())
             if path == "/api/bookmarks":
                 return self._json_cached(bookmarks())
+            if path == "/api/brief":
+                window = (query.get("window") or [DEFAULT_WINDOW])[0]
+                if window not in BRIEF_WINDOWS:
+                    return self._json({"error": "unknown window"}, 400)
+                return self._json(brief(window))
             if path == "/api/metrics/summary":
                 window = (query.get("window") or [DEFAULT_WINDOW])[0]
                 if window not in METRIC_WINDOWS:
@@ -3218,6 +3556,8 @@ class Handler(BaseHTTPRequestHandler):
                     annotation_id = cur.lastrowid
                 finally:
                     con.close()
+            # A note is brief content too, so the cached read model is stale.
+            _invalidate_summary()
             return self._json({"ok": True, "id": annotation_id}, 201)
         if not path.startswith("/api/push/"):
             return self._send(404, "not found", "text/plain; charset=utf-8")

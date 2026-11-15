@@ -489,18 +489,131 @@ body {
     overflow: hidden;
 }
 
+/* "What changed" card: a full-width brief above Jump back in. Rows are one
+   line each and the list scrolls inside the card, so 1280×800 still fits. */
+.brief-card {
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.brief-link {
+    flex: none;
+    font-size: 0.62rem;
+    font-weight: 600;
+    color: var(--accent-color);
+    text-decoration: none;
+    white-space: nowrap;
+}
+
+.brief-link:hover {
+    text-decoration: underline;
+}
+
+.brief-list {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    max-height: 132px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+}
+
+.brief-row-link {
+    display: grid;
+    grid-template-columns: 8px 42px minmax(48px, 92px) minmax(0, 1fr);
+    align-items: baseline;
+    gap: 9px;
+    padding: 3px 5px;
+    border-radius: 7px;
+    color: var(--text-color);
+    text-decoration: none;
+    min-width: 0;
+}
+
+a.brief-row-link:hover {
+    background: var(--icon-bg);
+}
+
+/* The level is carried by a marker as well as the wording, never colour alone. */
+.brief-mark {
+    align-self: center;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--muted);
+    opacity: 0.55;
+}
+
+.brief-level-warning .brief-mark {
+    background: #ed8936;
+    opacity: 1;
+}
+
+.brief-level-critical .brief-mark {
+    background: #e53e3e;
+    opacity: 1;
+}
+
+.brief-time {
+    font-size: 0.6rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.brief-device {
+    font-size: 0.68rem;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.brief-text {
+    font-size: 0.68rem;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.brief-level-critical .brief-text {
+    color: var(--text-color);
+}
+
+.brief-empty {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 6px 5px;
+    font-size: 0.72rem;
+    color: var(--muted);
+}
+
+.brief-quiet .brief-mark {
+    background: #48bb78;
+    opacity: 1;
+}
+
 /* All tools region. The list scrolls inside the card, never the page. */
 .all-tools-card {
     flex: 1 1 auto;
     min-height: 0;
     display: flex;
     flex-direction: column;
+    /* A short card scrolls its tool list vertically. Letting a fixed-height
+       multicol overflow sideways would hide the third column whenever the
+       brief above takes up height. */
+    overflow-y: auto;
 }
 
 .bookmarks-grid {
-    flex: 1 1 auto;
+    flex: 0 0 auto;
     min-height: 0;
-    overflow: auto;
+    overflow: visible;
     columns: 3;
     column-gap: 20px;
     padding-right: 2px;
@@ -1356,6 +1469,11 @@ input:focus-visible {
         max-height: 150px;
     }
 
+    /* Keep the brief to a few compact rows so the rail and All tools fit. */
+    .brief-list {
+        max-height: 100px;
+    }
+
     /* 1280×800 must fit every device row without page scroll. */
     .device-row {
         padding: 3px 0;
@@ -1419,6 +1537,13 @@ input:focus-visible {
 
     .bookmarks-grid {
         columns: 1;
+    }
+
+    /* Keep the device: the row text has its leading name removed, so dropping
+       this column would leave the sentence unattributed. */
+    .brief-row-link {
+        grid-template-columns: 8px 34px minmax(44px, 72px) minmax(0, 1fr);
+        gap: 6px;
     }
 
     /* Four tiles per row at any phone width: a quarter-width minimum minus the

@@ -42,6 +42,8 @@ const bookmarksGridEl = document.getElementById('bookmarks-grid');
 const resultCountEl = document.getElementById('result-count');
 const mostUsedEl = document.getElementById('most-used');
 const launchpadGridEl = document.getElementById('launchpad-grid');
+const briefListEl = document.getElementById('brief-list');
+const briefSubEl = document.getElementById('brief-sub');
 const deviceGridEl = document.getElementById('device-grid');
 const networkSummaryEl = document.getElementById('network-summary');
 const networkUpdatedEl = document.getElementById('network-updated');
@@ -73,6 +75,8 @@ let checkState = null;
 let checkSignature = null;
 // Created on the first start, after refreshDevices is defined.
 let devicePoller = null;
+// The brief changes slowly, so it polls once a minute rather than with the rail.
+let briefPoller = null;
 
 const clock = window.dashboardUI.createClock({
     clock: clockEl,
@@ -113,6 +117,7 @@ function updateDashboard() {
             loadBookmarks();
         }
         startDevicePolling();
+        startBriefPolling();
     }
 }
 
@@ -439,6 +444,79 @@ async function loadBookmarks() {
     renderMostUsed(bookmarkStore);
 }
 
+// ---------- What changed ----------
+
+// Only the metrics deep link is trusted, and only for a device id the server
+// encoded. Anything else renders as plain text.
+function briefSafeHref(href) {
+    return typeof href === 'string' && /^metrics\.html\?device=[A-Za-z0-9%._~:-]+$/.test(href)
+        ? href : null;
+}
+
+// The API text names the device so it reads on its own; the row already has a
+// device column, so drop the leading name rather than printing it twice.
+function briefText(item) {
+    const name = String(item.device_name || '');
+    const text = String(item.text || '');
+    if (name && text.indexOf(name + ':') === 0) return text.slice(name.length + 1).trim();
+    if (name && text.indexOf(name + ' ') === 0) return text.slice(name.length + 1);
+    return text;
+}
+
+function briefRow(item) {
+    const level = ['critical', 'warning', 'info'].indexOf(item.level) === -1
+        ? 'info' : item.level;
+    const href = briefSafeHref(item.href);
+    const tag = href ? 'a' : 'div';
+    const attrs = href ? ' href="' + escapeHtml(href) + '"' : '';
+    return '<li class="brief-row brief-level-' + level + '" data-level="' + level + '">' +
+        '<' + tag + ' class="brief-row-link"' + attrs + '>' +
+        '<span class="brief-mark" role="img" aria-label="' + level + '"></span>' +
+        '<time class="brief-time" datetime="' +
+        new Date(item.ts * 1000).toISOString() + '">' +
+        escapeHtml(clockLabel(item.ts)) + '</time>' +
+        '<span class="brief-device">' + escapeHtml(item.device_name || 'fleet') + '</span>' +
+        '<span class="brief-text" title="' + escapeHtml(item.detail || item.text || '') + '">' +
+        escapeHtml(briefText(item)) + '</span>' +
+        '</' + tag + '></li>';
+}
+
+function renderBrief(payload) {
+    const items = Array.isArray(payload && payload.items) ? payload.items : [];
+    const quiet = !!(payload && payload.quiet);
+    const rows = items.map(briefRow).join('');
+    if (quiet) {
+        briefListEl.innerHTML =
+            '<li class="brief-empty brief-quiet">' +
+            '<span class="brief-mark" aria-hidden="true"></span>' +
+            'All clear — nothing needs attention</li>' + rows;
+    } else {
+        briefListEl.innerHTML = rows ||
+            '<li class="brief-empty">No changes recorded</li>';
+    }
+    briefSubEl.textContent = quiet
+        ? 'Last 24 hours · all clear'
+        : 'Last 24 hours · ' + items.length + (items.length === 1 ? ' item' : ' items');
+}
+
+// A failed poll keeps the last good list instead of flashing an all-clear.
+async function refreshBrief() {
+    const result = await window.dashData.read('/api/brief?window=24h', 'brief');
+    if (result.ok) renderBrief(result.data);
+    return result.ok;
+}
+
+function startBriefPolling() {
+    if (!briefPoller) {
+        briefPoller = window.dashboardUI.createPoller({
+            interval: 60000,
+            maxInterval: 300000,
+            run: refreshBrief,
+        });
+    }
+    briefPoller.start();
+}
+
 function fmtAgo(ts) {
     const s = Math.max(0, Math.floor(Date.now() / 1000) - ts);
     if (s < 60) return s + 's ago';
@@ -495,7 +573,14 @@ function networkSummary(devices) {
 }
 
 // 24-hour HH:MM, independent of the browser locale (a 12-hour locale must not
-// turn 14:05 into 2:05 PM).
+// turn 14:05 into 2:05 PM). Brief rows use this; updatedLabel keeps its own
+// formatting, which its source contract pins to these same getHours calls.
+function clockLabel(timestamp) {
+    const date = new Date(timestamp * 1000);
+    return String(date.getHours()).padStart(2, '0') + ':' +
+        String(date.getMinutes()).padStart(2, '0');
+}
+
 function updatedLabel(timestamp) {
     if (!timestamp) return '';
     const date = new Date(timestamp * 1000);
