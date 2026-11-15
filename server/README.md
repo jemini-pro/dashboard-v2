@@ -37,8 +37,9 @@ a main column (Jump back in, Launchpad, All tools) and a Network rail. There is 
 | Endpoint | Method | Purpose |
 |---|---|---|
 | `/api/health` | GET | `{ok}` |
+| `/api/checks` | GET | per-check current state, 24 h/7 d uptime and verdict (see [Service checks](#service-checks)) |
 | `/api/bookmarks` | GET | the bookmark store, with a decayed `score` per item |
-| `/api/stats` | GET | devices array, cached 5 s; each device carries 24 h availability and warning counts, plus the pve → LXC → Docker `topology` |
+| `/api/stats` | GET | devices array, cached 5 s; each device carries 24 h availability and warning counts, plus the pve → LXC → Docker `topology` and an additive service-check `warnings` list |
 | `/api/metrics/summary` | GET | per-device availability, averages, events, disk trend, warnings, compact volume and latest-signal summaries, a CPU sparkline, plus the same `topology`; long windows read rollups |
 | `/api/metrics` | GET | one device's bucketed history, min/max bands, per-volume series, recent signals and annotations: `?device=<id>&window=1h\|6h\|24h\|7d\|30d\|90d\|1y&step=<s>` |
 | `/api/hit` | POST | record a bookmark click (`{"url": "..."}` → `204`, no body) |
@@ -203,7 +204,160 @@ DASH_WARN_DAYS_TO_90=14   # days-to-90 warning line; critical is warn/4
 DASH_WARN_GROWTH=1.0      # disk growth %/day warning; critical is 5x
 DASH_WARN_MEM_PCT=90      # RAM warning line; critical is +7, capped at 99
 DASH_WARN_OFFLINE_S=600   # offline warning; critical is 6x
+DASH_CHECKS_SECONDS=60    # check loop cadence; minimum 10; interval_s can slow a check
+DASH_CHECK_BUCKET_SECONDS=60  # one check row per bucket; minimum 10; repeats replace
+DASH_CHECK_HISTORY_DAYS=7 # raw check retention (24h/7d uptime is all the API asks)
+DASH_WARN_CERT_DAYS=14    # certificate warning line; critical is half
 ```
+
+## Service checks
+
+A device being online says its host answers; it does not say the service people
+open still works. Checks close that gap with an HTTP probe and an expected
+status and/or body. They are configured in `data/checks.json` (durable host
+path `/opt/stack/dash/data/checks.json`) and probed by a sibling thread, so a
+dead or slow URL never delays device sampling.
+
+### Config
+
+```json
+{
+  "checks": [
+    {
+      "id": "gitea",
+      "name": "Gitea",
+      "url": "https://git.lan/api/healthz",
+      "method": "GET",
+      "expect_status": "2xx",
+      "expect_body": "ok",
+      "timeout_s": 5,
+      "interval_s": 60,
+      "device_id": "agent:pve",
+      "external": false
+    }
+  ]
+}
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `id` | yes | unique, non-empty; the bookmark reference and history key |
+| `url` | yes | absolute `http:` or `https:` URL |
+| `name` | no | display name; defaults to `id` |
+| `method` | no | `GET` (default) or `HEAD`; any other value falls back to `GET` |
+| `expect_status` | no | `200`, `"2xx"`, `"200-299"` or a list of those; default `"2xx"` (100–599 only) |
+| `expect_body` | no | substring that must appear in the response body |
+| `timeout_s` | no | hard per-probe timeout, clamped to 1–60 s; default **5** |
+| `interval_s` | no | per-check cadence, clamped to 10–86400 s; default `DASH_CHECKS_SECONDS` |
+| `device_id` | no | ties the check to a device (`agent:<name>` or `docker01`) for its verdict |
+| `external` | no | `true` when the probe leaves the LAN; a failing external probe is `path_down` |
+
+The file may also be a bare array of check objects. A missing, empty or corrupt
+store means **zero checks** and `/api/checks` still returns `200` with an empty
+list. Invalid entries are dropped, duplicate ids keep the first, and zero
+checks is a supported configuration (the dashboard shows "No service checks").
+
+A bookmark opts into health by naming a check; the reference is passed through
+unchanged by `/api/bookmarks` and by the server-injected first-paint payload:
+
+```json
+{"title": "Gitea", "desc": "Git", "url": "https://git.lan/", "check": "gitea"}
+```
+
+### Probing and storage
+
+- **Its own thread.** `checks_loop()` starts beside the device sampler and runs
+  immediately, then every `DASH_CHECKS_SECONDS` (default **60 s**). A pass
+  reads the due checks (a check with `interval_s` is due when its newest stored
+  sample is older than that), probes them, and writes the results. The loop
+  cadence is a floor: `interval_s` can make a check less frequent, never more
+  frequent than the loop. Device sampling never waits on a probe.
+- **Hard timeout.** Each probe uses `urllib` with `timeout_s`, reads at most
+  64 KB of body, and treats an HTTP error status as an answer. Redirects are
+  **not followed**: a `301`/`302` is reported as the status, so an
+  `expect_status: "3xx"` check can observe it. HTTPS probes read the peer
+  certificate's `notAfter` with the stdlib `ssl` module, including on an error
+  response (for example a 503); `http:` probes have no certificate figure
+  (`cert_days: null`).
+- **One table.** `check_samples (check_id, ts, ok, status, latency_ms,
+  cert_days, error)` in `metrics.db`. Results land in the same bucketed,
+  single-writer path as device samples: one row per check per
+  `DASH_CHECK_BUCKET_SECONDS` (default **60 s**) and a repeat inside the bucket
+  replaces the row, so a retry never double-counts uptime. `error` is one
+  printable line (`HTTP 503`, `TimeoutError: timed out`, …).
+- **Retention.** Raw check rows are kept for `DASH_CHECK_HISTORY_DAYS` (default
+  **7**) and pruned on the existing hourly pass. That is enough for the 24 h
+  and 7 d uptimes the API reports; no check rollups are needed.
+
+### API
+
+`GET /api/checks` returns:
+
+```json
+{
+  "generated": 1700000000,
+  "checks": [
+    {
+      "id": "gitea",
+      "name": "Gitea",
+      "url": "https://git.lan/api/healthz",
+      "device_id": "agent:pve",
+      "ok": true,
+      "status": 200,
+      "latency_ms": 18,
+      "cert_days": 63.4,
+      "error": null,
+      "last_change": 1699999000,
+      "uptime_24h": 99.7,
+      "uptime_7d": 98.2,
+      "verdict": "ok"
+    }
+  ]
+}
+```
+
+`ok`, `status`, `latency_ms`, `cert_days` and `error` describe the newest
+sample; all are `null` until the first probe. `last_change` is the bucket time
+at which the current run of `ok` began (the first stored sample when it never
+changed). `uptime_24h` / `uptime_7d` are the share of stored samples that
+passed, or `null` when the window has none. Zero checks returns
+`"checks": []`.
+
+`/api/stats` also carries a top-level `warnings` array in the existing
+`{code, level, value, threshold, text}` shape: a failing check is a `service`
+warning at `critical`, and a certificate inside `DASH_WARN_CERT_DAYS` is a
+`cert` warning (`critical` at half the window). This reads only the latest
+in-memory per-check state; `/api/stats` never scans check history.
+
+### Verdict rules
+
+The verdict is chosen in this order:
+
+| Verdict | When |
+|---|---|
+| `unknown` | the check has no samples yet |
+| `host_down` | `device_id` is set and that device is known offline (even if the last probe passed) |
+| `ok` | the newest sample passed |
+| `path_down` | the newest sample failed and the check is `external` |
+| `service_down` | the newest sample failed for any other reason, including an unknown `device_id` |
+
+So a bookmark can distinguish "the host is off" from "the host is up but this
+service is down" from "the outbound path is down". A colour is never the only
+signal: the dashboard badges carry a dot whose shape and glyph differ by
+verdict (`!` service, `!` in a square host, `~` in a ring path, `?` hollow
+unknown), a visible word on non-ok All tools rows, and visually-hidden text for
+assistive tech.
+
+### UI
+
+- **All tools** rows and **Launchpad** tiles show a check badge when their
+  bookmark names a check; an id the store does not answer reads "no data"
+  rather than disappearing.
+- **Services** is a compact card in the rail below Network. Each row shows the
+  dot + verdict, latency, 24 h uptime and certificate days (when the probe is
+  HTTPS). The header counts `n/m up`. The rail keeps its own scroll, so the
+  page still fits one screen at 1280×800 and the existing breakpoints are
+  unchanged.
 
 ## Workbench UI
 
@@ -217,6 +371,7 @@ overflow. At the target desktop sizes every core section fits in one screen.
 | Launchpad | pinned tool tiles (monogram + two-line label) |
 | All tools | every category in store order, numbered rows, live search count |
 | Network | `n/m online · x% avg CPU`, kind-average chips, compact device rows with 24 h availability, and a **Metrics →** link |
+| Services | compact check rows below Network: verdict, latency, 24 h uptime and certificate days |
 
 A device that reports more than one volume gets a compact breakdown under its row
 (label, size, bar, percentage). The `DSK` cell stays a single gauge and shows the
@@ -483,22 +638,28 @@ curl, then removes the temp directory and process. Docker and node are not requi
 server/check_api.sh
 ```
 
-It asserts: `POST /api/hit` → `204` with no body; the score appears in
-`/api/bookmarks` and rises; older hits decay (`7d > 28d > 60d`, 14-day hit ≈ `0.37`);
-hits older than 90 days are trimmed on write; an unknown URL is accepted; a title rename
-keeps the score; `/api/bookmarks` stays under ~10 KB for the current 31 links; the
-sampler writes history with no browser open; `/api/metrics` returns bucketed points,
-a step, min/max bands and a derived summary; 7d/30d route through `rollup_5m` and
-90d/1y through `rollup_1h`; all four rollup tables contain rows; a push with a `disks`
-array becomes per-volume series with growth/day and days-to-90 and a compact summary,
-an oversized list is capped at 16; a push with extra signals exposes load/swap/network/
-CPU pressure, while an old payload still works and gains no synthetic zeros; a deploy
-annotation becomes a marker and Events row; server-side warnings flag disk and RAM;
-a detected restart becomes an auto marker; unknown windows/devices are rejected; hits,
-metrics history, per-volume history, extra-signal history **and** annotations survive
-a full process restart; and the click feature sets no cookie and makes no third-party
-request. It also guards the compose/README path documentation below and the
-Workbench UI, breakpoint and check documentation above.
+It asserts: a bookmark `check` reference passes through `/api/bookmarks`;
+`POST /api/hit` → `204` with no body; the score appears in `/api/bookmarks` and
+rises; older hits decay (`7d > 28d > 60d`, 14-day hit ≈ `0.37`); hits older than
+90 days are trimmed on write; an unknown URL is accepted; a title rename keeps
+the score; `/api/bookmarks` stays under ~10 KB for the current 31 links; the
+sampler writes history with no browser open; `/api/checks` probes the server's
+own `/api/health` (verdict `ok`, 100% 24 h uptime, latency, `last_change`) and a
+missing route (verdict `service_down`, `HTTP 404`); the failing check reaches
+`/api/stats` warnings in the shared shape; a corrupt check store returns an
+empty list; `/api/metrics` returns bucketed points, a step, min/max bands and a
+derived summary; 7d/30d route through `rollup_5m` and 90d/1y through `rollup_1h`;
+all four rollup tables contain rows; a push with a `disks` array becomes
+per-volume series with growth/day and days-to-90 and a compact summary, an
+oversized list is capped at 16; a push with extra signals exposes
+load/swap/network/CPU pressure, while an old payload still works and gains no
+synthetic zeros; a deploy annotation becomes a marker and Events row;
+server-side warnings flag disk and RAM; a detected restart becomes an auto
+marker; unknown windows/devices are rejected; hits, metrics history, per-volume
+history, extra-signal history **and** annotations survive a full process
+restart; and the click feature sets no cookie and makes no third-party request.
+It also guards the compose/README path documentation below, the Workbench UI,
+breakpoint and check documentation above, and the Services card/check badges.
 
 ## Click-history durability
 

@@ -7,6 +7,7 @@ Stdlib only: no pip, no build step.
 Endpoints
     GET  /                  static dashboard
     GET  /api/bookmarks     bookmark store (JSON, single source of truth)
+    GET  /api/checks        service-probe state, uptimes and verdicts
     GET  /api/stats         device telemetry (live, plus 24 h availability)
     GET  /api/metrics       one device's history for a window
     GET  /api/metrics/summary   every device's derived history summary
@@ -16,13 +17,18 @@ Endpoints
 """
 import hashlib
 import hmac
+import http.client
 import json
 import math
 import os
+import re
 import shutil
 import sqlite3
+import ssl
 import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -33,6 +39,7 @@ DATA = Path(os.environ.get("DASH_DATA_DIR") or BASE / "data")
 AGENTS_FILE = DATA / "agents.json"
 HITS_FILE = DATA / "hits.json"
 METRICS_FILE = DATA / "metrics.db"
+CHECKS_FILE = DATA / "checks.json"
 
 HALF_LIFE_DAYS = 14.0
 HIT_RETENTION_DAYS = 90
@@ -46,6 +53,13 @@ TOKEN = os.environ.get("DASH_TOKEN", "").strip()
 SAMPLE_SECONDS = max(5, int(os.environ.get("DASH_SAMPLE_SECONDS", "60")))
 HISTORY_DAYS = max(1, int(os.environ.get("DASH_HISTORY_DAYS", "30")))
 HISTORY_SECONDS = HISTORY_DAYS * 86400
+# Service checks share the sampler's bucketing discipline but not its cadence:
+# a per-check interval may be longer, and the raw check history is deliberately
+# short (7 days) because the API only reports 24 h and 7 d uptime.
+CHECKS_SECONDS = max(10, int(os.environ.get("DASH_CHECKS_SECONDS", "60")))
+CHECK_BUCKET_SECONDS = max(10, int(os.environ.get("DASH_CHECK_BUCKET_SECONDS", "60")))
+CHECK_RETENTION_DAYS = max(1, int(os.environ.get("DASH_CHECK_HISTORY_DAYS", "7")))
+CHECK_RETENTION_SECONDS = CHECK_RETENTION_DAYS * 86400
 # Two pre-aggregated tiers keep long windows from scanning raw rows: 5-minute
 # buckets for the 7d/30d ranges and hourly buckets for 90d/1y. They are
 # recomputed by the sampler from the current bucket, not by a separate job.
@@ -88,6 +102,9 @@ _prev_cpu = {"usec": None, "at": None}
 _availability_cache = {"at": 0.0, "by_id": {}}
 _summary_cache = {"at": 0.0, "window": None, "body": None}
 _last_prune = {"at": 0.0}
+# Latest probe per check, kept for the cheap `/api/stats` warning surface. The
+# check history itself is never scanned there.
+_check_state = {"results": {}}
 
 
 def _invalidate_summary():
@@ -327,6 +344,8 @@ WARN_DAYS_TO_90 = float(os.environ.get("DASH_WARN_DAYS_TO_90", "14"))
 WARN_GROWTH = float(os.environ.get("DASH_WARN_GROWTH", "1.0"))
 WARN_OFFLINE_S = int(os.environ.get("DASH_WARN_OFFLINE_S", "600"))
 WARN_MEM_PCT = float(os.environ.get("DASH_WARN_MEM_PCT", "90"))
+# A certificate is a warning inside two weeks and critical inside one.
+WARN_CERT_DAYS = float(os.environ.get("DASH_WARN_CERT_DAYS", "14"))
 
 
 def _finite(value):
@@ -412,6 +431,529 @@ def agent_devices():
             "last_seen": int(rec.get("last_seen", 0)),
         })
     return out
+
+
+# ---------- service checks ----------
+# A check is an HTTP probe with an expected status and/or body. The store is a
+# JSON file beside bookmarks.json so a homelab owner edits it without a build
+# step or a restart; the sampler re-reads it every pass. Every entry is
+# normalised to the same shape here, and one bad entry is dropped rather than
+# taking the API down.
+DEFAULT_STATUS_RANGES = ((200, 299),)
+FAILING_VERDICTS = ("service_down", "path_down", "host_down")
+DEFAULT_CHECK_TIMEOUT = 5.0
+MAX_CHECK_TIMEOUT = 60.0
+MIN_CHECK_INTERVAL = 10
+MAX_CHECK_INTERVAL = 86400
+MAX_CHECK_URL = 2048
+MAX_CHECK_BODY = 500
+
+_STATUS_CLASS = re.compile(r"([1-5])xx")
+_STATUS_RANGE = re.compile(r"(\d{3})\s*-\s*(\d{3})")
+_STATUS_CODE = re.compile(r"\d{3}")
+
+
+def _status_ranges(value):
+    """Parse `200`, `2xx`, `200-299` or a list of those into inclusive ranges.
+
+    Invalid input returns None so the caller can fall back to the 2xx default;
+    a config typo must never turn into an impossible expectation.
+    """
+    items = value if isinstance(value, list) else [value]
+    ranges = []
+    for item in items:
+        if isinstance(item, bool):
+            return None
+        if isinstance(item, int):
+            if 100 <= item <= 599:
+                ranges.append((item, item))
+            else:
+                return None
+            continue
+        if not isinstance(item, str):
+            return None
+        text = item.strip().lower().replace(" ", "")
+        if not text:
+            return None
+        match = _STATUS_CLASS.fullmatch(text)
+        if match:
+            base = int(match.group(1)) * 100
+            ranges.append((base, base + 99))
+            continue
+        match = _STATUS_RANGE.fullmatch(text)
+        if match:
+            low, high = int(match.group(1)), int(match.group(2))
+            if low > high or low < 100 or high > 599:
+                return None
+            ranges.append((low, high))
+            continue
+        if _STATUS_CODE.fullmatch(text):
+            code = int(text)
+            if 100 <= code <= 599:
+                ranges.append((code, code))
+                continue
+        return None
+    return tuple(sorted(set(ranges))) or None
+
+
+def _normalise_check(raw):
+    """One stored entry in the shape the probe and API share, or None."""
+    if not isinstance(raw, dict):
+        return None
+    check_id = raw.get("id")
+    if not isinstance(check_id, str) or not check_id.strip():
+        return None
+    check_id = check_id.strip()[:80]
+    url = raw.get("url")
+    if not isinstance(url, str):
+        return None
+    url = url.strip()[:MAX_CHECK_URL]
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return None
+    name = raw.get("name")
+    name = name.strip()[:80] if isinstance(name, str) and name.strip() else check_id
+
+    method = raw.get("method")
+    method = method.upper() if isinstance(method, str) else "GET"
+    if method not in ("GET", "HEAD"):
+        # A config typo must not issue a mutating request.
+        method = "GET"
+
+    expect_body = raw.get("expect_body")
+    expect_body = expect_body[:MAX_CHECK_BODY] if isinstance(
+        expect_body, str) and expect_body else None
+
+    timeout = _finite(raw.get("timeout_s"))
+    if timeout is None or timeout <= 0:
+        timeout = DEFAULT_CHECK_TIMEOUT
+    else:
+        timeout = min(MAX_CHECK_TIMEOUT, max(1.0, timeout))
+
+    interval = _finite(raw.get("interval_s"))
+    if interval is None or interval <= 0:
+        interval = None
+    else:
+        interval = int(min(MAX_CHECK_INTERVAL, max(MIN_CHECK_INTERVAL, interval)))
+
+    device_id = raw.get("device_id")
+    device_id = device_id.strip()[:80] if isinstance(device_id, str) else ""
+    return {
+        "id": check_id,
+        "name": name,
+        "url": url,
+        "method": method,
+        "status_ranges": _status_ranges(raw.get("expect_status"))
+        or DEFAULT_STATUS_RANGES,
+        "expect_body": expect_body,
+        "timeout_s": float(timeout),
+        "interval_s": interval,
+        "device_id": device_id or None,
+        "external": raw.get("external") is True,
+    }
+
+
+def load_checks():
+    """Read and normalise the check store; a missing or corrupt file is empty."""
+    try:
+        with open(CHECKS_FILE) as f:
+            data = json.load(f)
+    except Exception:  # noqa: BLE001 - an absent or broken store means no checks
+        return []
+    raw = data.get("checks") if isinstance(data, dict) else data
+    if not isinstance(raw, list):
+        return []
+    checks, seen = [], set()
+    for item in raw:
+        check = _normalise_check(item)
+        if check is None or check["id"] in seen:
+            continue
+        seen.add(check["id"])
+        checks.append(check)
+    return checks
+
+
+# A probe reads at most this much of a body: enough for an expectation, never
+# enough for a large page to turn one slow check into a long read.
+MAX_PROBE_BODY = 65536
+
+
+def _cert_not_after(cert):
+    """Epoch seconds from ssl's `notAfter` text, or None if it cannot be read."""
+    if not isinstance(cert, dict):
+        return None
+    raw = cert.get("notAfter")
+    if not isinstance(raw, str):
+        return None
+    try:
+        return ssl.cert_time_to_seconds(raw)
+    except (ValueError, OverflowError):
+        return None
+
+
+class _CertHTTPSConnection(http.client.HTTPSConnection):
+    """An HTTPS connection that keeps the peer certificate for the probe.
+
+    urllib does not expose the socket after the fact, so the connection that
+    actually negotiated TLS records `notAfter` and attaches itself to the
+    response. Redirects create a new connection, and the final response is the
+    one that carries the certificate the user will see.
+    """
+
+    cert_not_after = None
+
+    def connect(self):
+        super().connect()
+        try:
+            self.cert_not_after = _cert_not_after(self.sock.getpeercert())
+        except (AttributeError, ValueError):
+            self.cert_not_after = None
+
+    def getresponse(self):
+        response = super().getresponse()
+        response.dash_connection = self
+        return response
+
+
+class _CertHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_CertHTTPSConnection, req, context=self._context)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Report the status a service sent instead of following it.
+
+    A probe is an observation: following a redirect would hide the 3xx a
+    check may be expecting, and would report the final page's status as if
+    the configured URL had answered it.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_PROBE_OPENER = urllib.request.build_opener(
+    _CertHTTPSHandler(context=ssl.create_default_context()),
+    _NoRedirect(),
+)
+
+
+def _cert_from_response(response):
+    """Peer `notAfter` from a response our HTTPS connection annotated."""
+    connection = getattr(response, "dash_connection", None)
+    return getattr(connection, "cert_not_after", None)
+
+
+def _urllib_transport(url, method, timeout):
+    """Perform one probe: `(status, body, cert_not_after)`, raising on failure.
+
+    HTTP error statuses are responses, not transport failures, so they are
+    returned like any other status; the caller decides whether they match.
+    urllib's timeout bounds each blocking operation, and the body read is
+    capped; the sibling thread is what keeps a trickling server away from
+    device sampling.
+    """
+    request = urllib.request.Request(url, method=method)
+    try:
+        with _PROBE_OPENER.open(request, timeout=timeout) as response:
+            body = response.read(MAX_PROBE_BODY)
+            return response.status, body, _cert_from_response(response)
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read(MAX_PROBE_BODY)
+        except Exception:  # noqa: BLE001 - the status is still the answer
+            body = b""
+        # `HTTPError.fp` is the response our connection annotated, so a 5xx
+        # from an https service still carries its certificate lifetime.
+        return exc.code, body, _cert_from_response(exc.fp)
+
+
+def _status_matches(ranges, status):
+    return status is not None and any(
+        low <= status <= high for low, high in ranges
+    )
+
+
+def _probe_error_text(exc):
+    """One line of failure detail, safe to store and re-serve."""
+    text = f"{type(exc).__name__}: {exc}".replace("\n", " ").strip()
+    return text[:200] or type(exc).__name__
+
+
+def probe_check(check, now=None, transport=None):
+    """Probe one check and return a sample-shaped result.
+
+    `transport` is the seam tests use instead of a real network; it returns
+    `(status, body, cert_not_after)` and raises on a connection failure.
+    """
+    now = time.time() if now is None else now
+    transport = transport or _urllib_transport
+    started = time.monotonic()
+    status, body, not_after = None, b"", None
+    error = None
+    try:
+        status, body, not_after = transport(
+            check["url"], check["method"], check["timeout_s"]
+        )
+    except Exception as exc:  # noqa: BLE001 - a dead URL is a sample, not a crash
+        error = _probe_error_text(exc)
+    latency_ms = int(round((time.monotonic() - started) * 1000))
+
+    ok = False
+    if error is None:
+        ok = _status_matches(check["status_ranges"], status)
+        if not ok:
+            error = f"HTTP {status}"
+        elif check["expect_body"]:
+            text = body.decode("utf-8", "replace") if isinstance(
+                body, bytes) else str(body)
+            if check["expect_body"] not in text:
+                ok = False
+                error = f"body did not contain {check['expect_body']!r}"
+
+    cert_days = (
+        None if not_after is None
+        else round((float(not_after) - now) / 86400.0, 1)
+    )
+    return {
+        "id": check["id"],
+        "ok": ok,
+        "status": status,
+        "latency_ms": latency_ms,
+        "cert_days": cert_days,
+        "error": error,
+    }
+
+
+def _device_online(live, device_id):
+    """Whether a tied device is online, or None when it is not known."""
+    if not device_id:
+        return None
+    state = live.get(device_id)
+    return bool(state.get("online")) if state else None
+
+
+def check_verdict(check, ok, device_online):
+    """Classify a check for the launcher and the Services card.
+
+    Precedence is deliberate: no sample at all is unknown; a tied device that
+    is known offline is host_down even if its last probe passed; then a passing
+    sample is ok, an external failure is path_down and every other failure is
+    service_down. An unknown device_id falls through to service_down because
+    the server cannot honestly claim the host is offline.
+    """
+    if ok is None:
+        return "unknown"
+    if check.get("device_id") and device_online is False:
+        return "host_down"
+    if ok:
+        return "ok"
+    if check.get("external"):
+        return "path_down"
+    return "service_down"
+
+
+def _last_change_ts(con, check_id, ok):
+    """Bucket ts at which the current run of `ok` began.
+
+    MAX(ts) of the opposite state plus the first row after it gives the
+    transition without scanning the series; when the state never changed, the
+    first stored sample is the start.
+    """
+    previous = con.execute(
+        "SELECT MAX(ts) FROM check_samples WHERE check_id = ? AND ok != ?",
+        (check_id, int(ok)),
+    ).fetchone()[0]
+    if previous is None:
+        first = con.execute(
+            "SELECT MIN(ts) FROM check_samples WHERE check_id = ?", (check_id,)
+        ).fetchone()[0]
+        return int(first) if first is not None else None
+    following = con.execute(
+        "SELECT MIN(ts) FROM check_samples WHERE check_id = ? AND ts > ?",
+        (check_id, previous),
+    ).fetchone()[0]
+    return int(following) if following is not None else None
+
+
+def _uptime_share(con, check_id, since):
+    row = con.execute(
+        "SELECT AVG(ok) FROM check_samples WHERE check_id = ? AND ts >= ?",
+        (check_id, int(since)),
+    ).fetchone()
+    return round(100.0 * row[0], 1) if row[0] is not None else None
+
+
+def _check_entry(con, check, live, now):
+    latest = None
+    if con is not None:
+        latest = con.execute(
+            "SELECT ok, status, latency_ms, cert_days, error, ts "
+            "FROM check_samples WHERE check_id = ? ORDER BY ts DESC LIMIT 1",
+            (check["id"],),
+        ).fetchone()
+    entry = {
+        "id": check["id"],
+        "name": check["name"],
+        "url": check["url"],
+        "device_id": check["device_id"],
+        "ok": None,
+        "status": None,
+        "latency_ms": None,
+        "cert_days": None,
+        "error": None,
+        "last_change": None,
+        "uptime_24h": None,
+        "uptime_7d": None,
+        "verdict": "unknown",
+    }
+    if latest is None:
+        return entry
+    ok, status, latency, cert_days, error, _ts = latest
+    entry.update({
+        "ok": bool(ok),
+        "status": int(status) if status is not None else None,
+        "latency_ms": int(round(latency)) if latency is not None else None,
+        "cert_days": round(float(cert_days), 1) if cert_days is not None else None,
+        "error": error,
+        "last_change": _last_change_ts(con, check["id"], ok),
+        "uptime_24h": _uptime_share(con, check["id"], now - 86400),
+        "uptime_7d": _uptime_share(con, check["id"], now - 7 * 86400),
+    })
+    entry["verdict"] = check_verdict(
+        check, entry["ok"], _device_online(live, check["device_id"])
+    )
+    return entry
+
+
+def checks_payload(now=None):
+    """Per-check current state, uptimes and verdict for the launcher."""
+    now = time.time() if now is None else now
+    checks = load_checks()
+    payload = {"generated": int(now), "checks": []}
+    if not checks:
+        return payload
+    live = _live_state(now)
+    con = _connect_metrics() if METRICS_FILE.exists() else None
+    try:
+        for check in checks:
+            payload["checks"].append(_check_entry(con, check, live, now))
+    finally:
+        if con is not None:
+            con.close()
+    return payload
+
+
+def run_checks_once(now=None, transport=None):
+    """Probe every due check once and store the samples.
+
+    Reads the due times under `_db_lock`, probes without holding it, then
+    writes through the single-writer path. `transport` is the test seam; the
+    production caller uses urllib.
+    """
+    now = time.time() if now is None else now
+    checks = load_checks()
+    if not checks:
+        with _lock:
+            _check_state["results"] = {}
+        return 0
+
+    last_seen, latest = {}, {}
+    if METRICS_FILE.exists():
+        with _db_lock:
+            con = _connect_metrics()
+            try:
+                last_seen = dict(con.execute(
+                    "SELECT check_id, MAX(ts) FROM check_samples GROUP BY check_id"
+                ).fetchall())
+                # One row per check: the sample the verdict and warnings use
+                # while the check is not due for another probe.
+                latest = {
+                    row[0]: row[1:]
+                    for row in con.execute(
+                        "SELECT c.check_id, c.ok, c.status, c.cert_days, c.error "
+                        "FROM check_samples c WHERE c.ts = ("
+                        "  SELECT MAX(ts) FROM check_samples "
+                        "  WHERE check_id = c.check_id)"
+                    ).fetchall()
+                }
+            finally:
+                con.close()
+
+    live = _live_state(now)
+    results, carried = [], {}
+    for check in checks:
+        interval = check["interval_s"] or CHECKS_SECONDS
+        last = last_seen.get(check["id"])
+        if last is not None and now - last < interval:
+            # Not due, but the state a restart lost still has to feed the
+            # warning surface, and the verdict still follows the live host.
+            sample = latest.get(check["id"])
+            if sample is not None:
+                ok, status, cert_days, error = sample
+                carried[check["id"]] = {
+                    "name": check["name"],
+                    "ok": bool(ok),
+                    "status": status,
+                    "cert_days": cert_days,
+                    "error": error,
+                    "verdict": check_verdict(
+                        check, bool(ok), _device_online(live, check["device_id"])
+                    ),
+                    "ts": int(last),
+                }
+            continue
+        result = probe_check(check, now=now, transport=transport)
+        result["name"] = check["name"]
+        result["device_id"] = check["device_id"]
+        result["verdict"] = check_verdict(
+            check, result["ok"], _device_online(live, check["device_id"])
+        )
+        results.append(result)
+
+    if results:
+        record_check_samples(results, now=now)
+        prune_metrics(now)
+
+    known = {check["id"] for check in checks}
+    with _lock:
+        state = {
+            check_id: result
+            for check_id, result in _check_state["results"].items()
+            if check_id in known
+        }
+        state.update(carried)
+        for result in results:
+            state[result["id"]] = {
+                "name": result["name"],
+                "ok": result["ok"],
+                "status": result["status"],
+                "cert_days": result["cert_days"],
+                "error": result["error"],
+                "verdict": result["verdict"],
+                "ts": int(now),
+            }
+        _check_state["results"] = state
+    return len(results)
+
+
+def checks_loop(interval=None):
+    """Probe checks forever on its own thread, never delaying device sampling."""
+    interval = CHECKS_SECONDS if interval is None else max(1, interval)
+    while True:
+        started = time.time()
+        try:
+            run_checks_once()
+        except Exception as exc:  # noqa: BLE001 - a probe bug must not kill the API
+            print(f"service checks failed: {type(exc).__name__}: {exc}", flush=True)
+        time.sleep(max(1.0, interval - (time.time() - started)))
+
+
+def start_checks(interval=None):
+    thread = threading.Thread(target=checks_loop, args=(interval,), daemon=True,
+                              name="service-checks")
+    thread.start()
+    return thread
 
 
 # ---------- metrics history ----------
@@ -552,6 +1094,22 @@ CREATE TABLE IF NOT EXISTS metric_samples (
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS metric_samples_ts ON metric_samples (ts);
+
+-- One row per check per bucket. The sampler replaces a repeat inside a bucket,
+-- so a probe retry never double-counts uptime. cert_days is the peer
+-- certificate's remaining lifetime for an https probe, NULL for http.
+CREATE TABLE IF NOT EXISTS check_samples (
+    check_id   TEXT NOT NULL,
+    ts         INTEGER NOT NULL,
+    ok         INTEGER NOT NULL,
+    status     INTEGER,
+    latency_ms REAL,
+    cert_days  REAL,
+    error      TEXT,
+    PRIMARY KEY (check_id, ts)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS check_samples_ts ON check_samples (ts);
 
 -- Manual deploy/restart/backup/note annotations. device_id = '' means
 -- fleet-wide, so a deploy note appears on every device chart.
@@ -701,6 +1259,45 @@ def sample_all(now=None):
     return record_samples([local_device()] + agent_devices(), now=now)
 
 
+def record_check_samples(results, now=None):
+    """Write one bucketed check row per result, replacing a duplicate bucket.
+
+    This is the same single-writer path as device samples: it takes `_db_lock`
+    and never holds it while waiting on a network probe.
+    """
+    now = time.time() if now is None else now
+    ts = int(now) - (int(now) % CHECK_BUCKET_SECONDS)
+    wrote = 0
+    with _db_lock:
+        con = _connect_metrics()
+        try:
+            for result in results:
+                check_id = result.get("id")
+                if not isinstance(check_id, str) or not check_id:
+                    continue
+                con.execute(
+                    "INSERT INTO check_samples "
+                    "(check_id, ts, ok, status, latency_ms, cert_days, error) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(check_id, ts) DO UPDATE SET "
+                    "ok = excluded.ok, status = excluded.status, "
+                    "latency_ms = excluded.latency_ms, "
+                    "cert_days = excluded.cert_days, error = excluded.error",
+                    (
+                        check_id, ts, 1 if result.get("ok") else 0,
+                        _metric_number(result.get("status"), int),
+                        _metric_number(result.get("latency_ms")),
+                        _metric_number(result.get("cert_days")),
+                        clean_text(result.get("error"), 200),
+                    ),
+                )
+                wrote += 1
+            con.commit()
+        finally:
+            con.close()
+    return wrote
+
+
 def prune_metrics(now=None):
     """Drop samples outside the retention window, at most once an hour."""
     now = time.time() if now is None else now
@@ -718,6 +1315,7 @@ def prune_metrics(now=None):
                 ("samples", HISTORY_SECONDS),
                 ("disk_samples", HISTORY_SECONDS),
                 ("metric_samples", HISTORY_SECONDS),
+                ("check_samples", CHECK_RETENTION_SECONDS),
                 ("rollup_5m", ROLLUP_5M_RETENTION),
                 ("rollup_1h", ROLLUP_1H_RETENTION),
                 ("disk_rollup_5m", ROLLUP_5M_RETENTION),
@@ -1195,6 +1793,56 @@ def live_warnings(device, now):
         "online": device.get("online", True),
         "last_seen": device.get("last_seen"),
     }, now)
+
+
+def _check_failure_text(result):
+    verdict = result.get("verdict")
+    if verdict == "host_down":
+        return "unreachable (host offline)"
+    if verdict == "path_down":
+        return "unreachable (path down)"
+    detail = result.get("error")
+    if not detail and result.get("status") is not None:
+        detail = f"HTTP {result['status']}"
+    return f"down ({detail or 'probe failed'})"
+
+
+def _cert_warning_text(name, days):
+    if days <= 0:
+        return f"{name} certificate expired {abs(days):g}d ago"
+    return f"{name} certificate expires in {days:g}d"
+
+
+def check_warnings():
+    """Failures and expiring certificates in the shared warning shape.
+
+    This reads only the latest per-check state the sampler keeps in memory, so
+    `/api/stats` never scans the check history on its 5 s poll.
+    """
+    with _lock:
+        results = list(_check_state["results"].items())
+    warnings = []
+    for check_id, result in results:
+        name = result.get("name") or check_id
+        if result.get("verdict") in FAILING_VERDICTS:
+            warnings.append({
+                "code": "service",
+                "level": "critical",
+                "value": result.get("status"),
+                "threshold": None,
+                "text": f"{name} {_check_failure_text(result)}",
+            })
+        cert_days = _finite(result.get("cert_days"))
+        if cert_days is not None and cert_days <= WARN_CERT_DAYS:
+            warnings.append({
+                "code": "cert",
+                "level": "critical" if cert_days <= WARN_CERT_DAYS / 2
+                else "warning",
+                "value": round(cert_days, 1),
+                "threshold": WARN_CERT_DAYS,
+                "text": _cert_warning_text(name, cert_days),
+            })
+    return warnings
 
 
 def _empty_summary():
@@ -1785,6 +2433,8 @@ def stats():
         "generated": int(now),
         "devices": devices,
         "topology": stack_topology(devices),
+        # Additive: the launcher's service warnings ride the same 5 s payload.
+        "warnings": check_warnings(),
     }
     with _lock:
         _cache["at"] = now
@@ -1992,6 +2642,8 @@ class Handler(BaseHTTPRequestHandler):
                 if payload is None:
                     return self._json({"error": "unknown device"}, 404)
                 return self._json(payload)
+            if path == "/api/checks":
+                return self._json(checks_payload())
             if path == "/api/health":
                 return self._json({"ok": True})
         except Exception as exc:  # noqa: BLE001
@@ -2124,5 +2776,8 @@ if __name__ == "__main__":
     DATA.mkdir(parents=True, exist_ok=True)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     start_monitor()
+    # Checks run on a sibling thread: a slow or dead URL must never delay the
+    # device sampler, whose cadence history and availability depend on.
+    start_checks()
     print(f"dash listening on :{PORT}  token={'set' if TOKEN else 'open'}", flush=True)
     server.serve_forever()
