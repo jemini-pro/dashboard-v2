@@ -1800,6 +1800,109 @@ class MetricsHistoryTest(ApiTestCase):
         series_payload = app.metrics_series("docker01", "1h", 60, now=self.BASE + 60)
         self.assertEqual(series_payload["volumes"], [])
 
+    # ---------- one window reader ----------
+
+    def window_view(self, since, until, step, device_id="docker01"):
+        """Read one window through the module the endpoints use, not a table."""
+        con = app._connect_metrics()
+        try:
+            return app.read_window(con, device_id, since, until, step)
+        finally:
+            con.close()
+
+    def seed_six_hours(self):
+        """Six hours of minute samples: hour 2 offline, a reboot in hour 3.
+
+        CPU and RAM change by the hour and the offline hour carries the
+        window's peak, so parity also pins sample weighting and the rule that
+        every recorded sample is averaged. One missing minute makes a
+        5-minute bucket short, so a lost weight would be visible. Whole
+        5-minute and whole-hour runs keep every store's resolution
+        comparable.
+        """
+        for minute in range(360):
+            if minute == 1:
+                continue
+            hour = minute // 60
+            uptime = (
+                1000 + minute * 60 if minute < 180
+                else 60 + (minute - 180) * 60
+            )
+            cpu = 99.0 if hour == 2 else 10.0 + hour * 10
+            if hour == 0:
+                cpu += minute % 5
+            self.sample([self.device(
+                online=hour != 2, cpu=cpu,
+                mem=95.0 if hour == 2 else 30.0 + hour,
+                disk=50.0, uptime=uptime,
+                disks=[self.volume("/", 50.0, "System")],
+            )], now=self.BASE + minute * 60)
+
+    def test_the_window_reader_agrees_across_raw_five_minute_and_hourly_stores(self):
+        self.seed_six_hours()
+        until = self.BASE + 360 * 60
+        raw = self.window_view(self.BASE, until, 300)
+        five = self.window_view(until - 7 * 86400, until, 300)
+        hourly = self.window_view(until - 90 * 86400, until, 3600)
+
+        # The store is chosen from the window length, not by the caller.
+        self.assertEqual(raw["source"], "raw")
+        self.assertEqual(five["source"], "5m")
+        self.assertEqual(hourly["source"], "1h")
+
+        # Independent values: the offline hour's peak counts in the averages
+        # and its 99% CPU is the window peak, exactly as a rollup weights it.
+        self.assertEqual(raw["summary"]["samples"], 359)
+        self.assertEqual(raw["summary"]["availability_pct"], 83.3)
+        self.assertEqual(raw["summary"]["cpu_avg"], 46.9)
+        self.assertEqual(raw["summary"]["cpu_max"], 99.0)
+        self.assertEqual(raw["summary"]["mem_avg"], 43.0)
+
+        for name, other in (("5m", five), ("1h", hourly)):
+            self.assertEqual(other["summary"], raw["summary"], name)
+            self.assertEqual(other["events"], raw["events"], name)
+            self.assertEqual(other["online"], raw["online"], name)
+
+        # The same buckets, so the chart data must be identical too.
+        self.assertEqual(five["points"], raw["points"])
+        self.assertEqual(five["bands"], raw["bands"])
+        self.assertEqual(
+            hourly["points"],
+            self.window_view(self.BASE, until, 3600)["points"],
+        )
+        self.assertEqual(
+            hourly["bands"],
+            self.window_view(self.BASE, until, 3600)["bands"],
+        )
+        self.assertEqual(five["volumes"], raw["volumes"])
+
+    def test_an_empty_window_has_the_same_summary_shape_as_a_populated_one(self):
+        self.sample([self.device()], now=self.BASE)
+        populated = self.window_view(self.BASE, self.BASE + 60, 60)["summary"]
+        empty = self.window_view(
+            self.BASE + 86400, self.BASE + 86400 + 7 * 86400, 300
+        )
+        self.assertEqual(empty["source"], "5m")
+        self.assertEqual(empty["summary"]["samples"], 0)
+        self.assertEqual(set(empty["summary"]), set(populated))
+        self.assertEqual(empty["points"], [])
+        self.assertEqual(empty["bands"], {"cpu": [], "mem": [], "disk": []})
+        self.assertEqual(empty["volumes"], [])
+        self.assertEqual(empty["signals"], {})
+        for key in ("cpu_pct", "mem_pct", "disk_pct"):
+            self.assertIsNone(empty["summary"][key])
+
+    def test_the_series_endpoint_keeps_the_summary_shape_when_the_window_is_empty(self):
+        self.sample([self.device()], now=self.BASE)
+        populated = app.metrics_series(
+            "docker01", "1h", 60, now=self.BASE + 60
+        )["summary"]
+        empty = app.metrics_series(
+            "docker01", "1h", 60, now=self.BASE + 86400
+        )["summary"]
+        self.assertEqual(empty["samples"], 0)
+        self.assertEqual(set(empty), set(populated))
+
     # ---------- peaks and rollups ----------
 
     def rollup_rows(self, table, columns="*"):
