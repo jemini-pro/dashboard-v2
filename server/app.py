@@ -346,6 +346,10 @@ WARN_OFFLINE_S = int(os.environ.get("DASH_WARN_OFFLINE_S", "600"))
 WARN_MEM_PCT = float(os.environ.get("DASH_WARN_MEM_PCT", "90"))
 # A certificate is a warning inside two weeks and critical inside one.
 WARN_CERT_DAYS = float(os.environ.get("DASH_WARN_CERT_DAYS", "14"))
+WARN_ZFS_SCRUB_DAYS = float(os.environ.get("DASH_WARN_ZFS_SCRUB_DAYS", "30"))
+WARN_BACKUP_HOURS = float(os.environ.get("DASH_WARN_BACKUP_HOURS", "36"))
+WARN_UPS_CHARGE_PCT = float(os.environ.get("DASH_WARN_UPS_CHARGE_PCT", "30"))
+WARN_UPS_RUNTIME_S = int(os.environ.get("DASH_WARN_UPS_RUNTIME_S", "300"))
 
 
 def _finite(value):
@@ -405,6 +409,157 @@ def worst_disk_pct(disks, fallback):
     return max(values) if values else fallback
 
 
+# ---------- failure-mode health ----------
+# SMART, ZFS, UPS, backup freshness and update state arrive as optional
+# blocks. Like disks, they are untrusted input from a token holder: every
+# entry is validated and clamped, and a malformed block is omitted rather
+# than stored and re-served. An agent that sends none of these keeps working.
+MAX_HEALTH_ITEMS = 16
+MAX_HEALTH_COUNT = 1_000_000_000
+# The metrics page reads the latest block plus a short snapshot history; a
+# device does not need a year of SMART temperatures on the wire.
+HEALTH_HISTORY_LIMIT = 24
+HEALTH_KINDS = ("smart", "zfs", "ups", "backup", "updates")
+
+
+def _health_count(value):
+    """A non-negative integer counter, clamped, or None. bool is not a count."""
+    number = _metric_number(value, int)
+    if number is None or number < 0:
+        return None
+    return min(number, MAX_HEALTH_COUNT)
+
+
+def _health_percent(value):
+    number = _metric_number(value)
+    if number is None or number < 0:
+        return None
+    return round(min(number, 100.0), 1)
+
+
+def clean_smart(raw):
+    """Validate the optional SMART list; cap it and drop unusable entries."""
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw[:MAX_HEALTH_ITEMS]:
+        if not isinstance(item, dict):
+            continue
+        device = clean_text(item.get("device"), 64)
+        if not device:
+            continue
+        entry = {"device": device}
+        health = clean_text(item.get("health"), 32)
+        if health:
+            entry["health"] = health
+        temperature = _metric_number(item.get("temperature_c"))
+        if temperature is not None and temperature >= 0:
+            entry["temperature_c"] = round(min(temperature, 200.0), 1)
+        for key in ("reallocated", "pending", "power_on_hours"):
+            value = _health_count(item.get(key))
+            if value is not None:
+                entry[key] = value
+        out.append(entry)
+    return out
+
+
+def clean_zfs(raw):
+    """Validate the optional ZFS pool list; cap it and drop unusable entries."""
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw[:MAX_HEALTH_ITEMS]:
+        if not isinstance(item, dict):
+            continue
+        pool = clean_text(item.get("pool"), 64)
+        if not pool:
+            continue
+        entry = {"pool": pool}
+        state = clean_text(item.get("state"), 32)
+        if state:
+            entry["state"] = state
+        capacity = _health_percent(item.get("capacity_pct"))
+        if capacity is not None:
+            entry["capacity_pct"] = capacity
+        scrub = _health_count(item.get("scrub_age_s"))
+        if scrub is not None:
+            entry["scrub_age_s"] = scrub
+        errors = _health_count(item.get("errors"))
+        if errors is not None:
+            entry["errors"] = errors
+        out.append(entry)
+    return out
+
+
+def clean_ups(raw):
+    """Validate the optional UPS object, or None when it carries no reading."""
+    if not isinstance(raw, dict):
+        return None
+    entry = {}
+    status = clean_text(raw.get("status"), 32)
+    if status:
+        entry["status"] = status
+    for key in ("charge_pct", "load_pct"):
+        value = _health_percent(raw.get(key))
+        if value is not None:
+            entry[key] = value
+    runtime = _health_count(raw.get("runtime_s"))
+    if runtime is not None:
+        entry["runtime_s"] = runtime
+    if isinstance(raw.get("battery_low"), bool):
+        entry["battery_low"] = raw["battery_low"]
+    return entry or None
+
+
+def clean_backup(raw):
+    """A backup is only useful with an absolute success timestamp."""
+    if not isinstance(raw, dict):
+        return None
+    ts = _metric_number(raw.get("last_success_ts"), int)
+    if ts is None or ts <= 0:
+        return None
+    entry = {"last_success_ts": ts}
+    tool = clean_text(raw.get("tool"), 32)
+    if tool:
+        entry["tool"] = tool
+    return entry
+
+
+def clean_updates(raw):
+    """Validate the optional update object, or None when it carries nothing."""
+    if not isinstance(raw, dict):
+        return None
+    entry = {}
+    for key in ("pending", "security"):
+        value = _health_count(raw.get(key))
+        if value is not None:
+            entry[key] = value
+    if isinstance(raw.get("reboot_required"), bool):
+        entry["reboot_required"] = raw["reboot_required"]
+    return entry or None
+
+
+def clean_health(raw):
+    """The optional failure-mode blocks, cleaned; absent kinds stay absent."""
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for kind in HEALTH_KINDS:
+        if kind not in raw:
+            continue
+        if kind in ("smart", "zfs"):
+            cleaned = clean_smart(raw[kind]) if kind == "smart" else clean_zfs(raw[kind])
+        elif kind == "ups":
+            cleaned = clean_ups(raw[kind])
+        elif kind == "backup":
+            cleaned = clean_backup(raw[kind])
+        else:
+            cleaned = clean_updates(raw[kind])
+        if cleaned:
+            out[kind] = cleaned
+    return out
+
+
 def agent_devices():
     now = time.time()
     out = []
@@ -412,6 +567,7 @@ def agent_devices():
         age = now - rec.get("last_seen", 0)
         disks = rec.get("disks")
         disks = disks if isinstance(disks, list) else []
+        health = clean_health(rec.get("health"))
         out.append({
             "id": f"agent:{name}",
             "name": rec.get("name", name),
@@ -427,6 +583,7 @@ def agent_devices():
             **{metric: rec.get(metric) for metric in EXTRA_METRICS
                if metric in rec},
             **{key: rec[key] for key in CONTAINER_FIELDS if key in rec},
+            **({"health": health} if health else {}),
             "online": age < 150,  # agents push every 60 s; allow two misses
             "last_seen": int(rec.get("last_seen", 0)),
         })
@@ -1111,6 +1268,20 @@ CREATE TABLE IF NOT EXISTS check_samples (
 
 CREATE INDEX IF NOT EXISTS check_samples_ts ON check_samples (ts);
 
+-- Failure-mode telemetry (SMART, ZFS, UPS, backup freshness, updates). One
+-- row per device per kind per bucket; a repeat heartbeat replaces the rows it
+-- touches, exactly like disk_samples. payload_json is the cleaned block, so an
+-- old agent has no rows and the API omits the block rather than inventing one.
+CREATE TABLE IF NOT EXISTS device_health (
+    device_id    TEXT NOT NULL,
+    ts           INTEGER NOT NULL,
+    kind         TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    PRIMARY KEY (device_id, kind, ts)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS device_health_ts ON device_health (ts);
+
 -- Manual deploy/restart/backup/note annotations. device_id = '' means
 -- fleet-wide, so a deploy note appears on every device chart.
 CREATE TABLE IF NOT EXISTS annotations (
@@ -1240,6 +1411,20 @@ def record_samples(devices, now=None):
                             "VALUES (?, ?, ?, ?)",
                             (device_id, metric, ts, value),
                         )
+                # Failure-mode blocks share the bucket and the replacement
+                # rule. An agent that sends none of them writes no rows; a
+                # repeat heartbeat is the source of truth for its bucket.
+                con.execute(
+                    "DELETE FROM device_health WHERE device_id = ? AND ts = ?",
+                    (device_id, ts),
+                )
+                for kind, block in clean_health(device.get("health")).items():
+                    con.execute(
+                        "INSERT INTO device_health "
+                        "(device_id, ts, kind, payload_json) VALUES (?, ?, ?, ?)",
+                        (device_id, ts, kind,
+                         json.dumps(block, separators=(",", ":"), sort_keys=True)),
+                    )
                 # Recompute only the buckets this heartbeat touches. Later
                 # heartbeats in the same bucket replace the row rather than
                 # appending, so a rollup is always a pure function of raw rows.
@@ -1316,6 +1501,7 @@ def prune_metrics(now=None):
                 ("disk_samples", HISTORY_SECONDS),
                 ("metric_samples", HISTORY_SECONDS),
                 ("check_samples", CHECK_RETENTION_SECONDS),
+                ("device_health", HISTORY_SECONDS),
                 ("rollup_5m", ROLLUP_5M_RETENTION),
                 ("rollup_1h", ROLLUP_1H_RETENTION),
                 ("disk_rollup_5m", ROLLUP_5M_RETENTION),
@@ -1727,6 +1913,218 @@ def _duration_label(seconds):
     return f"{max(1, seconds // 60)}m"
 
 
+def _age_label(seconds):
+    """A short duration for backup age, scrub age and UPS runtime: 31d, 40h, 12m."""
+    seconds = max(0, int(seconds))
+    if seconds >= 3 * 86400:
+        return f"{seconds // 86400}d"
+    if seconds >= 3600:
+        return f"{seconds // 3600}h"
+    return f"{max(1, seconds // 60)}m"
+
+
+def _ups_on_battery(status):
+    return "OB" in status.upper().split() if isinstance(status, str) else False
+
+
+def _smart_reason(disk):
+    """Why this disk is failing, or None. One rule for summary and warnings."""
+    health = disk.get("health")
+    if isinstance(health, str) and health.strip() and health.upper() != "PASSED":
+        return "health", health.strip()
+    pending = _finite(disk.get("pending"))
+    if pending is not None and pending > 0:
+        return "pending", int(pending)
+    return None
+
+
+def _smart_failing(disk):
+    return _smart_reason(disk) is not None
+
+
+def _zfs_reason(pool):
+    """Why this pool is unhealthy, or None. Scrub age is a separate warning."""
+    state = pool.get("state")
+    if isinstance(state, str) and state.strip() and state.upper() != "ONLINE":
+        return "state", state.strip()
+    errors = _finite(pool.get("errors"))
+    if errors is not None and errors > 0:
+        return "errors", int(errors)
+    return None
+
+
+def _zfs_unhealthy(pool):
+    return _zfs_reason(pool) is not None
+
+
+def health_warnings(health, now):
+    """Warnings derived from the failure-mode blocks, in the usual shape.
+
+    The rules are deliberately conservative: a missing reading is not a
+    warning (the agent could not run the command), only a reported bad value
+    is. Pending updates are ``info`` so an available package does not turn the
+    rail amber.
+    """
+    if not isinstance(health, dict):
+        return []
+    warnings = []
+
+    for disk in health.get("smart") or []:
+        if not isinstance(disk, dict):
+            continue
+        reason = _smart_reason(disk)
+        if reason is None:
+            continue
+        field, value = reason
+        device = disk.get("device") or "disk"
+        if field == "health":
+            warnings.append({
+                "code": "smart", "level": "critical", "value": value,
+                "threshold": "PASSED", "text": f"SMART {device}: {value}",
+            })
+        else:
+            warnings.append({
+                "code": "smart", "level": "critical", "value": value,
+                "threshold": 0,
+                "text": f"SMART {device}: {value} pending sectors",
+            })
+
+    for pool in health.get("zfs") or []:
+        if not isinstance(pool, dict):
+            continue
+        name = pool.get("pool") or "pool"
+        reason = _zfs_reason(pool)
+        if reason is not None:
+            field, value = reason
+            if field == "state":
+                warnings.append({
+                    "code": "zfs", "level": "critical", "value": value,
+                    "threshold": "ONLINE", "text": f"ZFS {name}: {value}",
+                })
+            else:
+                warnings.append({
+                    "code": "zfs", "level": "critical", "value": value,
+                    "threshold": 0, "text": f"ZFS {name}: {value} errors",
+                })
+        scrub = _finite(pool.get("scrub_age_s"))
+        limit = WARN_ZFS_SCRUB_DAYS * 86400
+        if scrub is not None and scrub > limit:
+            warnings.append({
+                "code": "zfs_scrub", "level": "warning", "value": int(scrub),
+                "threshold": limit,
+                "text": f"ZFS {name}: scrub {_age_label(scrub)} old",
+            })
+
+    ups = health.get("ups")
+    if isinstance(ups, dict):
+        status = ups.get("status")
+        charge = _finite(ups.get("charge_pct"))
+        runtime = _finite(ups.get("runtime_s"))
+        if _ups_on_battery(status):
+            warnings.append({
+                "code": "ups", "level": "critical", "value": status.strip(),
+                "threshold": "OL",
+                "text": f"UPS on battery ({status.strip()})",
+            })
+        elif ups.get("battery_low") is True:
+            warnings.append({
+                "code": "ups", "level": "critical", "value": True,
+                "threshold": False, "text": "UPS battery low",
+            })
+        elif charge is not None and charge < WARN_UPS_CHARGE_PCT:
+            warnings.append({
+                "code": "ups", "level": "critical", "value": charge,
+                "threshold": WARN_UPS_CHARGE_PCT,
+                "text": f"UPS charge {charge:g}%",
+            })
+        elif runtime is not None and runtime < WARN_UPS_RUNTIME_S:
+            warnings.append({
+                "code": "ups", "level": "critical", "value": int(runtime),
+                "threshold": WARN_UPS_RUNTIME_S,
+                "text": f"UPS runtime {_age_label(runtime)}",
+            })
+
+    backup = health.get("backup")
+    if isinstance(backup, dict):
+        last = _finite(backup.get("last_success_ts"))
+        if last is not None:
+            age = now - last
+            limit = WARN_BACKUP_HOURS * 3600
+            if age > limit:
+                tool = backup.get("tool")
+                label = f"Backup ({tool})" if isinstance(tool, str) and tool else "Backup"
+                warnings.append({
+                    "code": "backup", "level": "warning", "value": int(age),
+                    "threshold": limit,
+                    "text": f"{label} {_age_label(age)} old",
+                })
+
+    updates = health.get("updates")
+    if isinstance(updates, dict):
+        if updates.get("reboot_required") is True:
+            warnings.append({
+                "code": "reboot", "level": "warning", "value": True,
+                "threshold": False, "text": "Reboot required",
+            })
+        pending = _finite(updates.get("pending"))
+        if pending is not None and pending > 0:
+            security = _finite(updates.get("security"))
+            suffix = (f" · {int(security)} security"
+                      if security is not None and security > 0 else "")
+            warnings.append({
+                "code": "updates", "level": "info", "value": int(pending),
+                "threshold": 0,
+                "text": f"{int(pending)} updates pending{suffix}",
+            })
+
+    return warnings
+
+
+def _health_summary(health, now):
+    """The compact per-device health block for the fleet summary."""
+    blocks = health if isinstance(health, dict) else {}
+    smart = [disk for disk in blocks.get("smart") or [] if isinstance(disk, dict)]
+    zfs = [pool for pool in blocks.get("zfs") or [] if isinstance(pool, dict)]
+    ups = blocks.get("ups") if isinstance(blocks.get("ups"), dict) else None
+    backup = blocks.get("backup") if isinstance(blocks.get("backup"), dict) else None
+    updates = blocks.get("updates") if isinstance(blocks.get("updates"), dict) else None
+
+    warnings = health_warnings(blocks, now)
+    levels = {warning["level"] for warning in warnings}
+    if not any(blocks.get(kind) for kind in HEALTH_KINDS):
+        status = "unknown"
+    elif "critical" in levels:
+        status = "critical"
+    elif "warning" in levels:
+        status = "warning"
+    else:
+        status = "ok"
+
+    backup_age = None
+    if backup is not None:
+        last = _finite(backup.get("last_success_ts"))
+        if last is not None:
+            backup_age = max(0, int(now - last))
+    charge = _finite(ups.get("charge_pct")) if ups else None
+    return {
+        "status": status,
+        "issues": sum(1 for warning in warnings if warning["level"] != "info"),
+        "smart_failing": sum(1 for disk in smart if _smart_failing(disk)),
+        "zfs_unhealthy": sum(1 for pool in zfs if _zfs_unhealthy(pool)),
+        "ups": ({
+            "status": ups.get("status"),
+            "on_battery": _ups_on_battery(ups.get("status")),
+            "charge_pct": charge,
+        } if ups else None),
+        "backup_age_s": backup_age,
+        "updates_pending": _finite(updates.get("pending")) if updates else None,
+        "reboot_required": bool(
+            updates and updates.get("reboot_required") is True
+        ),
+        "ts": blocks.get("ts"),
+    }
+
+
 def evaluate_warnings(device, now):
     """Curated per-device warnings from the summary fields.
 
@@ -1782,16 +2180,30 @@ def evaluate_warnings(device, now):
                 "text": f"Offline for {_duration_label(offline)}",
             })
 
+    warnings.extend(health_warnings(device.get("health"), now))
     return warnings
 
 
+def _alert_counts(warnings):
+    """(count, level) excluding info; an available update is not an alert."""
+    alerts = [warning for warning in warnings if warning.get("level") != "info"]
+    level = ("critical" if any(warning["level"] == "critical" for warning in alerts)
+             else ("warning" if alerts else None))
+    return len(alerts), level
+
+
 def live_warnings(device, now):
-    """The cheap dashboard-rail subset: live disk, RAM and offline duration."""
+    """The cheap dashboard-rail subset: live disk, RAM, offline and health.
+
+    Health blocks are already in the in-memory agent record, so this stays a
+    pure arithmetic check and never scans history on the 5 s stats poll.
+    """
     return evaluate_warnings({
         "disk_pct": device.get("disk_pct"),
         "mem_pct": device.get("mem_pct"),
         "online": device.get("online", True),
         "last_seen": device.get("last_seen"),
+        "health": device.get("health"),
     }, now)
 
 
@@ -2237,6 +2649,62 @@ def _latest_signals(con, device_id):
     return signals
 
 
+def _health_block(kind, blob):
+    """One stored block, re-validated on read; None when unusable."""
+    if kind not in HEALTH_KINDS:
+        return None
+    try:
+        payload = json.loads(blob)
+    except (TypeError, ValueError):
+        return None
+    cleaned = clean_health({kind: payload})
+    return cleaned.get(kind)
+
+
+def _latest_health(con, device_id):
+    """Latest cleaned block per kind, plus the newest snapshot timestamp.
+
+    Kinds are read independently: a heartbeat may report SMART but omit ZFS
+    because the command was missing, so the last known pool state is still
+    useful. A device with no health rows gets ``{"ts": None}``.
+    """
+    rows = con.execute(
+        "SELECT h.kind, h.ts, h.payload_json FROM device_health h "
+        "WHERE h.device_id = ? AND h.ts = ("
+        "  SELECT MAX(h2.ts) FROM device_health h2 "
+        "  WHERE h2.device_id = h.device_id AND h2.kind = h.kind)",
+        (device_id,),
+    ).fetchall()
+    out = {"ts": None}
+    for kind, ts, blob in rows:
+        block = _health_block(kind, blob)
+        if block is None:
+            continue
+        out[kind] = block
+        out["ts"] = ts if out["ts"] is None else max(out["ts"], int(ts))
+    return out
+
+
+def _health_history(con, device_id, since, until, limit=HEALTH_HISTORY_LIMIT):
+    """The last ``limit`` health snapshots in the window, oldest first."""
+    rows = con.execute(
+        "SELECT ts, kind, payload_json FROM device_health "
+        "WHERE device_id = ? AND ts >= ? AND ts <= ? AND ts IN ("
+        "  SELECT DISTINCT ts FROM device_health "
+        "  WHERE device_id = ? AND ts >= ? AND ts <= ? "
+        "  ORDER BY ts DESC LIMIT ?) "
+        "ORDER BY ts, kind",
+        (device_id, int(since), int(until),
+         device_id, int(since), int(until), int(limit)),
+    ).fetchall()
+    snapshots = {}
+    for ts, kind, blob in rows:
+        block = _health_block(kind, blob)
+        if block is not None:
+            snapshots.setdefault(int(ts), {})[kind] = block
+    return [{"ts": ts, **snapshots[ts]} for ts in sorted(snapshots)]
+
+
 def _stored_annotations(con, device_id, since, until):
     """Device-specific plus fleet-wide annotations inside the window."""
     rows = con.execute(
@@ -2317,6 +2785,7 @@ def metrics_summary(window=DEFAULT_WINDOW, now=None):
             view = read_window_summary(con, device_id, since, now, step)
             payload["source"] = view["source"]
             state = live.get(device_id, {})
+            health = _latest_health(con, device_id)
             entry = {
                 "id": device_id,
                 "name": name,
@@ -2326,10 +2795,18 @@ def metrics_summary(window=DEFAULT_WINDOW, now=None):
                 "spark": spark,
                 "volumes": _volume_summary(view["volumes"]),
                 "signals": _latest_signals(con, device_id),
+                "health": _health_summary(health, now),
                 **view["summary"],
                 "source": view["source"],
             }
-            entry["warnings"] = evaluate_warnings(entry, now)
+            # Evaluate against the full blocks, then serialise only the compact
+            # summary so the fleet payload does not grow with disk count.
+            entry["warnings"] = evaluate_warnings(
+                {**entry, "health": health}, now
+            )
+            entry["warning_count"], entry["warning_level"] = _alert_counts(
+                entry["warnings"]
+            )
             payload["devices"].append(entry)
     finally:
         con.close()
@@ -2354,6 +2831,7 @@ def metrics_series(device_id, window=DEFAULT_WINDOW, requested_step=None, now=No
         "device": None, "summary": _empty_summary(), "points": [],
         "bands": {"cpu": [], "mem": [], "disk": []}, "volumes": [],
         "signals": {}, "annotations": [], "warnings": [], "events": [],
+        "health": {"ts": None}, "health_history": [],
     }
     if not METRICS_FILE.exists():
         if device_id:
@@ -2370,6 +2848,8 @@ def metrics_series(device_id, window=DEFAULT_WINDOW, requested_step=None, now=No
             return None
         view = read_window(con, device_id, since, now, step)
         stored = _stored_annotations(con, device_id, since, now)
+        health = _latest_health(con, device_id)
+        health_history = _health_history(con, device_id, since, now)
     finally:
         con.close()
     state = live.get(device_id, {})
@@ -2400,10 +2880,13 @@ def metrics_series(device_id, window=DEFAULT_WINDOW, requested_step=None, now=No
     payload["signals"] = view["signals"]
     payload["annotations"] = annotations
     payload["events"] = events[:20]
+    payload["health"] = health
+    payload["health_history"] = health_history
     payload["warnings"] = evaluate_warnings({
         **view["summary"],
         "online": payload["device"]["online"],
         "last_seen": payload["device"]["last_seen"],
+        "health": health,
     }, now)
     return payload
 
@@ -2423,11 +2906,10 @@ def stats():
         device["availability_24h"] = availability.get(device["id"])
         # The rail indicator is deliberately the cheap live subset: no history
         # scan on a 5 s poll. The metrics page carries the full warning set.
-        warnings = live_warnings(device, now)
-        device["warning_count"] = len(warnings)
-        device["warning_level"] = (
-            "critical" if any(warning["level"] == "critical" for warning in warnings)
-            else ("warning" if warnings else None)
+        # An available update is info, not an alert: it must not turn the chip
+        # on for every healthy machine.
+        device["warning_count"], device["warning_level"] = _alert_counts(
+            live_warnings(device, now)
         )
     body = {
         "generated": int(now),
@@ -2761,6 +3243,24 @@ class Handler(BaseHTTPRequestHandler):
                 if k in payload})
             if "disks" in payload:
                 rec["disks"] = clean_disks(payload["disks"])
+            # Health blocks replace per kind, only when that key was sent. A
+            # command that failed is omitted by the agent, so the last known
+            # reading (and a stale backup age) stays visible instead of
+            # silently disappearing. An explicit empty block clears it.
+            if isinstance(payload, dict):
+                present = [kind for kind in HEALTH_KINDS if kind in payload]
+                if present:
+                    cleaned = clean_health(payload)
+                    current = dict(rec.get("health") or {})
+                    for kind in present:
+                        if kind in cleaned:
+                            current[kind] = cleaned[kind]
+                        else:
+                            current.pop(kind, None)
+                    if current:
+                        rec["health"] = current
+                    else:
+                        rec.pop("health", None)
             for key in CONTAINER_FIELDS:
                 cleaned = clean_text(payload.get(key))
                 if cleaned:

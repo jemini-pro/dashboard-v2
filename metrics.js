@@ -50,6 +50,9 @@ const chartVolumeTableEl = document.getElementById('chart-volume-table');
 const signalStripEl = document.getElementById('signal-strip');
 const signalSubEl = document.getElementById('signal-sub');
 const signalTilesEl = document.getElementById('signal-tiles');
+const healthSectionEl = document.getElementById('health-section');
+const healthSubEl = document.getElementById('health-sub');
+const healthBodyEl = document.getElementById('health-body');
 const deviceListEl = document.getElementById('device-list');
 const devicesSubEl = document.getElementById('devices-sub');
 const eventsEl = document.getElementById('events');
@@ -286,10 +289,20 @@ function deviceItem(device) {
         : '—';
     // State is text as well as a dot: colour and opacity never carry it alone.
     const stateText = kindLabel(device.kind) + ' · ' + (device.online ? 'online' : 'offline');
-    const warningCount = Array.isArray(device.warnings) ? device.warnings.length : 0;
+    // The summary now stamps alert counts that exclude info (an available
+    // update is not an alert); fall back to the warnings list on older payloads.
+    const warningList = Array.isArray(device.warnings) ? device.warnings : [];
+    const alerts = warningList.filter((warning) => warning.level !== 'info');
+    const warningCount = isNumber(device.warning_count)
+        ? device.warning_count
+        : alerts.length;
+    const critical = device.warning_level === 'critical' ||
+        alerts.some((warning) => warning.level === 'critical');
     const warning = warningCount
-        ? '<span class="device-item-warn" title="' + warningCount +
-          ' active warning(s)">' + warningCount + 'w</span>'
+        ? '<span class="device-item-warn' + (critical ? ' is-critical' : '') +
+          '" title="' + warningCount + ' active warning(s)' +
+          (critical ? ', critical' : '') + '">' + warningCount + 'w' +
+          (critical ? '!' : '') + '</span>'
         : '';
     return '<button type="button" class="device-item' + (selected ? ' is-selected' : '') + '" ' +
         'data-device="' + escapeHtml(device.id) + '" aria-pressed="' + String(selected) + '">' +
@@ -727,6 +740,157 @@ function renderSignals() {
         .map(({ def, data }) => signalTile(def, data)).join('');
 }
 
+// ---------- health ----------
+
+function healthBadge(text, level) {
+    return '<span class="health-badge is-' + level + '">' + escapeHtml(text) + '</span>';
+}
+
+function healthNumber(value, suffix) {
+    return isNumber(value) ? Math.round(value) + (suffix || '') : '—';
+}
+
+function healthAge(seconds) {
+    if (!isNumber(seconds)) return '—';
+    const value = Math.max(0, Math.round(seconds));
+    if (value >= 3 * 86400) return Math.round(value / 86400) + 'd';
+    if (value >= 3600) return Math.round(value / 3600) + 'h';
+    return Math.max(1, Math.round(value / 60)) + 'm';
+}
+
+function smartRow(disk) {
+    const status = typeof disk.health === 'string' ? disk.health.trim() : '';
+    const pending = isNumber(disk.pending) ? disk.pending : null;
+    const statusBad = status && status.toUpperCase() !== 'PASSED';
+    const pendingBad = pending !== null && pending > 0;
+    const label = statusBad ? status : (pendingBad ? 'PENDING' : (status || 'unknown'));
+    return '<tr' + (statusBad || pendingBad ? ' class="is-critical"' : '') + '>' +
+        '<td>' + escapeHtml(disk.device) + '</td>' +
+        '<td>' + healthBadge(label, statusBad || pendingBad ? 'critical' : 'ok') + '</td>' +
+        '<td>' + escapeHtml(healthNumber(disk.temperature_c, '°C')) + '</td>' +
+        '<td>' + escapeHtml(healthNumber(disk.reallocated)) + '</td>' +
+        '<td' + (pendingBad ? ' class="is-critical"' : '') + '>' +
+        escapeHtml(healthNumber(pending)) + '</td>' +
+        '<td>' + escapeHtml(healthNumber(disk.power_on_hours, ' h')) + '</td>' +
+        '</tr>';
+}
+
+function zfsRow(pool) {
+    const state = typeof pool.state === 'string' ? pool.state.trim() : '';
+    const errors = isNumber(pool.errors) ? pool.errors : null;
+    const stateBad = state && state.toUpperCase() !== 'ONLINE';
+    const errorsBad = errors !== null && errors > 0;
+    const label = stateBad ? state : (errorsBad ? 'ERRORS' : (state || 'unknown'));
+    return '<tr' + (stateBad || errorsBad ? ' class="is-critical"' : '') + '>' +
+        '<td>' + escapeHtml(pool.pool) + '</td>' +
+        '<td>' + healthBadge(label, stateBad || errorsBad ? 'critical' : 'ok') + '</td>' +
+        '<td>' + pct(pool.capacity_pct) + '</td>' +
+        '<td>' + (isNumber(pool.scrub_age_s)
+            ? escapeHtml(healthAge(pool.scrub_age_s)) + ' ago' : '—') + '</td>' +
+        '<td' + (errorsBad ? ' class="is-critical"' : '') + '>' +
+        escapeHtml(healthNumber(errors)) + '</td>' +
+        '</tr>';
+}
+
+function healthTable(title, count, headings, rows) {
+    return '<section class="health-block" aria-label="' + escapeHtml(title) + '">' +
+        '<div class="health-head">' +
+        '<h3 class="volume-heading">' + escapeHtml(title) + '</h3>' +
+        '<span class="card-sub">' + count + '</span></div>' +
+        '<div class="volume-scroll"><table class="health-table"><thead><tr>' +
+        headings.map((heading) => '<th scope="col">' + escapeHtml(heading) + '</th>').join('') +
+        '</tr></thead><tbody>' + rows + '</tbody></table></div></section>';
+}
+
+function upsTile(ups, history) {
+    const tokens = typeof ups.status === 'string'
+        ? ups.status.toUpperCase().split(/\s+/) : [];
+    const onBattery = tokens.includes('OB') || ups.battery_low === true;
+    const known = typeof ups.status === 'string' && ups.status.trim();
+    let badge = '';
+    if (ups.battery_low === true) badge = healthBadge('BATTERY LOW', 'critical');
+    else if (known) badge = healthBadge(onBattery ? 'ON BATTERY' : 'ONLINE',
+        onBattery ? 'critical' : 'ok');
+    // The short history the API carries earns its place here: a charge
+    // sparkline is the one trend a dense tile can show.
+    const charges = (history || []).map((entry) =>
+        entry.ups ? entry.ups.charge_pct : null);
+    const spark = sparkSvg(charges);
+    return '<div class="health-tile">' +
+        '<span class="health-label">UPS</span>' +
+        '<span class="health-value">' + escapeHtml(ups.status || '—') + '</span>' +
+        badge +
+        '<span class="health-meta">' + pct(ups.charge_pct) + ' charge · ' +
+        (isNumber(ups.runtime_s) ? healthAge(ups.runtime_s) : '—') + ' runtime · ' +
+        pct(ups.load_pct) + ' load</span>' +
+        (spark ? '<span class="signal-spark">' + spark + '</span>' : '') +
+        '</div>';
+}
+
+function backupTile(backup) {
+    const age = isNumber(backup.last_success_ts)
+        ? Math.max(0, Date.now() / 1000 - backup.last_success_ts)
+        : null;
+    return '<div class="health-tile">' +
+        '<span class="health-label">Backup</span>' +
+        '<span class="health-value">' + (age === null ? '—' : healthAge(age) + ' ago') + '</span>' +
+        '<span class="health-meta">' + escapeHtml(backup.tool || 'last success') + '</span></div>';
+}
+
+function updatesTile(updates) {
+    // Missing counts stay missing: a reboot-only block must not render
+    // "0 pending · 0 security" as if the agent had measured them.
+    const pending = isNumber(updates.pending) ? updates.pending : null;
+    const security = isNumber(updates.security) ? updates.security : null;
+    const value = updates.reboot_required
+        ? 'Reboot required'
+        : (pending === null ? '—' : (pending ? pending + ' pending' : 'Up to date'));
+    const meta = [];
+    if (pending !== null) meta.push(pending + ' pending');
+    if (security !== null) meta.push(security + ' security');
+    return '<div class="health-tile">' +
+        '<span class="health-label">Updates</span>' +
+        '<span class="health-value">' + escapeHtml(value) + '</span>' +
+        (updates.reboot_required ? healthBadge('REBOOT', 'warning') : '') +
+        (meta.length ? '<span class="health-meta">' +
+            escapeHtml(meta.join(' · ')) + '</span>' : '') +
+        '</div>';
+}
+
+function renderHealthSection() {
+    const health = series && series.health;
+    const smart = health && Array.isArray(health.smart) ? health.smart : [];
+    const zfs = health && Array.isArray(health.zfs) ? health.zfs : [];
+    const history = series && Array.isArray(series.health_history)
+        ? series.health_history : [];
+    const hasHealth = !!(health && (smart.length || zfs.length ||
+        health.ups || health.backup || health.updates));
+    healthSectionEl.hidden = !hasHealth;
+    if (!hasHealth) {
+        healthBodyEl.innerHTML = '';
+        healthSubEl.textContent = '';
+        return;
+    }
+    const blocks = [];
+    if (smart.length) {
+        blocks.push(healthTable('SMART', smart.length + ' devices',
+            ['Device', 'Health', 'Temperature', 'Reallocated', 'Pending', 'Power-on'],
+            smart.map(smartRow).join('')));
+    }
+    if (zfs.length) {
+        blocks.push(healthTable('ZFS', zfs.length + ' pools',
+            ['Pool', 'State', 'Used', 'Last scrub', 'Errors'],
+            zfs.map(zfsRow).join('')));
+    }
+    const tiles = [];
+    if (health.ups) tiles.push(upsTile(health.ups, history));
+    if (health.backup) tiles.push(backupTile(health.backup));
+    if (health.updates) tiles.push(updatesTile(health.updates));
+    if (tiles.length) blocks.push('<div class="health-tiles">' + tiles.join('') + '</div>');
+    healthBodyEl.innerHTML = blocks.join('');
+    healthSubEl.textContent = isNumber(health.ts) ? 'sampled ' + hhmm(health.ts) : '';
+}
+
 // ---------- table and events ----------
 
 function tableCells(point, index) {
@@ -842,6 +1006,7 @@ async function load(full) {
         renderChart();
         renderSignals();
         renderVolumes();
+        renderHealthSection();
         renderEvents();
         if (tableViewEl.open) renderTable();
         setStale(false);

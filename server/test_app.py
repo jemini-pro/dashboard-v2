@@ -3803,3 +3803,525 @@ class ServiceChecksUiTest(FrontEndSourceTest):
             self.assertNotIn("fonts.googleapis.com", source)
             self.assertNotIn("<img", source)
             self.assertNotIn("@font-face", source)
+
+
+class HealthPayloadCleaningTest(unittest.TestCase):
+    """The agent wire blocks are untrusted input: clean, clamp, drop junk."""
+
+    def test_smart_cleans_valid_fields_and_drops_malformed_entries(self):
+        cleaned = app.clean_smart([
+            {"device": "/dev/sda", "health": "PASSED", "temperature_c": 34,
+             "reallocated": 0, "pending": 0, "power_on_hours": 12000},
+            {"device": "  ", "health": "FAILED"},
+            {"health": "FAILED"},
+            "not a dict",
+            {"device": "/dev/sdb", "health": 7, "temperature_c": -5,
+             "reallocated": -2, "pending": True, "power_on_hours": "9"},
+        ])
+        self.assertEqual(cleaned, [
+            {"device": "/dev/sda", "health": "PASSED", "temperature_c": 34.0,
+             "reallocated": 0, "pending": 0, "power_on_hours": 12000},
+            # A negative temperature is not a reading; the row keeps only the
+            # identifier rather than fabricating 0 °C.
+            {"device": "/dev/sdb"},
+        ])
+
+    def test_smart_clamps_and_caps(self):
+        raw = [{"device": "/dev/sd%d" % i, "temperature_c": 999999,
+                "reallocated": 10 ** 15, "pending": 10 ** 15,
+                "power_on_hours": 10 ** 15}
+               for i in range(20)]
+        cleaned = app.clean_smart(raw)
+        self.assertEqual(len(cleaned), app.MAX_HEALTH_ITEMS)
+        self.assertEqual(cleaned[0]["temperature_c"], 200.0)
+        self.assertEqual(cleaned[0]["reallocated"], app.MAX_HEALTH_COUNT)
+        self.assertEqual(cleaned[0]["pending"], app.MAX_HEALTH_COUNT)
+        self.assertEqual(cleaned[0]["power_on_hours"], app.MAX_HEALTH_COUNT)
+
+    def test_zfs_cleans_clamps_and_requires_a_pool(self):
+        cleaned = app.clean_zfs([
+            {"pool": "tank", "state": "ONLINE", "capacity_pct": 42.5,
+             "scrub_age_s": 3600, "errors": 0},
+            {"pool": "", "state": "ONLINE"},
+            {"state": "ONLINE"},
+            {"pool": "doomed", "state": 5, "capacity_pct": 140,
+             "scrub_age_s": -1, "errors": 10 ** 15},
+        ])
+        self.assertEqual(cleaned, [
+            {"pool": "tank", "state": "ONLINE", "capacity_pct": 42.5,
+             "scrub_age_s": 3600, "errors": 0},
+            {"pool": "doomed", "capacity_pct": 100.0,
+             "errors": app.MAX_HEALTH_COUNT},
+        ])
+        self.assertEqual(len(app.clean_zfs(
+            [{"pool": "p%d" % i} for i in range(20)])), app.MAX_HEALTH_ITEMS)
+
+    def test_ups_is_a_single_clamped_object_or_none(self):
+        self.assertEqual(app.clean_ups({
+            "status": "OL", "charge_pct": 120, "runtime_s": -1,
+            "load_pct": -5, "battery_low": True,
+        }), {"status": "OL", "charge_pct": 100.0, "battery_low": True})
+        self.assertIsNone(app.clean_ups({}))
+        self.assertIsNone(app.clean_ups({"charge_pct": "90"}))
+        self.assertIsNone(app.clean_ups(["not", "an", "object"]))
+
+    def test_backup_requires_a_positive_absolute_timestamp(self):
+        self.assertEqual(
+            app.clean_backup({"last_success_ts": 1700000000, "tool": "restic"}),
+            {"last_success_ts": 1700000000, "tool": "restic"},
+        )
+        for raw in ({}, {"last_success_ts": 0}, {"last_success_ts": -5},
+                    {"last_success_ts": "yesterday"}, {"last_success_ts": True},
+                    None):
+            self.assertIsNone(app.clean_backup(raw), raw)
+
+    def test_updates_are_clamped_counters_and_a_real_bool(self):
+        self.assertEqual(
+            app.clean_updates({"pending": 5, "security": 2,
+                               "reboot_required": True}),
+            {"pending": 5, "security": 2, "reboot_required": True},
+        )
+        self.assertEqual(
+            app.clean_updates({"pending": 10 ** 15, "security": -1,
+                               "reboot_required": "yes"}),
+            {"pending": app.MAX_HEALTH_COUNT},
+        )
+        self.assertIsNone(app.clean_updates({}))
+        self.assertIsNone(app.clean_updates("pending"))
+
+    def test_clean_health_keeps_only_present_nonempty_blocks(self):
+        cleaned = app.clean_health({
+            "smart": [{"device": "/dev/sda", "health": "PASSED"}],
+            "zfs": [],
+            "ups": {"status": "OL", "charge_pct": 100},
+            "backup": {"last_success_ts": 1700000000},
+            "updates": {"pending": 3},
+        })
+        self.assertEqual(set(cleaned), {"smart", "ups", "backup", "updates"})
+        self.assertEqual(cleaned["smart"][0]["device"], "/dev/sda")
+        self.assertEqual(app.clean_health({"smart": "nope", "ups": []}), {})
+        self.assertEqual(app.clean_health(None), {})
+
+
+class HealthStorageTest(ApiTestCase):
+    """device_health keeps one row per device/kind per bucket, like volumes."""
+
+    BASE = int(NOW) - (int(NOW) % 3600)
+
+    def device(self, health=None, device_id="agent:healthhost", **extra):
+        record = {
+            "id": device_id, "name": "healthhost", "kind": "pc",
+            "online": True, "cpu_pct": 1.0, "mem_pct": 2.0,
+            "mem_used": 1, "mem_total": 2, "disk_pct": 3.0,
+            "uptime_s": 4, "last_seen": self.BASE,
+        }
+        if health is not None:
+            record["health"] = health
+        record.update(extra)
+        return record
+
+    def sample(self, health, now):
+        app.record_samples([self.device(health)], now=now)
+
+    def health_rows(self, device_id="agent:healthhost"):
+        con = app._connect_metrics()
+        try:
+            return con.execute(
+                "SELECT ts, kind, payload_json FROM device_health "
+                "WHERE device_id = ? ORDER BY ts, kind", (device_id,)
+            ).fetchall()
+        finally:
+            con.close()
+
+    def test_each_cleaned_block_is_one_row_in_the_sample_bucket(self):
+        self.sample({
+            "smart": [{"device": "/dev/sda", "health": "PASSED", "pending": 0}],
+            "zfs": [{"pool": "tank", "state": "ONLINE", "errors": 0}],
+            "ups": {"status": "OL", "charge_pct": 100},
+            "backup": {"last_success_ts": self.BASE - 3600, "tool": "restic"},
+            "updates": {"pending": 2, "reboot_required": False},
+        }, now=self.BASE + 10)
+
+        rows = self.health_rows()
+        self.assertEqual([row[1] for row in rows],
+                         ["backup", "smart", "updates", "ups", "zfs"])
+        self.assertTrue(all(row[0] == self.BASE for row in rows))
+        payloads = {kind: json.loads(blob) for _ts, kind, blob in rows}
+        self.assertEqual(payloads["smart"][0]["device"], "/dev/sda")
+        self.assertEqual(payloads["backup"]["last_success_ts"],
+                         self.BASE - 3600)
+
+    def test_a_repeat_inside_the_bucket_replaces_the_health_rows(self):
+        self.sample({"smart": [{"device": "/dev/sda", "health": "PASSED"}],
+                     "zfs": [{"pool": "tank", "state": "ONLINE"}]}, now=self.BASE)
+        self.sample({"smart": [{"device": "/dev/sda", "health": "FAILED"}]},
+                    now=self.BASE + 30)
+
+        rows = self.health_rows()
+        self.assertEqual([row[1] for row in rows], ["smart"])
+        self.assertEqual(json.loads(rows[0][2])[0]["health"], "FAILED")
+
+    def test_latest_health_is_kept_per_kind_and_history_is_bounded(self):
+        self.sample({"smart": [{"device": "/dev/sda", "health": "PASSED"}],
+                     "zfs": [{"pool": "tank", "state": "ONLINE"}]}, now=self.BASE)
+        self.sample({"smart": [{"device": "/dev/sda", "health": "FAILED"}]},
+                    now=self.BASE + 60)
+        self.sample({"smart": [{"device": "/dev/sda", "health": "PASSED"}]},
+                    now=self.BASE + 120)
+
+        con = app._connect_metrics()
+        try:
+            latest = app._latest_health(con, "agent:healthhost")
+            history = app._health_history(
+                con, "agent:healthhost", self.BASE - 60, self.BASE + 180, limit=2
+            )
+        finally:
+            con.close()
+
+        self.assertEqual(latest["ts"], self.BASE + 120)
+        self.assertEqual(latest["smart"][0]["health"], "PASSED")
+        self.assertEqual(latest["zfs"][0]["pool"], "tank")  # last known
+        self.assertEqual([entry["ts"] for entry in history],
+                         [self.BASE + 60, self.BASE + 120])
+        self.assertEqual(history[0]["smart"][0]["health"], "FAILED")
+
+    def test_retention_prunes_health_rows_with_the_other_raw_tables(self):
+        self.sample({"smart": [{"device": "/dev/sda", "health": "PASSED"}]},
+                    now=self.BASE - app.HISTORY_SECONDS - 600)
+        self.assertEqual(len(self.health_rows()), 1)
+
+        app._last_prune["at"] = 0.0
+        self.sample({"smart": [{"device": "/dev/sda", "health": "PASSED"}]},
+                    now=self.BASE)
+
+        rows = self.health_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertGreaterEqual(rows[0][0], self.BASE - 60)
+
+    def test_a_push_keeps_the_last_reading_for_a_kind_it_did_not_report(self):
+        first = {"name": "healthhost", "kind": "pc", "cpu_pct": 1.0,
+                 "smart": [{"device": "/dev/sda", "health": "FAILED"}],
+                 "backup": {"last_success_ts": self.BASE - 3600}}
+        second = {"name": "healthhost", "kind": "pc", "cpu_pct": 2.0,
+                  "smart": [{"device": "/dev/sda", "health": "PASSED"}]}
+        third = {"name": "healthhost", "kind": "pc", "cpu_pct": 3.0,
+                 "backup": []}
+
+        self.post(json.dumps(first).encode(), "/api/push/healthhost")
+        self.post(json.dumps(second).encode(), "/api/push/healthhost")
+        health = app.load_agents()["healthhost"]["health"]
+        self.assertEqual(health["smart"][0]["health"], "PASSED")
+        self.assertEqual(health["backup"]["last_success_ts"], self.BASE - 3600)
+
+        self.post(json.dumps(third).encode(), "/api/push/healthhost")
+        health = app.load_agents()["healthhost"]["health"]
+        self.assertNotIn("backup", health)
+        self.assertIn("smart", health)
+
+    def test_an_old_agent_with_no_health_blocks_still_pushes(self):
+        body = {"name": "plain", "kind": "pc", "cpu_pct": 1.0, "mem_pct": 2.0,
+                "disk_pct": 3.0, "uptime_s": 4}
+        status, _ = self.post(json.dumps(body).encode(), "/api/push/plain")
+        self.assertEqual(status, 200)
+        self.assertNotIn("health", app.load_agents()["plain"])
+
+
+class HealthWarningTest(unittest.TestCase):
+    """Curated failure-mode warnings, in the existing evaluate_warnings shape."""
+
+    NOW = int(NOW)
+
+    def codes(self, health, now=None):
+        return {warning["code"]: warning
+                for warning in app.health_warnings(health, now or self.NOW)}
+
+    def test_healthy_smart_and_zfs_produce_no_warning(self):
+        self.assertEqual(self.codes({
+            "smart": [{"device": "/dev/sda", "health": "PASSED", "pending": 0}],
+            "zfs": [{"pool": "tank", "state": "ONLINE", "errors": 0,
+                     "scrub_age_s": 30 * 86400}],
+        }), {})
+
+    def test_smart_failure_or_pending_sectors_is_critical(self):
+        failed = self.codes({"smart": [
+            {"device": "/dev/sda", "health": "FAILED", "pending": 0}]})["smart"]
+        self.assertEqual(failed["level"], "critical")
+        self.assertIn("/dev/sda", failed["text"])
+
+        pending = self.codes({"smart": [
+            {"device": "/dev/sdb", "health": "PASSED", "pending": 2}]})["smart"]
+        self.assertEqual(pending["level"], "critical")
+        self.assertIn("2 pending", pending["text"])
+
+    def test_zfs_state_and_errors_are_critical_and_an_old_scrub_warns(self):
+        degraded = self.codes({"zfs": [
+            {"pool": "tank", "state": "DEGRADED"}]})["zfs"]
+        self.assertEqual(degraded["level"], "critical")
+
+        errors = self.codes({"zfs": [
+            {"pool": "tank", "state": "ONLINE", "errors": 3}]})["zfs"]
+        self.assertEqual(errors["level"], "critical")
+        self.assertIn("3 errors", errors["text"])
+
+        scrub = self.codes({"zfs": [
+            {"pool": "tank", "state": "ONLINE", "errors": 0,
+             "scrub_age_s": 31 * 86400}]})["zfs_scrub"]
+        self.assertEqual(scrub["level"], "warning")
+        self.assertIn("31d", scrub["text"])
+
+    def test_ups_on_battery_low_charge_or_short_runtime_is_critical(self):
+        on_battery = self.codes({"ups": {"status": "OB DISCHRG",
+                                        "charge_pct": 80}})["ups"]
+        self.assertEqual(on_battery["level"], "critical")
+        self.assertIn("battery", on_battery["text"])
+
+        self.assertEqual(self.codes(
+            {"ups": {"status": "OL", "charge_pct": 20}})["ups"]["level"],
+            "critical")
+        self.assertEqual(self.codes(
+            {"ups": {"status": "OL", "runtime_s": 120}})["ups"]["level"],
+            "critical")
+        self.assertEqual(self.codes(
+            {"ups": {"status": "OL", "battery_low": True}})["ups"]["level"],
+            "critical")
+        self.assertEqual(self.codes(
+            {"ups": {"status": "OL", "charge_pct": 100,
+                     "runtime_s": 1200}}), {})
+
+    def test_a_stale_backup_warns_and_a_fresh_or_future_one_does_not(self):
+        stale = self.codes({"backup": {
+            "last_success_ts": self.NOW - 40 * 3600, "tool": "restic"}})["backup"]
+        self.assertEqual(stale["level"], "warning")
+        self.assertIn("40h", stale["text"])
+        self.assertIn("restic", stale["text"])
+
+        self.assertEqual(self.codes({"backup": {
+            "last_success_ts": self.NOW - 30 * 3600}}), {})
+        self.assertEqual(self.codes({"backup": {
+            "last_success_ts": self.NOW + 3600}}), {})
+
+    def test_pending_updates_are_info_and_a_required_reboot_warns(self):
+        pending = self.codes({"updates": {"pending": 3, "security": 2}})
+        self.assertEqual(pending["updates"]["level"], "info")
+        self.assertIn("2 security", pending["updates"]["text"])
+
+        reboot = self.codes({"updates": {"reboot_required": True}})
+        self.assertEqual(reboot["reboot"]["level"], "warning")
+
+        both = self.codes({"updates": {"pending": 1, "reboot_required": True}})
+        self.assertEqual(set(both), {"updates", "reboot"})
+
+    def test_evaluate_warnings_appends_health_warnings(self):
+        warnings = app.evaluate_warnings({
+            "online": True,
+            "health": {"smart": [{"device": "/dev/sda", "health": "FAILED"}]},
+        }, self.NOW)
+        self.assertEqual([warning["code"] for warning in warnings], ["smart"])
+        for key in ("code", "level", "value", "threshold", "text"):
+            self.assertIn(key, warnings[0])
+
+    def test_health_summary_is_compact_and_status_ignores_info(self):
+        healthy = app._health_summary({
+            "ts": self.NOW,
+            "smart": [{"device": "/dev/sda", "health": "PASSED", "pending": 0}],
+        }, self.NOW)
+        self.assertEqual(healthy["status"], "ok")
+        self.assertEqual(healthy["smart_failing"], 0)
+        self.assertEqual(healthy["ts"], self.NOW)
+
+        info = app._health_summary({"updates": {"pending": 4}}, self.NOW)
+        self.assertEqual(info["status"], "ok")
+        self.assertEqual(info["updates_pending"], 4)
+        self.assertEqual(info["issues"], 0)
+
+        critical = app._health_summary({
+            "smart": [{"device": "/dev/sda", "health": "FAILED"}],
+            "zfs": [{"pool": "tank", "state": "ONLINE", "errors": 1}],
+            "ups": {"status": "OB", "charge_pct": 10},
+            "backup": {"last_success_ts": self.NOW - 48 * 3600},
+        }, self.NOW)
+        self.assertEqual(critical["status"], "critical")
+        self.assertEqual(critical["smart_failing"], 1)
+        self.assertEqual(critical["zfs_unhealthy"], 1)
+        self.assertTrue(critical["ups"]["on_battery"])
+        self.assertEqual(critical["backup_age_s"], 48 * 3600)
+        self.assertEqual(critical["issues"], 4)
+
+        self.assertEqual(app._health_summary({"ts": None}, self.NOW)["status"],
+                         "unknown")
+
+
+class HealthApiTest(ApiTestCase):
+    """The health blocks are additive: latest block, compact summary, chips."""
+
+    BASE = int(NOW) - (int(NOW) % 3600)
+
+    def device(self, health=None, device_id="agent:healthapi", **extra):
+        record = {
+            "id": device_id, "name": "healthapi", "kind": "pc",
+            "online": True, "cpu_pct": 1.0, "mem_pct": 2.0,
+            "mem_used": 1, "mem_total": 2, "disk_pct": 3.0,
+            "uptime_s": 4, "last_seen": self.BASE,
+        }
+        if health is not None:
+            record["health"] = health
+        record.update(extra)
+        return record
+
+    def failing_health(self):
+        return {
+            "smart": [{"device": "/dev/sda", "health": "FAILED", "pending": 2}],
+            "zfs": [{"pool": "tank", "state": "DEGRADED", "errors": 1,
+                     "scrub_age_s": 40 * 86400}],
+            "ups": {"status": "OB", "charge_pct": 10, "runtime_s": 120},
+            "backup": {"last_success_ts": self.BASE - 48 * 3600,
+                       "tool": "restic"},
+            "updates": {"pending": 3, "security": 1, "reboot_required": True},
+        }
+
+    def test_metrics_series_carries_the_latest_health_and_a_short_history(self):
+        app.record_samples([self.device(self.failing_health())], now=self.BASE)
+        app.record_samples([self.device(self.failing_health())],
+                           now=self.BASE + 60)
+
+        payload = app.metrics_series("agent:healthapi", "1h", 60,
+                                     now=self.BASE + 60)
+        health = payload["health"]
+        self.assertEqual(health["ts"], self.BASE + 60)
+        self.assertEqual(health["smart"][0]["device"], "/dev/sda")
+        self.assertEqual(health["zfs"][0]["pool"], "tank")
+        self.assertEqual(payload["health_history"][-1]["ts"], self.BASE + 60)
+        codes = {warning["code"] for warning in payload["warnings"]}
+        for code in ("smart", "zfs", "zfs_scrub", "ups", "backup", "reboot",
+                     "updates"):
+            self.assertIn(code, codes)
+
+    def test_an_old_device_has_an_empty_health_block_and_no_fabricated_rows(self):
+        app.record_samples([self.device()], now=self.BASE)
+        payload = app.metrics_series("agent:healthapi", "1h", 60,
+                                     now=self.BASE + 60)
+        self.assertEqual(payload["health"], {"ts": None})
+        self.assertEqual(payload["health_history"], [])
+        self.assertFalse(any(warning["code"] in app.HEALTH_KINDS
+                             for warning in payload["warnings"]))
+
+    def test_summary_carries_a_compact_health_status_and_alert_chip(self):
+        app.record_samples([self.device(self.failing_health())], now=self.BASE)
+
+        entry = app.metrics_summary("1h", now=self.BASE + 60)["devices"][0]
+        health = entry["health"]
+        self.assertEqual(health["status"], "critical")
+        self.assertEqual(health["smart_failing"], 1)
+        self.assertEqual(health["zfs_unhealthy"], 1)
+        self.assertTrue(health["ups"]["on_battery"])
+        self.assertEqual(health["updates_pending"], 3)
+        self.assertTrue(health["reboot_required"])
+        self.assertEqual(health["issues"], 6)
+        self.assertEqual(entry["warning_count"], 6)
+        self.assertEqual(entry["warning_level"], "critical")
+        # The full blocks stay out of the fleet payload.
+        self.assertNotIn("smart", health)
+
+    def test_info_only_updates_do_not_turn_the_warning_chip_on(self):
+        app.record_samples([self.device({"updates": {"pending": 4}})],
+                           now=self.BASE)
+        entry = app.metrics_summary("1h", now=self.BASE + 60)["devices"][0]
+        self.assertEqual(entry["health"]["status"], "ok")
+        self.assertEqual(entry["warning_count"], 0)
+        self.assertIsNone(entry["warning_level"])
+        self.assertEqual([w["code"] for w in entry["warnings"]], ["updates"])
+        self.assertEqual(entry["warnings"][0]["level"], "info")
+
+    def test_stats_sees_live_health_warnings_without_a_history_scan(self):
+        self.post(json.dumps({
+            "name": "livehealth", "kind": "pc", "cpu_pct": 1.0,
+            "mem_pct": 2.0, "disk_pct": 3.0, "uptime_s": 4,
+            "smart": [{"device": "/dev/sda", "health": "FAILED"}],
+        }).encode(), "/api/push/livehealth")
+        app._cache.update(at=0.0, body=None)
+
+        device = next(d for d in app.stats()["devices"]
+                      if d["id"] == "agent:livehealth")
+        self.assertEqual(device["warning_level"], "critical")
+        self.assertGreaterEqual(device["warning_count"], 1)
+        self.assertEqual(device["health"]["smart"][0]["health"], "FAILED")
+
+    def test_stats_keeps_info_only_updates_out_of_the_alert_count(self):
+        self.post(json.dumps({
+            "name": "liveinfo", "kind": "pc", "cpu_pct": 1.0,
+            "mem_pct": 2.0, "disk_pct": 3.0, "uptime_s": 4,
+            "updates": {"pending": 9},
+        }).encode(), "/api/push/liveinfo")
+        app._cache.update(at=0.0, body=None)
+
+        device = next(d for d in app.stats()["devices"]
+                      if d["id"] == "agent:liveinfo")
+        self.assertEqual(device["warning_count"], 0)
+        self.assertIsNone(device["warning_level"])
+
+
+class MetricsHealthSourceTest(FrontEndSourceTest):
+    """The selected device's failure-mode health, asserted at the source."""
+
+    def test_metrics_page_has_a_health_section_for_the_selected_device(self):
+        self.assertIn('id="health-section"', self.metrics_html)
+        self.assertIn('id="health-body"', self.metrics_html)
+        self.assertIn('id="health-sub"', self.metrics_html)
+        self.assertIn('class="card-heading">Health<', self.metrics_html)
+        self.assertIn("renderHealthSection()", function_body(self.metrics_js, "load"))
+
+    def test_health_section_shows_smart_zfs_ups_backup_and_updates(self):
+        body = function_body(self.metrics_js, "renderHealthSection")
+        for block in ("health.smart", "health.zfs", "health.ups",
+                      "health.backup", "health.updates"):
+            self.assertIn(block, body, block)
+
+        smart = function_body(self.metrics_js, "smartRow")
+        for heading in ("Temperature", "Reallocated", "Pending", "Power-on"):
+            self.assertIn(heading, smart + self.metrics_js, heading)
+        self.assertIn("disk.health", smart)
+        self.assertIn("disk.pending", smart)
+
+        zfs = function_body(self.metrics_js, "zfsRow")
+        for field in ("state", "capacity_pct", "scrub_age_s", "errors"):
+            self.assertIn(field, zfs)
+
+        ups = function_body(self.metrics_js, "upsTile")
+        for field in ("status", "charge_pct", "runtime_s", "load_pct",
+                      "battery_low"):
+            self.assertIn(field, ups)
+
+        self.assertIn("last_success_ts", self.metrics_js)
+        self.assertIn("reboot_required", self.metrics_js)
+        self.assertIn("updates.pending", self.metrics_js)
+
+    def test_health_state_is_text_not_colour_alone(self):
+        # The badge carries the state in words; the CSS only reinforces it.
+        self.assertIn("health-badge", self.metrics_js)
+        self.assertIn("disk.health", self.metrics_js)
+        self.assertRegex(self.metrics_css, r"\.health-badge\s*\{")
+        self.assertRegex(self.metrics_css, r"\.health-badge\.is-critical\s*\{")
+
+    def test_device_rail_reuses_the_warning_chip_with_a_critical_state(self):
+        body = function_body(self.metrics_js, "deviceItem")
+        self.assertIn("warning_count", body)
+        self.assertIn("warning_level", body)
+        self.assertIn("device-item-warn", body)
+        self.assertIn("is-critical", body)
+        self.assertRegex(self.metrics_css, r"\.device-item-warn\.is-critical\s*\{")
+
+    def test_health_section_hides_when_the_device_reports_no_health(self):
+        body = function_body(self.metrics_js, "renderHealthSection")
+        self.assertIn("healthSectionEl.hidden", body)
+        self.assertIn("healthBodyEl.innerHTML = ''", body)
+
+    def test_health_tiles_do_not_invent_missing_counts_or_states(self):
+        updates = function_body(self.metrics_js, "updatesTile")
+        self.assertIn("pending === null", updates)
+        self.assertNotIn("? updates.pending : 0", updates)
+        ups = function_body(self.metrics_js, "upsTile")
+        self.assertIn("known", ups)
+        self.assertIn("battery_low", ups)
+        # The small history the API carries is used, not just fetched.
+        self.assertIn("health_history",
+                      function_body(self.metrics_js, "renderHealthSection"))
