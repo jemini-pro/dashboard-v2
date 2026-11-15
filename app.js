@@ -492,9 +492,13 @@ function deviceRow(d) {
     const availability = deviceAvailability(d);
     const warningCount = Number(d.warning_count) || 0;
     const warningLevel = d.warning_level === 'critical' ? 'critical' : 'warning';
+    // The chip carries severity as text too ("!"), not colour alone.
     const warning = warningCount
         ? '<span class="device-warn is-' + warningLevel + '" title="' +
-          warningCount + ' active warning(s)">' + warningCount + 'w</span>'
+          warningCount + ' active warning(s)' +
+          (warningLevel === 'critical' ? ', critical' : '') + '">' +
+          warningCount + 'w' + (warningLevel === 'critical' ? '!' : '') +
+          '</span>'
         : '';
     return '<div class="device-row ' + state + '" data-device-id="' + escapeHtml(deviceKey(d)) + '">' +
         '<div class="device-id">' +

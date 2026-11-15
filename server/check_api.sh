@@ -232,6 +232,26 @@ PY
     fail "no signal samples for $id within 12 s"
 }
 
+wait_for_health() { # wait_for_health <device-id>
+    local id="$1" i
+    for i in $(seq 1 120); do
+        if curl -fsS "$BASE/api/metrics?device=$id&window=1h" \
+                -o "$TMP/health-series.json" 2>/dev/null; then
+            if python3 - "$TMP/health-series.json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+raise SystemExit(0 if (data.get("health") or {}).get("smart") else 1)
+PY
+            then
+                return 0
+            fi
+        fi
+        sleep 0.1
+    done
+    fail "no health samples for $id within 12 s"
+}
+
 wait_for_device() { # wait_for_device <device-id>
     local id="$1" i
     for i in $(seq 1 120); do
@@ -714,7 +734,101 @@ assert old["signals"] == {}, old["signals"]
 PY
 ok "/api/metrics/summary carries latest signals and none for old agents"
 
-# 9e. Annotations are token-protected writes, rendered as markers and Events;
+# 9e. Failure-mode health. A synthetic payload proves the server side for the
+# agents we cannot run here (Windows), and the old-style agent above proves an
+# agent that sends no health blocks still works and gains no fabricated rows.
+backup_ts="$(python3 -c 'import time; print(int(time.time()) - 48 * 3600)')"
+cat > "$TMP/health-push.json" <<JSON
+{
+  "name": "healthtest",
+  "kind": "pc",
+  "cpu_pct": 5.0,
+  "mem_pct": 20.0,
+  "mem_used": 1,
+  "mem_total": 2,
+  "disk_pct": 10.0,
+  "uptime_s": 10,
+  "smart": [
+    {"device": "/dev/sda", "health": "FAILED", "temperature_c": 41,
+     "reallocated": 3, "pending": 2, "power_on_hours": 9000},
+    {"device": "/dev/sdb", "health": "PASSED", "temperature_c": 30, "pending": 0}
+  ],
+  "zfs": [
+    {"pool": "tank", "state": "DEGRADED", "capacity_pct": 82.5,
+     "scrub_age_s": 3024000, "errors": 1}
+  ],
+  "ups": {"status": "OB", "charge_pct": 10, "runtime_s": 120,
+          "load_pct": 40, "battery_low": true},
+  "backup": {"last_success_ts": $backup_ts, "tool": "restic"},
+  "updates": {"pending": 3, "security": 1, "reboot_required": true}
+}
+JSON
+push_device healthtest "$TMP/health-push.json" || fail "push with health blocks failed"
+wait_for_health agent:healthtest
+
+python3 - "$TMP/health-series.json" "$DATA_DIR/metrics.db" <<'PY' || fail "health series payload is wrong"
+import json, sqlite3, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+health = data["health"]
+assert health["smart"][0]["device"] == "/dev/sda", health
+assert health["smart"][0]["health"] == "FAILED", health
+assert health["smart"][0]["pending"] == 2, health
+assert health["zfs"][0]["pool"] == "tank", health
+assert health["ups"]["status"] == "OB", health
+assert health["backup"]["tool"] == "restic", health
+assert health["updates"]["reboot_required"] is True, health
+assert data["health_history"], data
+codes = {w["code"] for w in data["warnings"]}
+for code in ("smart", "zfs", "zfs_scrub", "ups", "backup", "reboot", "updates"):
+    assert code in codes, codes
+con = sqlite3.connect(sys.argv[2])
+try:
+    rows = con.execute(
+        "SELECT COUNT(*) FROM device_health WHERE device_id = ?",
+        ("agent:healthtest",),
+    ).fetchone()[0]
+finally:
+    con.close()
+assert rows >= 5, rows
+PY
+ok "/api/metrics returns cleaned SMART, ZFS, UPS, backup and update blocks"
+
+curl -fsS "$BASE/api/metrics/summary?window=1h" \
+    -o "$TMP/metrics-summary.json" || fail "summary with health failed"
+python3 - "$TMP/metrics-summary.json" <<'PY' || fail "health summary/warnings are wrong"
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+device = next(d for d in data["devices"] if d["id"] == "agent:healthtest")
+health = device["health"]
+assert health["status"] == "critical", health
+assert health["smart_failing"] == 1, health
+assert health["zfs_unhealthy"] == 1, health
+assert health["ups"]["on_battery"] is True, health
+assert health["updates_pending"] == 3, health
+assert health["reboot_required"] is True, health
+assert device["warning_count"] >= 6, device["warning_count"]
+assert device["warning_level"] == "critical", device["warning_level"]
+assert "smart" not in health, "full SMART rows leaked into the fleet summary"
+codes = {w["code"] for w in device["warnings"]}
+for code in ("smart", "zfs", "zfs_scrub", "ups", "backup", "reboot", "updates"):
+    assert code in codes, codes
+PY
+ok "/api/metrics/summary carries a compact critical health status and warnings"
+
+curl -fsS "$BASE/api/metrics?device=agent:oldsig&window=1h" \
+    -o "$TMP/oldhealth-series.json" || fail "old-style health series failed"
+python3 - "$TMP/oldhealth-series.json" <<'PY' || fail "old agent gained fabricated health"
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+assert data["health"] == {"ts": None}, data["health"]
+assert data["health_history"] == [], data["health_history"]
+PY
+ok "an old agent without health blocks gains no fabricated health rows"
+
+# 9f. Annotations are token-protected writes, rendered as markers and Events;
 # warnings are evaluated server-side from the summary fields.
 ann_ts="$(python3 -c 'import time; print(int(time.time()) - 60)')"
 cat > "$TMP/annotation-push.json" <<JSON
@@ -950,7 +1064,10 @@ ok "README documents the Workbench UI, breakpoints and checks"
 for needle in 'rollup_5m' 'DASH_ROLLUP_5M_DAYS' 'DASH_ROLLUP_1H_DAYS' \
         'SUMMARY_CACHE_SECONDS' 'min/max' 'metric_samples' 'SIGNAL_WINDOW_S' \
         'load_1' 'swap_used' 'net_rx_bps' '/api/annotations' \
-        'DASH_WARN_DISK_PCT' 'DASH_WARN_DAYS_TO_90'; do
+        'DASH_WARN_DISK_PCT' 'DASH_WARN_DAYS_TO_90' 'device_health' \
+        'DASH_WARN_ZFS_SCRUB_DAYS' 'DASH_WARN_BACKUP_HOURS' \
+        'DASH_WARN_UPS_CHARGE_PCT' 'DASH_WARN_UPS_RUNTIME_S' \
+        'DASH_BACKUP_TS_FILE' 'DASH_UPS_NAME' 'health_history'; do
     grep -Fq "$needle" "$README" \
         || fail "README does not document $needle"
 done
@@ -972,6 +1089,12 @@ grep -Fq 'chart-marker' "$REPO/metrics.js" \
     || fail "chart has no annotation markers"
 grep -Fq 'device-warn' "$REPO/app.js" \
     || fail "dashboard rail has no warning indicator"
-ok "README documents rollups/signals/annotations and the page exposes their UI"
+grep -Fq 'id="health-section"' "$REPO/metrics.html" \
+    || fail "metrics page has no health section"
+grep -Fq 'renderHealthSection' "$REPO/metrics.js" \
+    || fail "metrics page does not render the health section"
+grep -Fq 'health-table' "$REPO/metrics.js" \
+    || fail "health section has no SMART/ZFS tables"
+ok "README documents rollups/signals/health/annotations and the page exposes their UI"
 
 echo "all $COUNT checks passed"
