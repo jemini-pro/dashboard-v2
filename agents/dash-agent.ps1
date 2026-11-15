@@ -128,6 +128,9 @@ try {
 } catch { }
 
 # Windows has no load average or iowait/steal, so those keys are never sent.
+# Field names mirror dash_common.py (CORE_METRICS + EXTRA_METRICS), the Python
+# agents' one payload vocabulary. PowerShell cannot import a Python module, so
+# server/test_agents.py cross-checks the keys below against that file.
 $body = @{
     name      = $Name
     kind      = "pc"

@@ -9,13 +9,25 @@ it like any other device.
 The dashboard never gets the Docker socket: the host pushes to the container,
 which is the direction that already works. A container that stops simply stops
 reporting, and the dashboard marks it exited once the heartbeat goes stale.
+
+There is no installer and no deploy entry for this file: it is run by hand.
+Put it and a copy of dash_common.py in the same directory on docker01
+(dash_common.py is served at /agents/dash_common.py), then run:
+
+    DASH_TOKEN=... python3 docker-container-agent.py
 """
 import calendar
 import json
 import os
 import subprocess
+import sys
 import time
-import urllib.request
+
+_HERE = os.path.dirname(os.path.abspath(globals().get("__file__") or "docker-container-agent.py"))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+import dash_common as common  # noqa: E402
 
 URL = os.environ.get("DASH_URL", "http://10.10.10.20:8448").rstrip("/")
 ENV_FILE = os.environ.get("DASH_ENV_FILE", "/opt/stack/dash/.env")
@@ -34,18 +46,7 @@ SIZE_UNITS = {
 
 
 def token():
-    value = os.environ.get("DASH_TOKEN", "")
-    if value:
-        return value
-    try:
-        with open(ENV_FILE) as handle:
-            for line in handle:
-                key, _, rest = line.partition("=")
-                if key.strip() == "DASH_TOKEN":
-                    return rest.strip().strip('"').strip("'")
-    except OSError:
-        pass
-    return ""
+    return common.load_token(ENV_FILE)
 
 
 def docker(*args):
@@ -131,17 +132,6 @@ def describe(name):
     }
 
 
-def push(name, payload, auth):
-    request = urllib.request.Request(
-        f"{URL}/api/push/{name}",
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", "X-Dash-Token": auth},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=10) as response:
-        return response.status
-
-
 def main():
     auth = token()
     if not auth:
@@ -155,7 +145,7 @@ def main():
         payload.update(describe(name))
         payload = {k: v for k, v in payload.items() if v is not None}
         try:
-            push(name, payload, auth)
+            common.push(name, payload, auth, URL)
         except Exception as exc:  # noqa: BLE001 - one container must not stop the rest
             failures += 1
             print(f"push {name} failed: {exc}")

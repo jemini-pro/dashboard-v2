@@ -5,6 +5,7 @@
   Setup:
     mkdir -p ~/dash
     curl -fsSL https://pve.tail73491d.ts.net:8448/agents/dash-agent.py -o ~/dash/dash-agent.py
+    curl -fsSL https://pve.tail73491d.ts.net:8448/agents/dash_common.py -o ~/dash/dash_common.py
     printf '%s' '<token>' > ~/dash/.token && chmod 600 ~/dash/.token
     curl -fsSL https://pve.tail73491d.ts.net:8448/agents/com.jem.dashagent.plist \
       -o ~/Library/LaunchAgents/com.jem.dashagent.plist

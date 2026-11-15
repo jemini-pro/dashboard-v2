@@ -25,10 +25,12 @@ a main column (Jump back in, Launchpad, All tools) and a Network rail. There is 
 | `fonts/` | self-hosted Space Grotesk subset plus its OFL licence |
 | `agents/dash-agent.py` | Linux/macOS agent, posts every 60 s with all local volumes |
 | `agents/dash-agent.ps1` | Windows agent, PowerShell 5+, all fixed/removable drives |
+| `agents/dash_common.py` | shared wire protocol and host collectors, installed beside the Python agents |
 | `agents/com.jem.dashagent.plist` | macOS LaunchAgent, token from `~/dash/.token` |
 | `agents/install-windows-agent.ps1` | Windows installer, hidden via `wscript` |
 | `agents/pve-host-agent.py` | Proxmox host agent (host metrics + guest list) |
 | `agents/install-pve-host-agent.sh` | installs the above as a systemd timer |
+| `agents/docker-container-agent.py` | hand-run container agent for docker01; no installer or deploy entry |
 
 ## Endpoints
 
@@ -272,14 +274,19 @@ Optional top-level fields on `/api/push/<name>` feed `metric_samples`:
 | `net_rx_bps`, `net_tx_bps` | bytes per second across real interfaces |
 | `cpu_iowait`, `cpu_steal` | percent, clamped to 0–100 |
 
+The Python agents share one vocabulary in `agents/dash_common.py`
+(`EXTRA_METRICS`), and `test_app.py` pins it to `server/app.py`'s
+`EXTRA_METRICS`.
 `dash-agent.py` samples `/proc/loadavg`, swap, `/proc/net/dev` (twice, one second
 apart) and `/proc/stat` on Linux; on macOS it uses `os.getloadavg()`,
-`sysctl vm.swapusage` and `netstat -ib`. `pve-host-agent.py` reports the same host
-signals and none for LXC guests. `dash-agent.ps1` reports the Windows page file as
-swap and `Get-Counter` network rates as best effort; Windows has no load average
-or iowait/steal, so those fields are never sent. The PowerShell path cannot be
-executed in this repo's test environment — the server side is covered with
-synthetic payloads, and the source-level assertions guard the optional fields.
+`sysctl vm.swapusage` and `netstat -ib`. `pve-host-agent.py` uses the Linux
+adapter and reports the same host signals and none for LXC guests.
+`dash-agent.ps1` reports the Windows page file as swap and `Get-Counter` network
+rates as best effort; Windows has no load average or iowait/steal, so those
+fields are never sent. PowerShell cannot import the shared Python module, so the
+PowerShell path cannot be executed in this repo's test environment — the server
+side is covered with synthetic payloads, and source-level assertions cross-check
+its field names against `dash_common.py`.
 
 Signals are raw-only and the API caps their series at the last 24 hours
 (`SIGNAL_WINDOW_S`). A 90d/1y range does not scan signal history just to draw a
@@ -291,11 +298,16 @@ from `signals`, never filled with zero.
 An installed agent is never revisited by hand — the Windows task, cron entry or LaunchAgent
 keeps running whatever the installer downloaded. So the served copy is the source of truth:
 
-- At the start of every run, `dash-agent.ps1` and `dash-agent.py` fetch
-  `GET /agents/dash-agent.<ext>`, compare it with the file on disk, and replace the file
-  when the text differs. The next run (or, in `--loop` mode, an immediate `execv`) runs the
-  new code. A failed fetch, an unreadable file or a read-only install is ignored: the agent
-  keeps reporting with the copy it already has.
+- At the start of every run, `dash-agent.ps1`, `dash-agent.py` and
+  `pve-host-agent.py` fetch their served copy, compare it with the file on disk, and replace
+  the file when the text differs. The next run (or an immediate `execv`) runs the new code.
+  The Python agents also refresh `dash_common.py` beside them, so a protocol or collector
+  change reaches the device with the same deploy. A failed fetch, an unreadable file or a
+  read-only install is ignored: the agent keeps reporting with the copy it already has.
+- A `dash-agent.py` installed before `dash_common.py` existed bootstraps the missing module
+  on its first run after self-updating, so the old single-file install path keeps working.
+  `install-pve-host-agent.sh` and the macOS setup copy both files up front; the hand-run
+  container agent has no installer and must be copied with `dash_common.py` by hand.
 - `DASH_AGENT_UPDATE=0` pins a development copy so editing it is not immediately undone
   by the server's version.
 - Deploy publishes the repository's agent files to `static/agents/` (see `deploy.sh`), so a
