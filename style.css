@@ -1535,14 +1535,11 @@ input:focus-visible {
         columns: 1;
     }
 
-    /* A phone cannot spare four columns: drop the device and keep the time
-       and sentence, which still read on their own. */
+    /* Keep the device: the row text has its leading name removed, so dropping
+       this column would leave the sentence unattributed. */
     .brief-row-link {
-        grid-template-columns: 8px 38px minmax(0, 1fr);
-    }
-
-    .brief-device {
-        display: none;
+        grid-template-columns: 8px 34px minmax(44px, 72px) minmax(0, 1fr);
+        gap: 6px;
     }
 
     /* Four tiles per row at any phone width: a quarter-width minimum minus the
