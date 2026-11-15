@@ -152,6 +152,52 @@ if ($net) {
     $body["net_tx_bps"] = $net.tx
 }
 
+# DASH_HEALTH=0 opts a machine out of all probes, matching the Python agents.
+if ($env:DASH_HEALTH -ne "0") {
+    # SMART through the storage cmdlets. HealthStatus is mapped to the wire's
+    # PASSED/FAILED vocabulary; reallocated/pending counters are ATA concepts
+    # and are omitted on Windows rather than fabricated. Every probe is best
+    # effort: a missing cmdlet, permission error or odd disk omits the block.
+    try {
+        $smart = @(Get-PhysicalDisk -ErrorAction Stop | Select-Object -First 16 | ForEach-Object {
+            $device = if ($_.FriendlyName) { [string]$_.FriendlyName } else { [string]$_.DeviceId }
+            $health = if ($_.HealthStatus -eq "Healthy") { "PASSED" } else { [string]$_.HealthStatus }
+            $entry = @{ device = $device; health = $health }
+            try {
+                $counter = Get-StorageReliabilityCounter -DeviceNumber ([int]$_.DeviceId) -ErrorAction Stop
+                if ($null -ne $counter.Temperature) { $entry["temperature_c"] = [int]$counter.Temperature }
+                if ($null -ne $counter.PowerOnHours) { $entry["power_on_hours"] = [int64]$counter.PowerOnHours }
+            } catch { }
+            $entry
+        } | Where-Object { $_.device })
+        if ($smart.Count -gt 0) { $body["smart"] = $smart }
+    } catch { }
+
+    # Pending updates need the PSWindowsUpdate module. Without it the whole
+    # block is omitted, as with the other optional signals. Reboot detection is
+    # a cheap registry probe included when the module is present.
+    if (Get-Command Get-WindowsUpdate -ErrorAction SilentlyContinue) {
+        try {
+            $wu = @(Get-WindowsUpdate -ErrorAction Stop)
+            $updates = @{ pending = $wu.Count }
+            $security = @($wu | Where-Object {
+                $_.MsrcSeverity -eq "Critical" -or $_.SecurityBulletinIDs
+            }).Count
+            if ($security -gt 0) { $updates["security"] = $security }
+            $reboot = $false
+            foreach ($key in @(
+                "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired",
+                "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending",
+                "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\PendingFileRenameOperations"
+            )) {
+                try { if (Test-Path $key) { $reboot = $true; break } } catch { }
+            }
+            $updates["reboot_required"] = $reboot
+            $body["updates"] = $updates
+        } catch { }
+    }
+}
+
 $body = $body | ConvertTo-Json -Depth 4
 
 try {

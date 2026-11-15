@@ -228,6 +228,11 @@
     background: var(--status-critical-mark);
 }
 
+/* An available update is informational: same row, quieter mark. */
+.warning-row.is-info::before {
+    background: var(--faint);
+}
+
 .warning-device {
     font-weight: 600;
     white-space: nowrap;
@@ -929,6 +934,147 @@
     font-size: 0.72rem;
     color: var(--muted);
     padding: 8px 0;
+}
+
+/* ---------- device health ---------- */
+
+.health-card[hidden] {
+    display: none;
+}
+
+.health-body {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-width: 0;
+}
+
+.health-block {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    border-top: 1px solid var(--sidebar-border);
+    padding-top: 8px;
+}
+
+.health-block:first-child {
+    border-top: 0;
+    padding-top: 0;
+}
+
+.health-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+}
+
+.health-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.65rem;
+    font-variant-numeric: tabular-nums;
+}
+
+.health-table th,
+.health-table td {
+    text-align: right;
+    padding: 4px 6px;
+    border-bottom: 1px solid var(--sidebar-border);
+    white-space: nowrap;
+}
+
+.health-table th:first-child,
+.health-table td:first-child,
+.health-table th:nth-child(2),
+.health-table td:nth-child(2) {
+    text-align: left;
+}
+
+.health-table th {
+    color: var(--muted);
+    font-weight: 600;
+}
+
+.health-table tr:last-child td {
+    border-bottom: 0;
+}
+
+.health-table td.is-critical {
+    color: var(--status-critical);
+    font-weight: 600;
+}
+
+/* The badge always carries the state in words; colour only reinforces it. */
+.health-badge {
+    display: inline-block;
+    padding: 1px 5px;
+    border-radius: 999px;
+    font-size: 0.55rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+    background: var(--icon-bg);
+    color: var(--status-good);
+}
+
+.health-badge.is-warning {
+    color: var(--status-warning);
+}
+
+.health-badge.is-critical {
+    color: var(--status-critical);
+    background: rgba(197, 48, 48, 0.12);
+}
+
+.health-tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+    gap: 6px;
+    border-top: 1px solid var(--sidebar-border);
+    padding-top: 8px;
+}
+
+.health-tile {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    padding: 6px 8px;
+    border-radius: 8px;
+    background: var(--icon-bg);
+}
+
+.health-label {
+    font-size: 0.55rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--faint);
+}
+
+.health-value {
+    font-size: 0.8rem;
+    font-weight: 600;
+    line-height: 1.2;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.health-meta {
+    font-size: 0.6rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* A critical health alert reuses the rail's warning chip, not a second one. */
+.device-item-warn.is-critical {
+    color: var(--status-critical);
 }
 
 /* ---------- responsive ---------- */

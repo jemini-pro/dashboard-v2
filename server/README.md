@@ -39,10 +39,10 @@ a main column (Jump back in, Launchpad, All tools) and a Network rail. There is 
 | `/api/health` | GET | `{ok}` |
 | `/api/bookmarks` | GET | the bookmark store, with a decayed `score` per item |
 | `/api/stats` | GET | devices array, cached 5 s; each device carries 24 h availability and warning counts, plus the pve → LXC → Docker `topology` |
-| `/api/metrics/summary` | GET | per-device availability, averages, events, disk trend, warnings, compact volume and latest-signal summaries, a CPU sparkline, plus the same `topology`; long windows read rollups |
-| `/api/metrics` | GET | one device's bucketed history, min/max bands, per-volume series, recent signals and annotations: `?device=<id>&window=1h\|6h\|24h\|7d\|30d\|90d\|1y&step=<s>` |
+| `/api/metrics/summary` | GET | per-device availability, averages, events, disk trend, warnings, compact volume/signal/health summaries, a CPU sparkline, plus the same `topology`; long windows read rollups |
+| `/api/metrics` | GET | one device's bucketed history, min/max bands, per-volume series, recent signals, annotations, the latest health blocks and a short health history: `?device=<id>&window=1h\|6h\|24h\|7d\|30d\|90d\|1y&step=<s>` |
 | `/api/hit` | POST | record a bookmark click (`{"url": "..."}` → `204`, no body) |
-| `/api/push/<name>` | POST | agent heartbeat, needs `X-Dash-Token`; optionally carries `disks` and extra signals |
+| `/api/push/<name>` | POST | agent heartbeat, needs `X-Dash-Token`; optionally carries `disks`, extra signals and the failure-mode `smart`/`zfs`/`ups`/`backup`/`updates` blocks |
 | `/api/annotations` | POST | record a deploy/restart/backup/note marker, needs `X-Dash-Token` |
 
 Reads are behind the Caddy basic-auth password on the tailnet. `/api/push/*` is exempt
@@ -92,6 +92,18 @@ can answer "is this normal, and since when?" rather than only "what is it now?".
   received — missing signals are never rendered as zero. Swap percentage is
   derived on read as `swap_used / swap_total`; a host with no swap reports
   total 0 and therefore no swap signal.
+- **Failure-mode health uses one block table.** `device_health (device_id, ts,
+  kind, payload_json)` stores one cleaned block per device per kind per bucket
+  (`smart`, `zfs`, `ups`, `backup`, `updates`) with the same bucket timestamp
+  and replacement rule as `disk_samples`. A repeat heartbeat inside a bucket
+  replaces its rows, so history never double-counts. Raw health rows follow
+  the same `DASH_HISTORY_DAYS` retention as raw samples and are pruned in the
+  same hourly pass. `/api/metrics` returns `health` with the latest block per
+  kind (a kind the agent did not report last time keeps its last known value)
+  plus `health_history`, up to 24 snapshots; `/api/metrics/summary` carries
+  only the compact status so the
+  fleet payload does not grow with disk or pool count. An old agent writes no
+  rows and the API returns `{"ts": null}` and an empty history.
 - **Annotations are SQLite rows, not derived.** `POST /api/annotations` stores
   `(device_id, ts, kind, text)`; `kind` is one of `deploy`, `restart`, `backup`
   or `note`, and an empty `device_id` means fleet-wide. It uses the same
@@ -103,11 +115,15 @@ can answer "is this normal, and since when?" rather than only "what is it now?".
   already have their own row.
 - **Warnings are evaluated server-side.** `evaluate_warnings()` turns the
   summary fields into `{code, level, value, threshold, text}` entries for disk
-  percent, days-to-90, disk growth, RAM and offline duration. Warning and
-  critical levels are derived from the env thresholds below; `/api/metrics`
-  and `/api/metrics/summary` carry the full list. `/api/stats` carries only the
-  cheap live subset (`disk`, `mem`, `offline`) as `warning_count` /
-  `warning_level`, so the dashboard rail never pays for a history scan.
+  percent, days-to-90, disk growth, RAM, offline duration and the failure-mode
+  health blocks (`smart`, `zfs`, `zfs_scrub`, `ups`, `backup`, `reboot`,
+  `updates`). Warning and critical levels are derived from the env thresholds
+  below; `/api/metrics` and `/api/metrics/summary` carry the full list.
+  `/api/stats` carries only the cheap live subset (`disk`, `mem`, `offline`
+  and the in-memory health blocks) as `warning_count` / `warning_level`, so the
+  dashboard rail never pays for a history scan. A pending update is `info` and
+  is excluded from both counts: an available package must not turn the chip on
+  for every healthy machine.
 - **Two rollup tiers.** `rollup_5m` and `rollup_1h` (plus the matching
   `disk_rollup_5m` / `disk_rollup_1h` for volumes) store `samples`,
   `online_samples`, per-series average/min/max and the uptime first/last/min
@@ -175,9 +191,15 @@ The Metrics page (`/metrics.html`) uses the same data:
 - a compact signal strip (load 1/5/15, swap, net RX/TX, I/O wait, steal) with
   sparklines, fed by the extra-signal API. It never joins the 0–100 chart and
   a signal the device did not send is absent rather than a zero tile;
-- a warning banner (device, text, warning/critical dot) above the chart, plus
-  a compact `nw` chip on each device row in the page rail. The dashboard's
-  Network rail shows the same live-only chip from `/api/stats`;
+- a **Health** card under the chart for the selected device: a SMART table
+  (device, health badge, temperature, reallocated, pending, power-on hours), a
+  ZFS pool table (state badge, capacity, last scrub, errors), and UPS, backup
+  and update tiles. The card is hidden when the device reports no health
+  blocks. State is always text in a badge or cell, never colour alone;
+- a warning banner (device, text, warning/critical mark) above the chart, plus
+  a compact `nw` chip on each device row in the page rail. A critical SMART,
+  ZFS or UPS reading turns that chip critical. The dashboard's Network rail
+  shows the same live-only chip from `/api/stats`;
 - dashed chart markers for every annotation in the window, with the note on
   the SVG `<title>`, and an Events row for each manual annotation;
 - a fleet summary (device online count, average availability, peak CPU, disk
@@ -203,6 +225,10 @@ DASH_WARN_DAYS_TO_90=14   # days-to-90 warning line; critical is warn/4
 DASH_WARN_GROWTH=1.0      # disk growth %/day warning; critical is 5x
 DASH_WARN_MEM_PCT=90      # RAM warning line; critical is +7, capped at 99
 DASH_WARN_OFFLINE_S=600   # offline warning; critical is 6x
+DASH_WARN_ZFS_SCRUB_DAYS=30  # ZFS scrub age warning line, in days
+DASH_WARN_BACKUP_HOURS=36    # backup age warning line, in hours
+DASH_WARN_UPS_CHARGE_PCT=30  # UPS charge critical line, in percent
+DASH_WARN_UPS_RUNTIME_S=300  # UPS runtime critical line, in seconds
 ```
 
 ## Workbench UI
@@ -292,6 +318,95 @@ Signals are raw-only and the API caps their series at the last 24 hours
 (`SIGNAL_WINDOW_S`). A 90d/1y range does not scan signal history just to draw a
 sparkline; the strip says which window it is showing. Missing signals are omitted
 from `signals`, never filled with zero.
+
+### Failure-mode health
+
+Capacity says how full a disk is; these optional blocks say whether it is
+dying, whether the pool is degraded, whether the UPS is carrying the house,
+when the backup last succeeded and whether the machine needs updates. All five
+are optional and additive: an old agent that sends none of them keeps working
+and gains no fabricated rows or warnings.
+
+| Block | Shape |
+|---|---|
+| `smart` | list, capped at 16: `{"device": "/dev/sda", "health": "PASSED", "temperature_c": 34, "reallocated": 0, "pending": 0, "power_on_hours": 12000}` |
+| `zfs` | list, capped at 16: `{"pool": "tank", "state": "ONLINE", "capacity_pct": 42.5, "scrub_age_s": 86400, "errors": 0}` |
+| `ups` | object: `{"status": "OL", "charge_pct": 100, "runtime_s": 1800, "load_pct": 25, "battery_low": false}` |
+| `backup` | object: `{"last_success_ts": 1700000000, "tool": "restic"}` — an absolute unix timestamp is required |
+| `updates` | object: `{"pending": 4, "security": 1, "reboot_required": false}` |
+
+The server cleans every block before storing it, exactly like `disks`: strings
+are trimmed, lists are capped at 16, percentages are clamped to 0–100,
+counters are non-negative and capped, and a malformed entry or key is dropped.
+A block that cleans to nothing is omitted, so a hostile heartbeat cannot store
+an unbounded payload or crash the sampler. `agents/dash_common.py` does not own
+these collectors in this branch; each agent keeps its own, and a later merge
+can move the shared ones.
+
+Warning rules (`evaluate_warnings`, same shape as the disk/RAM rules):
+
+| Reading | Level | Code |
+|---|---|---|
+| SMART `health` is not `PASSED` | critical | `smart` |
+| SMART `pending` > 0 | critical | `smart` |
+| ZFS `state` is not `ONLINE` | critical | `zfs` |
+| ZFS `errors` > 0 | critical | `zfs` |
+| ZFS scrub older than `DASH_WARN_ZFS_SCRUB_DAYS` (30) | warning | `zfs_scrub` |
+| UPS `status` contains NUT's `OB`, or `battery_low` is true | critical | `ups` |
+| UPS charge below `DASH_WARN_UPS_CHARGE_PCT` (30) | critical | `ups` |
+| UPS runtime below `DASH_WARN_UPS_RUNTIME_S` (300) | critical | `ups` |
+| Backup age above `DASH_WARN_BACKUP_HOURS` (36) | warning | `backup` |
+| `reboot_required` is true | warning | `reboot` |
+| `pending` updates > 0 | info | `updates` |
+
+A missing reading never warns: if `smartctl` could not run, the agent omits
+the block and the server says nothing rather than inventing a failure. `info`
+is for an available package and is excluded from the rail's `nw` chip and the
+`warning_level`; it still appears in the metrics warning banner.
+
+Collection is per platform and always best effort. Every probe has a short
+subprocess timeout (4 s, 6 s for disk/pool status, 8–10 s for package lists),
+SMART scanning stops after a 12 s budget across devices, and any missing
+command, permission error, timeout or unsupported platform omits that block:
+
+- **`dash-agent.py` on Linux:** `smartctl -H -A -j` for ATA/NVMe JSON (SMART
+  health, temperature, ATA IDs 5/197, power-on hours); `zpool list -H -p` plus
+  `zpool status -p` for state, capacity, scrub age and error count; `upsc`
+  only when `DASH_UPS_NAME` is set; `apt-get -s upgrade` (falling back to
+  `dnf -q check-update`) for update counts and `/var/run/reboot-required` for
+  the reboot flag.
+- **`dash-agent.py` on macOS:** `smartctl` when installed, otherwise
+  `diskutil list` + `diskutil info` for the physical disk's SMART status.
+  macOS gets no ZFS pool, UPS or package-update block; the opt-in backup
+  probe still works.
+- **`pve-host-agent.py`:** the same Linux collectors as above, reported for the
+  host only. LXC guests send no health blocks because they cannot see the
+  host's disks, pools or UPS.
+- **`dash-agent.ps1` on Windows:** `Get-PhysicalDisk` +
+  `Get-StorageReliabilityCounter` for health, temperature and power-on hours
+  (reallocated/pending are ATA concepts and are omitted); `Get-WindowsUpdate`
+  only when the PSWindowsUpdate module is installed, plus the registry
+  `RebootRequired`/`RebootPending` probe. Windows has no ZFS or NUT block.
+- **Backups are opt-in on the two Python agents**, because there is no
+  universal way to discover a backup tool. Set one of these on the device (the
+  agent never guesses): `DASH_BACKUP_TS_FILE=/var/lib/backup/last-success` (a
+  bare unix timestamp, or JSON with `last_success_ts`), or
+  `DASH_BACKUP_CMD="..."` whose stdout is the same bare number or JSON.
+  `DASH_BACKUP_TOOL=restic` labels the warning. The Windows agent does not
+  collect a backup block.
+- `DASH_HEALTH=0` disables all health probes on a device that should not run
+  them (for example a container with no hardware).
+
+A kind the agent omits keeps its last known value in `agents.json`; a kind the
+agent explicitly sends empty clears it. That keeps a stale backup age warning
+visible when a backup probe breaks, while an old-style empty block can still
+clear a reading that no longer applies.
+
+Deliberately not covered: SMART self-tests and NVMe media-error counters,
+per-pool history charts (the API carries up to 24 snapshots; the page uses them
+only for the UPS charge sparkline), UPS load history, Windows
+reallocated/pending counters (not exposed by the storage cmdlets) and macOS
+package updates (`softwareupdate -l` is too slow for a one-minute heartbeat).
 
 ## Agent updates
 
@@ -492,9 +607,11 @@ a step, min/max bands and a derived summary; 7d/30d route through `rollup_5m` an
 90d/1y through `rollup_1h`; all four rollup tables contain rows; a push with a `disks`
 array becomes per-volume series with growth/day and days-to-90 and a compact summary,
 an oversized list is capped at 16; a push with extra signals exposes load/swap/network/
-CPU pressure, while an old payload still works and gains no synthetic zeros; a deploy
-annotation becomes a marker and Events row; server-side warnings flag disk and RAM;
-a detected restart becomes an auto marker; unknown windows/devices are rejected; hits,
+CPU pressure, while an old payload still works and gains no synthetic zeros; a synthetic
+health push exposes cleaned SMART/ZFS/UPS/backup/update blocks, a compact critical
+summary and the matching warnings, while an old agent gains no fabricated health rows;
+a deploy annotation becomes a marker and Events row; server-side warnings flag disk and
+RAM; a detected restart becomes an auto marker; unknown windows/devices are rejected; hits,
 metrics history, per-volume history, extra-signal history **and** annotations survive
 a full process restart; and the click feature sets no cookie and makes no third-party
 request. It also guards the compose/README path documentation below and the
