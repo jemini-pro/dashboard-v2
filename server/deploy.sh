@@ -35,13 +35,15 @@ COMMIT="$(git -C "$BUILD" rev-parse --short HEAD)"
 
 say "preflight"
 for f in server/app.py server/Caddyfile server/docker-compose.yml \
-         index.html app.js stack.js style.css metrics.html metrics.js metrics.css \
+         index.html app.js ui-core.js dash-data.js stack.js style.css \
+         metrics.html metrics.js metrics.css \
          server/bookmarks.seed.json; do
     [ -f "$BUILD/$f" ] || die "missing $BUILD/$f"
 done
 [ -d "$BUILD/fonts" ] || die "missing $BUILD/fonts/"
 if grep -RqsE 'calendar\.google\.com|fonts\.googleapis\.com|fonts\.gstatic\.com' \
-        "$BUILD/index.html" "$BUILD/app.js" "$BUILD/stack.js" "$BUILD/style.css" \
+        "$BUILD/index.html" "$BUILD/app.js" "$BUILD/ui-core.js" \
+        "$BUILD/dash-data.js" "$BUILD/stack.js" "$BUILD/style.css" \
         "$BUILD/metrics.html" "$BUILD/metrics.js" "$BUILD/metrics.css"; then
     die "third-party references remain in the front end"
 fi
@@ -64,6 +66,8 @@ sed -i '/^PVE_/d' "$ENVF" || true
 say "install"
 install -m 0644 "$BUILD/server/app.py" "$STACK/dash/app.py"
 install -m 0644 "$BUILD/index.html" "$STACK/dash/static/index.html"
+install -m 0644 "$BUILD/ui-core.js" "$STACK/dash/static/ui-core.js"
+install -m 0644 "$BUILD/dash-data.js" "$STACK/dash/static/dash-data.js"
 install -m 0644 "$BUILD/app.js" "$STACK/dash/static/app.js"
 install -m 0644 "$BUILD/stack.js" "$STACK/dash/static/stack.js"
 install -m 0644 "$BUILD/style.css" "$STACK/dash/static/style.css"
@@ -84,10 +88,10 @@ done
 install -m 0644 "$BUILD/server/Caddyfile" "$STACK/caddy/Caddyfile"
 install -m 0644 "$BUILD/server/docker-compose.yml" "$STACK/docker-compose.yml"
 
-# The shared stack helper and the metrics page are extra files next to
-# index.html. Fail here rather than at the smoke test if one never reached the
-# static directory.
-for f in stack.js metrics.html metrics.js metrics.css; do
+# The shared runtime, data client, stack helper and the metrics page are extra
+# files next to index.html. Fail here rather than at the smoke test if one never
+# reached the static directory.
+for f in ui-core.js dash-data.js stack.js metrics.html metrics.js metrics.css; do
     [ -s "$STACK/dash/static/$f" ] || die "install left $f missing from $STACK/dash/static"
 done
 
@@ -103,6 +107,7 @@ chown -R 1000:1000 "$STACK/dash/data"
 # anywhere, including calendar.google.com.
 if grep -RqsE 'calendar\.google\.com|fonts\.googleapis\.com|fonts\.gstatic\.com' \
         "$STACK/dash/static/index.html" "$STACK/dash/static/app.js" \
+        "$STACK/dash/static/ui-core.js" "$STACK/dash/static/dash-data.js" \
         "$STACK/dash/static/stack.js" "$STACK/dash/static/style.css" \
         "$STACK/dash/static/metrics.html" "$STACK/dash/static/metrics.js" \
         "$STACK/dash/static/metrics.css"; then

@@ -22,7 +22,12 @@ import app  # noqa: E402
 
 from http.server import ThreadingHTTPServer  # noqa: E402
 
-APP_JS = Path(__file__).resolve().parent.parent / "app.js"
+FRONTEND = Path(__file__).resolve().parent.parent
+APP_JS = FRONTEND / "app.js"
+UI_CORE = FRONTEND / "ui-core.js"
+DASH_DATA = FRONTEND / "dash-data.js"
+STACK_JS = FRONTEND / "stack.js"
+METRICS_JS = FRONTEND / "metrics.js"
 
 # A fixed clock keeps decay assertions exact instead of racing wall time.
 NOW = 1_700_000_000.0
@@ -549,8 +554,127 @@ class FrontEndSourceTest(unittest.TestCase):
     def setUp(self):
         self.source = APP_JS.read_text()
         self.js = self.source
-        self.html = (APP_JS.parent / "index.html").read_text()
-        self.css = (APP_JS.parent / "style.css").read_text()
+        self.ui = UI_CORE.read_text()
+        self.dash_data = DASH_DATA.read_text()
+        self.stack = STACK_JS.read_text()
+        self.html = (FRONTEND / "index.html").read_text()
+        self.css = (FRONTEND / "style.css").read_text()
+        self.metrics_html = (FRONTEND / "metrics.html").read_text()
+        self.metrics_js = METRICS_JS.read_text()
+        self.metrics_css = (FRONTEND / "metrics.css").read_text()
+
+
+class SharedRuntimeSourceTest(FrontEndSourceTest):
+    """One shared runtime module and one data seam for both pages.
+
+    The repo still has no JS runtime, so these are source-level contracts: the
+    pages must load the shared modules first, keep no copy of their helpers,
+    and route fetching, clocking and polling through the shared interfaces.
+    """
+
+    def test_pages_load_the_shared_modules_before_their_own_script(self):
+        for html, page in ((self.html, "app.js"), (self.metrics_html, "metrics.js")):
+            with self.subTest(page=page):
+                core = html.index('src="ui-core.js"')
+                data = html.index('src="dash-data.js"')
+                stack = html.index('src="stack.js"')
+                script = html.index('src="' + page + '"')
+                self.assertLess(core, data)
+                self.assertLess(data, stack)
+                self.assertLess(stack, script)
+
+    def test_ui_core_exposes_the_shared_runtime(self):
+        self.assertIn("window.dashboardUI = {", self.ui)
+        for name in ("escapeHtml", "isNumber", "kindLabel", "KIND_DEFS",
+                     "KIND_ORDER", "fmtBytes", "fmtBytesCompact",
+                     "fmtDuration", "fmtUptime", "createClock", "createPoller"):
+            with self.subTest(export=name):
+                self.assertRegex(self.ui, r"\b" + name + r":\s*" + name + r"\b")
+
+    def test_escaping_kind_labels_and_formats_have_one_definition(self):
+        # Neither page carries its own copy of a shared helper.
+        for source in (self.js, self.metrics_js):
+            for absent in ("function escapeHtml(", "function kindLabel(",
+                           "KIND_DEFS = [", "WORK_START_HOUR ="):
+                with self.subTest(absent=absent):
+                    self.assertNotIn(absent, source)
+        self.assertIn("function escapeHtml(", self.ui)
+        self.assertIn("function kindLabel(", self.ui)
+        self.assertRegex(self.ui, r"KIND_DEFS\s*=\s*\[")
+
+        # The dashboard keeps its compact byte/uptime policy; the history page
+        # keeps its em-dash/duration one, both from the shared scale.
+        self.assertIn("fmtBytesCompact", self.js)
+        self.assertIn("fmtUptime", self.js)
+        self.assertIn("fmtBytes,", self.metrics_js)
+        self.assertIn("fmtDuration", self.metrics_js)
+        self.assertIn("function scaleBytes(", self.ui)
+        self.assertIn("function durationText(", self.ui)
+
+    def test_one_poller_owns_backoff_and_visibility(self):
+        poller = function_body(self.ui, "createPoller")
+        self.assertIn("setTimeout(", poller)
+        self.assertIn("clearTimeout(", poller)
+        self.assertIn("document.hidden", poller)
+        self.assertIn("visibilitychange", poller)
+        self.assertIn(
+            "Math.min(maxInterval, interval * 2 ** Math.min(failures, 3))",
+            poller,
+        )
+
+        # The dashboard polls through it; the history page keeps its minute.
+        start = function_body(self.js, "startDevicePolling")
+        self.assertIn("dashboardUI.createPoller(", start)
+        self.assertIn("interval: 10000", start)
+        self.assertIn("maxInterval: 60000", start)
+        self.assertIn("run: refreshDevices", start)
+        self.assertRegex(self.metrics_js, r"dashboardUI\.createPoller\(\{")
+        self.assertRegex(self.metrics_js, r"interval:\s*REFRESH_MS")
+        for source in (self.js, self.metrics_js):
+            self.assertNotIn("function scheduleRefresh(", source)
+        self.assertNotIn("setInterval(refreshDevices", self.js)
+        # Visibility is handled inside the one poller, not per page.
+        self.assertNotIn("document.addEventListener('visibilitychange'", self.js)
+        self.assertNotIn("document.addEventListener('visibilitychange'", self.metrics_js)
+
+    def test_one_fetch_client_serves_both_pages(self):
+        self.assertIn("window.dashData = {", self.dash_data)
+        get = function_body(self.dash_data, "getJson")
+        self.assertIn("cache: 'no-store'", get)
+        self.assertIn("response.ok", get)
+        self.assertIn("response.json()", get)
+
+        read = function_body(self.dash_data, "read")
+        self.assertIn("ok: true", read)
+        self.assertIn("ok: false", read)
+        self.assertIn("console.warn", read)
+        self.assertIn("keeping the last good reading", read)
+
+        for source in (self.js, self.metrics_js):
+            self.assertNotIn("function getJson(", source)
+            self.assertNotIn("await fetch(", source)
+
+        self.assertIn("dashData.read('/api/stats'",
+                      function_body(self.js, "refreshDevices"))
+        self.assertIn("dashData.read('/api/bookmarks'",
+                      function_body(self.js, "loadBookmarks"))
+        self.assertIn("dashData.read(", function_body(self.metrics_js, "load"))
+
+    def test_stack_exposes_the_model_plus_one_render_entry(self):
+        # The pure model stays; markup lives behind a single render entry.
+        self.assertIn("countedDevices: countedDevices", self.stack)
+        self.assertIn("group: group", self.stack)
+        self.assertIn("keyOf: keyOf", self.stack)
+        self.assertIn("render: render", self.stack)
+        self.assertNotIn("function escapeHtml(", self.stack)
+        self.assertIn("dashboardUI.escapeHtml", self.stack)
+
+        for source in (self.js, self.metrics_js):
+            self.assertNotIn("dashboardStack.branch(", source)
+            self.assertNotIn("dashboardStack.dockerEngine(", source)
+        self.assertIn("dashboardStack.render.branch(", self.js)
+        self.assertIn("dashboardStack.render.dockerEngine(", self.js)
+        self.assertIn("dashboardStack.render.dockerEngine(", self.metrics_js)
 
 
 class MostUsedCardTest(FrontEndSourceTest):
@@ -904,22 +1028,32 @@ class ThemeAndDebugTest(FrontEndSourceTest):
     """Ticket #41: theme keeps flipping at 09:00-17:00 and debug time wins."""
 
     def test_work_hours_drive_the_theme(self):
-        self.assertRegex(self.js, r"WORK_START_HOUR\s*=\s*9\b")
-        self.assertRegex(self.js, r"WORK_END_HOUR\s*=\s*17\b")
+        self.assertRegex(self.ui, r"WORK_START_HOUR\s*=\s*9\b")
+        self.assertRegex(self.ui, r"WORK_END_HOUR\s*=\s*17\b")
 
-        body = function_body(self.js, "updateDashboard")
+        body = function_body(self.ui, "update")
         self.assertIn("getCurrentTime()", body)
         self.assertIn("WORK_START_HOUR", body)
         self.assertIn("data-theme", body)
         self.assertIn("setAttribute", body)
 
+        # Both pages drive their clock, including the one-second tick, through
+        # the shared factory.
+        self.assertIn("dashboardUI.createClock(", self.js)
+        self.assertIn("clock.update()", function_body(self.js, "updateDashboard"))
+        self.assertIn("dashboardUI.createClock(", self.metrics_js)
+        self.assertIn("clock.start()", self.js)
+        self.assertIn("clock.start()", self.metrics_js)
+        self.assertIn("setInterval(update, 1000)", function_body(self.ui, "createClock"))
+        self.assertNotIn("setInterval(updateClock", self.metrics_js)
+
     def test_debug_time_overrides_the_clock_and_theme(self):
-        body = function_body(self.js, "getCurrentTime")
+        body = function_body(self.ui, "getCurrentTime")
         self.assertIn("debugTimeOffset", body)
         self.assertIn(
-            "debugTimeOffset = debugDate.getTime() - now.getTime()", self.js
+            "debugTimeOffset = debugDate.getTime() - now.getTime()", self.ui
         )
-        self.assertIn("debugTimeOffset = null", self.js)
+        self.assertIn("debugTimeOffset = null", self.ui)
 
     def test_clock_and_date_live_in_the_toolbar(self):
         self.assertIn('id="clock"', self.html)
@@ -1186,7 +1320,8 @@ class WorkbenchResponsiveTest(FrontEndSourceTest):
         root = APP_JS.parent
         self.assertFalse((root / "prototype").exists(), "prototype/ is still present")
 
-        for name in ("app.js", "stack.js", "index.html", "style.css",
+        for name in ("app.js", "ui-core.js", "dash-data.js", "stack.js",
+                     "index.html", "style.css",
                      "metrics.js", "metrics.html", "metrics.css"):
             text = (root / name).read_text()
             with self.subTest(file=name):
@@ -1222,10 +1357,10 @@ class NetworkCardTest(FrontEndSourceTest):
         body = function_body(self.js, "averageSample")
 
         self.assertIn("d.online", body)
-        self.assertIn("isNumericSample(d[field])", body)
+        self.assertIn("isNumber(d[field])", body)
         self.assertIn("samples.length", body)
 
-        numeric = function_body(self.js, "isNumericSample")
+        numeric = function_body(self.ui, "isNumber")
         self.assertIn("typeof value === 'number'", numeric)
         self.assertIn("Number.isFinite", numeric)
 
@@ -1241,11 +1376,13 @@ class NetworkCardTest(FrontEndSourceTest):
             function_body(self.js, "clampPct"),
         )
 
-    def test_dashboard_loads_the_shared_stack_helper_before_app_js(self):
-        self.assertLess(
-            self.html.index('src="stack.js"'),
-            self.html.index('src="app.js"'),
-        )
+    def test_dashboard_loads_the_shared_modules_before_app_js(self):
+        for name in ("ui-core.js", "dash-data.js", "stack.js"):
+            with self.subTest(module=name):
+                self.assertLess(
+                    self.html.index('src="' + name + '"'),
+                    self.html.index('src="app.js"'),
+                )
         self.assertNotIn("kind-chips", self.html)
 
     def test_network_tree_nests_pve_guests_and_the_docker_engine(self):
@@ -1255,7 +1392,7 @@ class NetworkCardTest(FrontEndSourceTest):
         self.assertIn("'PVE host'", body)
         self.assertIn("'LXC guests'", body)
         self.assertIn("'Elsewhere'", body)
-        self.assertIn("dashboardStack.dockerEngine(stack.containers)", body)
+        self.assertIn("dashboardStack.render.dockerEngine(stack.containers)", body)
         self.assertIn("sortNetworkDevices(stack.others)", body)
         # Standalone machines must not be folded into the pve branches.
         self.assertIn("stack.others", body)
@@ -1284,7 +1421,7 @@ class NetworkCardTest(FrontEndSourceTest):
         self.assertIn("state", row)
 
     def test_unknown_kinds_get_a_readable_label(self):
-        body = function_body(self.js, "kindLabel")
+        body = function_body(self.ui, "kindLabel")
 
         self.assertIn("KIND_LABELS[kind]", body)
         self.assertIn("replace(/[-_]+/g, ' ')", body)
@@ -1294,14 +1431,14 @@ class NetworkCardTest(FrontEndSourceTest):
     def test_kind_labels_and_order_share_one_definition(self):
         # Adding a kind must edit one list, not two parallel constants that can
         # drift apart.
-        self.assertRegex(self.js, r"KIND_DEFS\s*=\s*\[")
-        defs = re.search(r"KIND_DEFS\s*=\s*\[(.*?)\];", self.js, re.S)
+        self.assertRegex(self.ui, r"KIND_DEFS\s*=\s*\[")
+        defs = re.search(r"KIND_DEFS\s*=\s*\[(.*?)\];", self.ui, re.S)
         self.assertIsNotNone(defs, "KIND_DEFS not found")
         self.assertIn("label:", defs.group(1))
         self.assertIn("key:", defs.group(1))
 
-        self.assertRegex(self.js, r"KIND_LABELS\s*=\s*Object\.fromEntries\(")
-        self.assertRegex(self.js, r"KIND_ORDER\s*=\s*KIND_DEFS\.map\(")
+        self.assertRegex(self.ui, r"KIND_LABELS\s*=\s*Object\.fromEntries\(")
+        self.assertRegex(self.ui, r"KIND_ORDER\s*=\s*KIND_DEFS\.map\(")
 
     def test_device_key_helper_is_used_for_rows_and_poll_identity(self):
         key = function_body(self.js, "deviceKey")
@@ -1401,13 +1538,15 @@ class NetworkCardTest(FrontEndSourceTest):
 
         # Polling uses setTimeout with backoff, and pauses while the tab is
         # hidden, rather than a fixed interval that keeps waking a background
-        # tab.
-        schedule = function_body(self.js, "scheduleRefresh")
-        self.assertIn("setTimeout(", schedule)
-        self.assertIn("document.hidden", schedule)
-        self.assertIn("10000", schedule)
-        self.assertIn("Math.min(60000", schedule)
-        self.assertIn("visibilitychange", self.js)
+        # tab. Both now live in the one shared poller.
+        poller = function_body(self.ui, "createPoller")
+        self.assertIn("setTimeout(", poller)
+        self.assertIn("document.hidden", poller)
+        self.assertIn("Math.min(maxInterval, interval * 2 ** Math.min(failures, 3))", poller)
+        self.assertIn("visibilitychange", poller)
+        start = function_body(self.js, "startDevicePolling")
+        self.assertIn("interval: 10000", start)
+        self.assertIn("maxInterval: 60000", start)
         self.assertNotIn("setInterval(refreshDevices", self.js)
 
     def test_updated_label_uses_a_locale_independent_24_hour_clock(self):
@@ -2348,17 +2487,13 @@ class MetricsHistoryTest(ApiTestCase):
 class MetricsPageSourceTest(FrontEndSourceTest):
     """The metrics page, chart markup and deploy wiring, asserted at the source."""
 
-    def setUp(self):
-        super().setUp()
-        self.metrics_html = (APP_JS.parent / "metrics.html").read_text()
-        self.metrics_js = (APP_JS.parent / "metrics.js").read_text()
-        self.metrics_css = (APP_JS.parent / "metrics.css").read_text()
-
-    def test_page_loads_the_shared_stack_helper_before_metrics_js(self):
-        self.assertLess(
-            self.metrics_html.index('src="stack.js"'),
-            self.metrics_html.index('src="metrics.js"'),
-        )
+    def test_page_loads_the_shared_modules_before_metrics_js(self):
+        for name in ("ui-core.js", "dash-data.js", "stack.js"):
+            with self.subTest(module=name):
+                self.assertLess(
+                    self.metrics_html.index('src="' + name + '"'),
+                    self.metrics_html.index('src="metrics.js"'),
+                )
 
     def test_device_rail_uses_the_same_containment_tree_as_the_dashboard(self):
         body = function_body(self.metrics_js, "metricsTree")
@@ -2366,7 +2501,7 @@ class MetricsPageSourceTest(FrontEndSourceTest):
         self.assertIn("dashboardStack.group(devices, summary && summary.topology)", body)
         # A container row is the only handle on a container's series, so the
         # tree resolves each Docker row back to its device.
-        self.assertIn("dashboardStack.dockerEngine(stack.containers,", body)
+        self.assertIn("dashboardStack.render.dockerEngine(stack.containers,", body)
         self.assertIn("device.kind === 'container'", body)
         self.assertIn("'PVE host'", body)
         self.assertIn("'LXC guests'", body)
@@ -2443,7 +2578,8 @@ class MetricsPageSourceTest(FrontEndSourceTest):
 
     def test_deploy_ships_the_metrics_page_and_checks_it(self):
         deploy = (Path(__file__).resolve().parent / "deploy.sh").read_text()
-        for name in ("stack.js", "metrics.html", "metrics.js", "metrics.css"):
+        for name in ("ui-core.js", "dash-data.js", "stack.js",
+                     "metrics.html", "metrics.js", "metrics.css"):
             self.assertIn(name, deploy)
         smoke = deploy.split('say "smoke"', 1)[1]
         self.assertIn("metrics.html", smoke)
@@ -2472,16 +2608,18 @@ class MultiDiskTest(FrontEndSourceTest):
 
         self.assertIn("diskLabel(disk)", body)
         self.assertIn("escapeHtml(", body)
-        self.assertIn("fmtBytes(disk.total)", body)
+        self.assertIn("fmtBytesCompact(disk.total)", body)
         self.assertIn('data-mount="', body)
         self.assertIn('class="disk-fill"', body)
         self.assertIn("clampPct(disk.pct)", body)
         self.assertIn("METRIC_WARN_PCT", body)
         self.assertIn("'—'", body)
 
-        fmt = function_body(self.js, "fmtBytes")
+        fmt = function_body(self.ui, "scaleBytes")
         self.assertIn("1024", fmt)
         self.assertIn("'TB'", fmt)
+        # The dashboard keeps its compact policy through the shared scale.
+        self.assertIn("fmtBytesCompact", self.js)
 
     def test_disk_identity_is_part_of_the_row_key_so_names_cannot_go_stale(self):
         key = function_body(self.js, "diskKey")
@@ -2517,12 +2655,6 @@ class MultiDiskTest(FrontEndSourceTest):
 
 class MetricsVolumeSourceTest(FrontEndSourceTest):
     """Phase 1: per-volume history under the chart and inside the table view."""
-
-    def setUp(self):
-        super().setUp()
-        self.metrics_html = (APP_JS.parent / "metrics.html").read_text()
-        self.metrics_js = (APP_JS.parent / "metrics.js").read_text()
-        self.metrics_css = (APP_JS.parent / "metrics.css").read_text()
 
     def test_volume_table_lives_under_the_chart_and_in_the_table_view(self):
         self.assertIn('id="volume-section"', self.metrics_html)
@@ -2567,12 +2699,6 @@ class MetricsVolumeSourceTest(FrontEndSourceTest):
 class MetricsPeaksSourceTest(FrontEndSourceTest):
     """Phase 2: min/max bands and the 90d / 1y ranges."""
 
-    def setUp(self):
-        super().setUp()
-        self.metrics_html = (APP_JS.parent / "metrics.html").read_text()
-        self.metrics_js = (APP_JS.parent / "metrics.js").read_text()
-        self.metrics_css = (APP_JS.parent / "metrics.css").read_text()
-
     def test_the_api_bands_are_drawn_as_a_peak_band_behind_the_lines(self):
         body = function_body(self.metrics_js, "bandPaths")
         self.assertIn("point[4] !== 1", body)
@@ -2604,12 +2730,6 @@ class MetricsPeaksSourceTest(FrontEndSourceTest):
 
 class MetricsSignalsSourceTest(FrontEndSourceTest):
     """Phase 3: load/swap/network/iowait live outside the 0-100 chart."""
-
-    def setUp(self):
-        super().setUp()
-        self.metrics_html = (APP_JS.parent / "metrics.html").read_text()
-        self.metrics_js = (APP_JS.parent / "metrics.js").read_text()
-        self.metrics_css = (APP_JS.parent / "metrics.css").read_text()
 
     def test_signals_have_their_own_strip_outside_the_chart(self):
         self.assertIn('id="signal-strip"', self.metrics_html)
@@ -2644,12 +2764,6 @@ class MetricsSignalsSourceTest(FrontEndSourceTest):
 
 class MetricsAnnotationsWarningsSourceTest(FrontEndSourceTest):
     """Phase 4: warning banner, chart markers and annotation Events rows."""
-
-    def setUp(self):
-        super().setUp()
-        self.metrics_html = (APP_JS.parent / "metrics.html").read_text()
-        self.metrics_js = (APP_JS.parent / "metrics.js").read_text()
-        self.metrics_css = (APP_JS.parent / "metrics.css").read_text()
 
     def test_warning_banner_lists_active_warnings_and_hides_when_clean(self):
         self.assertIn('id="warning-banner"', self.metrics_html)
@@ -2691,12 +2805,6 @@ class DockerContainerRailTest(FrontEndSourceTest):
     in. The rendered result was checked against a live payload separately.
     """
 
-    def setUp(self):
-        super().setUp()
-        root = APP_JS.parent
-        self.stack = (root / "stack.js").read_text()
-        self.metrics = (root / "metrics.js").read_text()
-
     def test_containers_are_excluded_from_the_free_standing_cards(self):
         self.assertIn("device.kind !== 'container'", self.stack)
         # The filter that builds `others` is the one that has to carry it.
@@ -2710,8 +2818,8 @@ class DockerContainerRailTest(FrontEndSourceTest):
         self.assertIn("is-selectable", row)
 
     def test_the_metrics_tree_resolves_each_container_to_its_device(self):
-        self.assertIn("dockerEngine(stack.containers,", self.metrics)
-        self.assertIn("device.kind === 'container'", self.metrics)
+        self.assertIn("dockerEngine(stack.containers,", self.metrics_js)
+        self.assertIn("device.kind === 'container'", self.metrics_js)
 
     def test_the_selectable_row_is_styled_not_like_a_default_button(self):
         self.assertIn(".docker-container.is-selectable", self.css)
@@ -2728,12 +2836,6 @@ class DeviceCountTest(FrontEndSourceTest):
     nor turn the health dot amber when a container exits. Both rails share the
     filter so the dashboard and metrics page cannot drift apart.
     """
-
-    def setUp(self):
-        super().setUp()
-        root = APP_JS.parent
-        self.stack = (root / "stack.js").read_text()
-        self.metrics = (root / "metrics.js").read_text()
 
     def test_the_shared_helper_drops_container_kind(self):
         body = function_body(self.stack, "countedDevices")
@@ -2759,10 +2861,10 @@ class DeviceCountTest(FrontEndSourceTest):
         for name in ("renderTiles", "renderDevices", "renderHealth"):
             self.assertIn(
                 "dashboardStack.countedDevices(",
-                function_body(self.metrics, name),
+                function_body(self.metrics_js, name),
                 name,
             )
         # The tree still receives every device so a container row can select
         # its own series; only the tallies are filtered.
         self.assertIn("metricsTree(devices)",
-                      function_body(self.metrics, "renderDevices"))
+                      function_body(self.metrics_js, "renderDevices"))

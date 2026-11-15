@@ -833,13 +833,17 @@ ok "annotations survived a full server restart ($annotations_after stored)"
 # request. Deliberately scoped to the click-history/strip code so unrelated
 # front-end code does not produce false positives.
 grep -q "Set-Cookie" "$APP" && fail "server sets a cookie"
-grep -q "document.cookie" "$REPO/app.js" && fail "front end touches document.cookie"
+grep -qE 'document\.cookie' "$REPO/app.js" "$REPO/metrics.js" \
+    "$REPO/ui-core.js" "$REPO/dash-data.js" \
+    && fail "front end touches document.cookie"
 grep -qE 'calendar\.google\.com|fonts\.googleapis\.com|fonts\.gstatic\.com' \
-    "$REPO/index.html" "$REPO/app.js" "$REPO/stack.js" "$REPO/style.css" \
+    "$REPO/index.html" "$REPO/app.js" "$REPO/ui-core.js" "$REPO/dash-data.js" \
+    "$REPO/stack.js" "$REPO/style.css" \
     "$REPO/metrics.html" "$REPO/metrics.js" "$REPO/metrics.css" \
     && fail "front end still references the calendar iframe or Google Fonts"
-grep -qE 'https?://|document\.cookie' "$REPO/metrics.js" \
-    && fail "metrics page makes an external request or touches cookies"
+grep -qE 'https?://' \
+    "$REPO/app.js" "$REPO/ui-core.js" "$REPO/dash-data.js" "$REPO/metrics.js" \
+    && fail "front end makes an external request"
 grep -Fq "navigator.sendBeacon('/api/hit'" "$REPO/app.js" \
     || fail "click handler does not beacon to the same-origin /api/hit"
 grep -Fq "document.addEventListener('click', recordHit)" "$REPO/app.js" \
@@ -863,6 +867,42 @@ done
 grep -Eq 'https?://|fetch\(|XMLHttpRequest|document\.cookie' "$TMP/strip-functions.js" \
     && fail "card/strip code makes an external request or touches cookies"
 ok "feature sets no cookie and makes no third-party request"
+
+# 11c. One front-end runtime and one data seam. Deployment installs every
+# static file by name, so check the modules exist and that each page loads
+# ui-core.js and dash-data.js before stack.js and its own script.
+for f in ui-core.js dash-data.js stack.js; do
+    [ -s "$REPO/$f" ] || fail "front-end module $f is missing"
+done
+grep -Fq 'window.dashboardUI = {' "$REPO/ui-core.js" \
+    || fail "ui-core.js exposes no shared runtime"
+grep -Fq 'createPoller: createPoller' "$REPO/ui-core.js" \
+    || fail "ui-core.js has no shared poller"
+grep -Fq 'window.dashData = {' "$REPO/dash-data.js" \
+    || fail "dash-data.js exposes no fetch client"
+grep -Fq "cache: 'no-store'" "$REPO/dash-data.js" \
+    || fail "the fetch client may serve a cached reading"
+grep -Fq 'render: render' "$REPO/stack.js" \
+    || fail "stack.js has no render adapter entry"
+grep -Fq 'dashboardUI.escapeHtml' "$REPO/stack.js" \
+    || fail "stack.js keeps its own escapeHtml copy"
+
+check_module_order() {
+    local page="$1" script="$2"
+    local core data stack target
+    core=$(grep -n 'src="ui-core.js"' "$page" | cut -d: -f1 || true)
+    data=$(grep -n 'src="dash-data.js"' "$page" | cut -d: -f1 || true)
+    stack=$(grep -n 'src="stack.js"' "$page" | cut -d: -f1 || true)
+    target=$(grep -n "src=\"$script\"" "$page" | cut -d: -f1 || true)
+    [ -n "$core" ] && [ -n "$data" ] && [ -n "$stack" ] && [ -n "$target" ] \
+        || fail "$page is missing ui-core.js, dash-data.js, stack.js or $script"
+    if (( core >= data || data >= stack || stack >= target )); then
+        fail "$page must load ui-core.js, dash-data.js and stack.js before $script"
+    fi
+}
+check_module_order "$REPO/index.html" app.js
+check_module_order "$REPO/metrics.html" metrics.js
+ok "both pages load ui-core, dash-data and stack before their own script"
 
 # 12. Repo/deploy coherence: compose defaults describe the live /opt/stack
 # layout but can be pointed at the repo, and the durable host path is documented.
