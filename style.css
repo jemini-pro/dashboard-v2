@@ -604,12 +604,16 @@ a.brief-row-link:hover {
     min-height: 0;
     display: flex;
     flex-direction: column;
+    /* A short card scrolls its tool list vertically. Letting a fixed-height
+       multicol overflow sideways would hide the third column whenever the
+       brief above takes up height. */
+    overflow-y: auto;
 }
 
 .bookmarks-grid {
-    flex: 1 1 auto;
+    flex: 0 0 auto;
     min-height: 0;
-    overflow: auto;
+    overflow: visible;
     columns: 3;
     column-gap: 20px;
     padding-right: 2px;

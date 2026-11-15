@@ -823,13 +823,14 @@ probes the server's own `/api/health` (verdict `ok`, 100% 24 h uptime, latency,
 `last_change`) and a missing route (verdict `service_down`, `HTTP 404`); the
 failing check reaches `/api/stats` warnings in the shared shape; a corrupt check
 store returns an empty list; a deploy annotation becomes a marker and Events
-row; `/api/brief` names that annotation
-once with the documented item shape and rejects a window it does not offer; server-side warnings flag disk and RAM; a detected restart becomes an auto
-marker; unknown windows/devices are rejected; hits, metrics history, per-volume
-history, extra-signal history **and** annotations survive a full process restart;
-and the click feature sets no cookie and makes no third-party request. It also
-guards the compose/README path documentation below, the Workbench UI, breakpoint
-and check documentation above, and the Services card/check badges.
+row; `/api/brief` names that annotation once with the documented item shape and
+rejects a window it does not offer; server-side warnings flag disk and RAM; a
+detected restart becomes an auto marker; unknown windows/devices are rejected;
+hits, metrics history, per-volume history, extra-signal history **and**
+annotations survive a full process restart; and the click feature sets no cookie
+and makes no third-party request. It also guards the compose/README path
+documentation below, the Workbench UI, breakpoint and check documentation above,
+and the Services card/check badges.
 
 ## Click-history durability
 

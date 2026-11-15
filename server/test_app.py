@@ -2927,6 +2927,12 @@ class BriefSourceTest(FrontEndSourceTest):
         self.assertIn("interval: 60000", self.source)
         self.assertIn("startBriefPolling();", self.source)
 
+    def test_the_brief_does_not_push_all_tools_into_sideways_overflow(self):
+        card = self.css[self.css.index(".all-tools-card {"):]
+        self.assertIn("overflow-y: auto", card[:card.index("}")])
+        grid = self.css[self.css.index(".bookmarks-grid {"):]
+        self.assertIn("overflow: visible", grid[:grid.index("}")])
+
     def test_the_list_scrolls_inside_the_card_and_has_level_colours(self):
         self.assertIn(".brief-list", self.css)
         self.assertIn("max-height", self.css)
