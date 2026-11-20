@@ -288,7 +288,10 @@ function deviceItem(device) {
         ? device.availability_pct.toFixed(1) + '%'
         : '—';
     // State is text as well as a dot: colour and opacity never carry it alone.
-    const stateText = kindLabel(device.kind) + ' · ' + (device.online ? 'online' : 'offline');
+    // The role replaces the kind label where one exists, so a pve guest reads
+    // "T3 Code · online" rather than "LXC guests · online".
+    const role = typeof device.role === 'string' ? device.role.trim() : '';
+    const stateText = (role || kindLabel(device.kind)) + ' · ' + (device.online ? 'online' : 'offline');
     // The summary now stamps alert counts that exclude info (an available
     // update is not an alert); fall back to the warnings list on older payloads.
     const warningList = Array.isArray(device.warnings) ? device.warnings : [];

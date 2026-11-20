@@ -245,6 +245,11 @@ DOCKER_CONTAINERS = (
 CONTAINER_FIELDS = ("state", "role")
 MAX_CONTAINER_TEXT = 64
 
+# Structural facts about a guest, not samples: a vmid and a core count identify
+# the box and never move, so they are stored and shown but never charted.
+GUEST_INT_FIELDS = ("vmid", "vcpu")
+MAX_GUEST_INT = 100_000
+
 
 def clean_text(value, limit=MAX_CONTAINER_TEXT):
     """Trim an agent string into something safe to re-serve to every browser."""
@@ -598,6 +603,7 @@ def agent_devices():
             **{metric: rec.get(metric) for metric in EXTRA_METRICS
                if metric in rec},
             **{key: rec[key] for key in CONTAINER_FIELDS if key in rec},
+            **{key: rec[key] for key in GUEST_INT_FIELDS if key in rec},
             **({"health": health} if health else {}),
             "online": age < 150,  # agents push every 60 s; allow two misses
             "last_seen": int(rec.get("last_seen", 0)),
@@ -3605,6 +3611,12 @@ class Handler(BaseHTTPRequestHandler):
                 cleaned = clean_text(payload.get(key))
                 if cleaned:
                     rec[key] = cleaned
+            # Guest identity: a positive integer inside the sane range, or the
+            # stored value stays as it was.
+            for key in GUEST_INT_FIELDS:
+                value = _metric_number(payload.get(key), int)
+                if value is not None and 0 < value <= MAX_GUEST_INT:
+                    rec[key] = value
             rec["last_seen"] = int(time.time())
             agents[name] = rec
             save_agents(agents)

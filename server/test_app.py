@@ -433,6 +433,51 @@ class PushTokenTest(ApiTestCase):
         self.assertNotIn("\x00", container["state"])
         self.assertEqual(len(container["role"]), app.MAX_CONTAINER_TEXT)
 
+    def test_a_pve_guest_carries_its_role_and_identity(self):
+        self.push_payload(
+            {
+                "kind": "lxc-guest",
+                "name": "agent",
+                "state": "running",
+                "role": "T3 Code",
+                "vmid": 210,
+                "vcpu": 4,
+                "cpu_pct": 0.1,
+                "mem_pct": 7.1,
+                "mem_used": 612667392,
+                "mem_total": 8589934592,
+                "uptime_s": 373817,
+            },
+            name="agent",
+        )
+        app._cache.update(at=0.0, body=None)
+
+        with frozen_time():
+            body = app.stats()
+
+        device = next(d for d in body["devices"] if d["id"] == "agent:agent")
+        self.assertEqual(device["kind"], "lxc-guest")
+        self.assertEqual(device["role"], "T3 Code")
+        self.assertEqual(device["vmid"], 210)
+        self.assertEqual(device["vcpu"], 4)
+        # A guest is a device of its own, never a row in the Docker block.
+        names = [c["name"] for c in body["topology"]["containers"]]
+        self.assertNotIn("agent", names)
+
+    def test_a_nonsense_guest_identity_is_not_stored(self):
+        self.push_payload(
+            {"kind": "lxc-guest", "name": "odd", "vmid": "210", "vcpu": -4},
+            name="odd",
+        )
+        app._cache.update(at=0.0, body=None)
+
+        with frozen_time():
+            body = app.stats()
+
+        device = next(d for d in body["devices"] if d["id"] == "agent:odd")
+        self.assertNotIn("vmid", device)
+        self.assertNotIn("vcpu", device)
+
     def test_stats_describes_the_pve_docker_stack(self):
         self.push_payload({"name": "pve", "kind": "host"}, name="pve")
         app._cache.update(at=0.0, body=None)
@@ -1513,6 +1558,30 @@ class NetworkCardTest(FrontEndSourceTest):
         self.assertIn("' · online'", sub)
         # The dot remains alongside the text.
         self.assertIn("device-dot", function_body(self.js, "deviceRow"))
+
+    def test_a_reported_role_replaces_the_kind_label_in_the_row_sub_line(self):
+        sub = function_body(self.js, "deviceSub")
+
+        # Every pve guest reads "LXC guests"; the role is what tells agent from
+        # hermes, so it wins over the kind label.
+        self.assertIn("deviceRole(d)", sub)
+        self.assertIn("role || kindLabel(d.kind)", sub)
+        role = function_body(self.js, "deviceRole")
+        self.assertIn("typeof d.role === 'string'", role)
+
+    def test_a_guest_row_keeps_its_size_and_vmid_out_of_the_crowded_sub_line(self):
+        row = function_body(self.js, "deviceRow")
+        sub = function_body(self.js, "deviceSub")
+
+        # The rail gives the sub-line one narrow column beside three metrics, so
+        # "role · up 4d 7h · online" clips the state away. A guest keeps role and
+        # state on screen and puts uptime, vCPU, RAM and vmid in the tooltip.
+        self.assertIn("isNumber(d.vmid)) return label + ' · online'", sub)
+        self.assertIn("isNumber(d.vmid)", row)
+        self.assertIn("isNumber(d.vcpu)", row)
+        self.assertIn("isNumber(d.mem_total)", row)
+        self.assertIn("fmtUptime(d.uptime_s)", row)
+        self.assertIn("title=", row)
 
     def test_offline_rows_show_last_seen_and_online_rows_show_uptime(self):
         body = function_body(self.js, "deviceSub")

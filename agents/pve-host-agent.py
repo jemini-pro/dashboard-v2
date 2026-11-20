@@ -27,6 +27,16 @@ URL = os.environ.get("DASH_URL", "http://10.10.10.20:8448").rstrip("/")
 SKIP = {n.strip() for n in os.environ.get("DASH_SKIP", "docker01").split(",") if n.strip()}
 HOST = common.LinuxHost()
 
+# What each LXC guest runs. pve reports CPU, RAM and disk, but nothing about
+# the job a container does, so the role is a deployment fact kept here, the way
+# the dashboard keeps DOCKER_CONTAINERS. DASH_LXC_ROLES overrides or extends it
+# without a deploy: JSON on one line, e.g. {"agent": "T3 Code"}.
+LXC_ROLES = {
+    "agent": "T3 Code",
+    "hermes": "Hermes",
+}
+
+
 # ---------- failure-mode collectors ----------
 # Kept local to this agent on purpose: another session is consolidating host
 # collectors into dash_common.py, and this branch must stand alone until that
@@ -379,12 +389,39 @@ def guests():
         return []
 
 
-def guest_payload(guest):
-    """One LXC guest. Guests have no host-level volumes or signals."""
+def role_map():
+    """The configured role per guest name, with any env override on top."""
+    mapping = dict(LXC_ROLES)
+    raw = os.environ.get("DASH_LXC_ROLES", "").strip()
+    if not raw:
+        return mapping
+    try:
+        extra = json.loads(raw)
+    except ValueError:
+        print("DASH_LXC_ROLES is not JSON; keeping the built-in roles")
+        return mapping
+    if not isinstance(extra, dict):
+        return mapping
+    mapping.update({
+        str(key): value.strip()
+        for key, value in extra.items()
+        if isinstance(value, str) and value.strip()
+    })
+    return mapping
+
+
+def guest_payload(guest, roles=None):
+    """One LXC guest: what it runs, how big it is, and its root volume.
+
+    A guest has no agent of its own, so pve's reading of its root filesystem is
+    the only disk sample it will ever have. Everything else here is what pve
+    already knows; nothing is invented when a field is missing.
+    """
     name = guest.get("name") or f"ct{guest.get('vmid')}"
-    return {
+    payload = {
         "name": name,
         "kind": "lxc-guest",
+        "state": guest.get("status") or "running",
         "cpu_pct": round(100.0 * guest.get("cpu", 0), 1),
         "mem_pct": (round(100.0 * guest["mem"] / guest["maxmem"], 1)
                     if guest.get("maxmem") else None),
@@ -392,6 +429,29 @@ def guest_payload(guest):
         "mem_total": guest.get("maxmem"),
         "uptime_s": guest.get("uptime"),
     }
+    role = (roles or {}).get(name)
+    if role:
+        payload["role"] = role
+    # Identity, not a sample: vmid is stable and vcpu is a configured size.
+    for key, field in (("vmid", "vmid"), ("vcpu", "maxcpu")):
+        value = guest.get(field)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            payload[key] = value
+    total = guest.get("maxdisk")
+    used = guest.get("disk")
+    if (isinstance(total, int) and not isinstance(total, bool)
+            and isinstance(used, int) and not isinstance(used, bool)
+            and total > 0):
+        pct = round(100.0 * used / total, 1)
+        payload["disks"] = [{
+            "mount": "/",
+            "label": "rootfs",
+            "total": total,
+            "used": used,
+            "pct": pct,
+        }]
+        payload["disk_pct"] = pct
+    return payload
 
 
 def main():
@@ -413,8 +473,9 @@ def main():
     except Exception as exc:  # noqa: BLE001
         errors.append(f"pve: {exc}")
 
+    roles = role_map()
     for guest in guests():
-        payload = guest_payload(guest)
+        payload = guest_payload(guest, roles)
         name = payload["name"]
         if name in SKIP:
             continue

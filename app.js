@@ -625,15 +625,30 @@ function deviceDisks(d) {
 // Online rows read "kind · up 3d 4h · online"; offline rows keep their
 // last-seen time and say "offline". The status is text as well as the dot, so
 // assistive tech does not depend on colour.
+//
+// A guest's kind label says the least about it: on pve every sibling reads
+// "LXC guests". The role says what the box actually does ("T3 Code",
+// "Hermes"), so it replaces the label whenever an agent reports one.
+function deviceRole(d) {
+    return typeof d.role === 'string' ? d.role.trim() : '';
+}
+
 function deviceSub(d) {
+    const role = deviceRole(d);
     if (!d.online) {
-        return (d.last_seen ? fmtAgo(d.last_seen) : kindLabel(d.kind)) + ' · offline';
+        return (d.last_seen ? fmtAgo(d.last_seen) : (role || kindLabel(d.kind))) + ' · offline';
     }
-    const kind = kindLabel(d.kind);
-    const detail = d.uptime_s === null || d.uptime_s === undefined
-        ? kind
-        : kind + ' · up ' + fmtUptime(d.uptime_s);
-    return detail + ' · online';
+    const label = role || kindLabel(d.kind);
+    // A guest's sub-line shares one ~130 px column with three metric cells:
+    // "T3 Code · up 4d 7h · online" is clipped, and the tail it loses is the
+    // state. So a guest keeps its role and state here, and its uptime, size
+    // and vmid move into the row's tooltip.
+    if (isNumber(d.vmid)) return label + ' · online';
+    const parts = [label];
+    if (d.uptime_s !== null && d.uptime_s !== undefined) {
+        parts.push('up ' + fmtUptime(d.uptime_s));
+    }
+    return parts.join(' · ') + ' · online';
 }
 
 // 24 h availability is stamped by /api/stats from the history store. It sits
@@ -664,7 +679,20 @@ function deviceRow(d) {
           warningCount + 'w' + (warningLevel === 'critical' ? '!' : '') +
           '</span>'
         : '';
-    return '<div class="device-row ' + state + '" data-device-id="' + escapeHtml(deviceKey(d)) + '">' +
+    // A guest's pve id and size are worth one hover: "agent" is CT 210 on this
+    // host, and `pct` and the Proxmox UI only accept the number. The rail's
+    // sub-line has room for the role alone, so the rest lives here.
+    const ct = isNumber(d.vmid) ? 'CT ' + d.vmid : '';
+    const facts = [
+        d.name,
+        deviceRole(d),
+        ct,
+        isNumber(d.vcpu) ? d.vcpu + ' vCPU' : '',
+        isNumber(d.mem_total) ? fmtBytesCompact(d.mem_total) + ' RAM' : '',
+        d.uptime_s !== null && d.uptime_s !== undefined ? 'up ' + fmtUptime(d.uptime_s) : '',
+    ].filter(Boolean);
+    const title = ct ? ' title="' + escapeHtml(facts.join(' · ')) + '"' : '';
+    return '<div class="device-row ' + state + '" data-device-id="' + escapeHtml(deviceKey(d)) + '"' + title + '>' +
         '<div class="device-id">' +
         '<span class="device-dot ' + state + '" aria-hidden="true"></span>' +
         '<span class="device-text">' +

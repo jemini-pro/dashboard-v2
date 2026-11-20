@@ -660,6 +660,47 @@ class PveHostAgentTest(unittest.TestCase):
             "device": "/dev/sda", "health": "PASSED", "temperature_c": 30,
         }])
 
+    def test_a_guest_reports_what_it_runs_and_its_root_volume(self):
+        guest = {"name": "agent", "vmid": 210, "status": "running", "cpu": 0.1,
+                 "maxcpu": 4, "mem": 1000, "maxmem": 4000, "uptime": 60,
+                 "disk": 500, "maxdisk": 2000}
+
+        payload = self.agent.guest_payload(guest, {"agent": "T3 Code"})
+
+        self.assertEqual(payload["role"], "T3 Code")
+        self.assertEqual(payload["state"], "running")
+        self.assertEqual(payload["vmid"], 210)
+        self.assertEqual(payload["vcpu"], 4)
+        self.assertEqual(payload["disks"], [{
+            "mount": "/", "label": "rootfs", "total": 2000, "used": 500,
+            "pct": 25.0,
+        }])
+        self.assertEqual(payload["disk_pct"], 25.0)
+
+    def test_a_guest_with_no_configured_role_or_volume_invents_neither(self):
+        guest = {"name": "mystery", "vmid": 199, "cpu": 0, "mem": 1, "maxmem": 2}
+
+        payload = self.agent.guest_payload(guest, {})
+
+        self.assertNotIn("role", payload)
+        self.assertNotIn("disks", payload)
+        self.assertNotIn("disk_pct", payload)
+        # A missing sample stays missing; the page drops the line rather than
+        # printing a made-up "up 0s".
+        self.assertIsNone(payload["uptime_s"])
+
+    def test_the_built_in_roles_cover_the_agent_and_hermes(self):
+        self.assertEqual(self.agent.role_map()["agent"], "T3 Code")
+        self.assertEqual(self.agent.role_map()["hermes"], "Hermes")
+
+    def test_the_environment_can_add_a_role_without_a_deploy(self):
+        with mock.patch.dict(os.environ,
+                             {"DASH_LXC_ROLES": '{"adguard": "DNS"}'}):
+            roles = self.agent.role_map()
+
+        self.assertEqual(roles["adguard"], "DNS")
+        self.assertEqual(roles["agent"], "T3 Code")
+
     def test_a_failing_guest_does_not_stop_the_host_heartbeat(self):
         guest = {"name": "adguard", "vmid": 101, "cpu": 0.1, "mem": 1,
                  "maxmem": 2, "uptime": 3}
