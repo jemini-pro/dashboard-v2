@@ -1,7 +1,7 @@
 /*
  * Containment model shared by the dashboard rail and the metrics rail.
  *
- * The dashboard runs inside Docker, inside the docker01 LXC, inside the pve
+ * The dashboard runs inside Docker, inside the docker LXC, inside the pve
  * Proxmox host. The API describes that stack in `topology`; this file turns a
  * flat device list plus that description into the four groups both pages draw:
  * host, Docker host, sibling guests, and everything off the PVE tree.

@@ -637,10 +637,10 @@ ok "/api/bookmarks is $size bytes for $items links (under 10240)"
 # 9. Server-side history: the sampler writes even though nobody is polling the
 # browser, and the derived endpoints expose availability and points.
 wait_for_samples
-samples="$(metrics_summary_field docker01 samples)"
-availability="$(metrics_summary_field docker01 availability_pct)"
-[[ "$samples" -ge 1 ]] || fail "docker01 has no stored samples ($samples)"
-[[ "$availability" == "100.0" ]] || fail "docker01 availability is $availability, expected 100.0"
+samples="$(metrics_summary_field docker samples)"
+availability="$(metrics_summary_field docker availability_pct)"
+[[ "$samples" -ge 1 ]] || fail "docker has no stored samples ($samples)"
+[[ "$availability" == "100.0" ]] || fail "docker availability is $availability, expected 100.0"
 python3 - "$TMP/metrics-summary.json" <<'PY' || fail "summary sparkline is not 12 points"
 import json, sys
 with open(sys.argv[1]) as f:
@@ -649,13 +649,13 @@ assert all(len(device.get("spark", [])) == 12 for device in data["devices"]), da
 PY
 ok "the server-side sampler stores history without a browser open ($samples samples)"
 
-curl -fsS "$BASE/api/metrics?device=docker01&window=1h" -o "$TMP/metrics-series.json" \
+curl -fsS "$BASE/api/metrics?device=docker&window=1h" -o "$TMP/metrics-series.json" \
     || fail "GET /api/metrics failed"
 python3 - "$TMP/metrics-series.json" <<'PY' || fail "metrics series payload is wrong"
 import json, sys
 with open(sys.argv[1]) as f:
     data = json.load(f)
-assert data["device"]["id"] == "docker01", data.get("device")
+assert data["device"]["id"] == "docker", data.get("device")
 assert data["window"] == "1h", data.get("window")
 assert data["step"] >= 60, data.get("step")
 assert data["points"], "no points"
@@ -672,7 +672,7 @@ ok "/api/metrics returns bucketed points, a step and a derived summary"
 
 # 11b. Rollup routing and peaks: 7d/30d read the 5-minute tier and 90d/1y the
 # hourly tier, and every payload carries min/max bands aligned with points.
-curl -fsS "$BASE/api/metrics?device=docker01&window=7d" \
+curl -fsS "$BASE/api/metrics?device=docker&window=7d" \
     -o "$TMP/series-7d.json" || fail "GET 7d series failed"
 python3 - "$TMP/series-7d.json" <<'PY' || fail "7d series is not rollup-backed"
 import json, sys
@@ -682,7 +682,7 @@ assert data["source"] == "5m", data.get("source")
 assert data["points"], "no 7d points"
 assert len(data["bands"]["cpu"]) == len(data["points"])
 PY
-curl -fsS "$BASE/api/metrics?device=docker01&window=90d" \
+curl -fsS "$BASE/api/metrics?device=docker&window=90d" \
     -o "$TMP/series-90d.json" || fail "GET 90d series failed"
 python3 - "$TMP/series-90d.json" <<'PY' || fail "90d series is not hourly-rollup-backed"
 import json, sys
@@ -962,7 +962,7 @@ ok "an old agent without health blocks gains no fabricated health rows"
 # warnings are evaluated server-side from the summary fields.
 ann_ts="$(python3 -c 'import time; print(int(time.time()) - 60)')"
 cat > "$TMP/annotation-push.json" <<JSON
-{"device": "docker01", "kind": "deploy", "text": "check_api deploy", "ts": $ann_ts}
+{"device": "docker", "kind": "deploy", "text": "check_api deploy", "ts": $ann_ts}
 JSON
 curl -fsS -X POST -H 'Content-Type: application/json' \
     --data-binary @"$TMP/annotation-push.json" \
@@ -974,7 +974,7 @@ with open(sys.argv[1]) as f:
     data = json.load(f)
 assert data["ok"] is True and data["id"], data
 PY
-curl -fsS "$BASE/api/metrics?device=docker01&window=1h" \
+curl -fsS "$BASE/api/metrics?device=docker&window=1h" \
     -o "$TMP/ann-series.json" || fail "GET series with annotations failed"
 python3 - "$TMP/ann-series.json" <<'PY' || fail "annotation is missing from the chart/events"
 import json, sys
@@ -1006,7 +1006,7 @@ for item in data["items"]:
 notes = [item for item in data["items"]
          if item["kind"] == "annotation" and "check_api deploy" in item["text"]]
 assert len(notes) == 1, data["items"]
-assert notes[0]["device_id"] == "docker01", notes[0]
+assert notes[0]["device_id"] == "docker", notes[0]
 assert data["quiet"] is False, data
 PY
 ok "/api/brief names the seeded annotation once and rejects unknown windows"

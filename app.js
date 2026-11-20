@@ -58,7 +58,7 @@ const debugControls = document.getElementById('debug-controls');
 let bookmarksRendered = false;
 let bookmarkStore = [];
 let networkDevices = [];
-// The server describes pve -> docker01 -> Docker in the same payload; null
+// The server describes pve -> docker -> Docker in the same payload; null
 // until the first successful poll, so the tree can fall back to device kinds.
 let networkTopology = null;
 // Keyed by device identity so a poll can patch existing rows, and null until
@@ -555,7 +555,7 @@ function avgText(value) {
 }
 
 // One count feeds both the Network summary and the toolbar health text.
-// The shared helper drops Docker containers, which belong to the docker01
+// The shared helper drops Docker containers, which belong to the docker
 // card rather than counting as separate machines.
 function deviceCounts(devices) {
     const counted = window.dashboardStack.countedDevices(devices);

@@ -30,7 +30,7 @@ a main column (Jump back in, Launchpad, All tools) and a Network rail. There is 
 | `agents/install-windows-agent.ps1` | Windows installer, hidden via `wscript` |
 | `agents/pve-host-agent.py` | Proxmox host agent (host metrics + guest list) |
 | `agents/install-pve-host-agent.sh` | installs the above as a systemd timer |
-| `agents/docker-container-agent.py` | hand-run container agent for docker01; no installer or deploy entry |
+| `agents/docker-container-agent.py` | hand-run container agent for docker; no installer or deploy entry |
 
 ## Endpoints
 
@@ -83,7 +83,7 @@ can answer "is this normal, and since when?" rather than only "what is it now?".
   ts, label, total, used, pct)` with the same bucket timestamp and in the same
   transaction as its aggregate row. A repeat inside a bucket replaces that
   device's volume rows, so a mount that vanished does not linger and a second
-  heartbeat never double-counts. The local `docker01` volume and each agent's
+  heartbeat never double-counts. The local `docker` volume and each agent's
   `disks` array both feed it. LXC guests report no volume data, so they have
   no rows; old agents that send only `disk_pct` simply have none.
 - **Extra signals use one generic table.** `metric_samples (device_id, metric,
@@ -276,7 +276,7 @@ dead or slow URL never delays device sampling.
 | `expect_body` | no | substring that must appear in the response body |
 | `timeout_s` | no | hard per-probe timeout, clamped to 1–60 s; default **5** |
 | `interval_s` | no | per-check cadence, clamped to 10–86400 s; default `DASH_CHECKS_SECONDS` |
-| `device_id` | no | ties the check to a device (`agent:<name>` or `docker01`) for its verdict |
+| `device_id` | no | ties the check to a device (`agent:<name>` or `docker`) for its verdict |
 | `external` | no | `true` when the probe leaves the LAN; a failing external probe is `path_down` |
 
 The file may also be a bare array of check objects. A missing, empty or corrupt
@@ -708,7 +708,7 @@ docker compose up -d
 
 ### Deploying
 
-`server/deploy.sh [ref]` (run as root on `docker01`) fetches the ref, preflights for
+`server/deploy.sh [ref]` (run as root on `docker`) fetches the ref, preflights for
 third-party references, backs up `/opt/stack`, preserves or creates `DASH_AUTH_HASH`,
 installs the server, static files, fonts and the served copies of the agents, runs
 `docker compose up -d`, and smoke-tests both the rendered page and the unauthenticated

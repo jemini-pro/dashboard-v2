@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Deploy the dashboard from the repo to /opt/stack on docker01.
-# Run as root on docker01. No CI; every step is idempotent and backed up.
+# Deploy the dashboard from the repo to /opt/stack on docker.
+# Run as root on docker. No CI; every step is idempotent and backed up.
 #
 #   server/deploy.sh [ref]        # default: main
 #
@@ -18,7 +18,7 @@ BACKUP="$BACKUP_DIR/stack-$TS.tar.gz"
 say() { printf '\n== %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-[ "$(id -u)" -eq 0 ] || die "run as root on docker01"
+[ "$(id -u)" -eq 0 ] || die "run as root on docker"
 [ -d "$STACK/dash" ] || die "missing $STACK/dash"
 [ -f "$STACK/dash/.env" ] || die "missing $STACK/dash/.env"
 

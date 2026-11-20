@@ -510,7 +510,7 @@ class PushTokenTest(ApiTestCase):
             body = app.stats()
 
         self.assertEqual(body["topology"]["host_id"], "agent:pve")
-        self.assertEqual(body["topology"]["docker_host_id"], "docker01")
+        self.assertEqual(body["topology"]["docker_host_id"], "docker")
         self.assertEqual(
             [container["name"] for container in body["topology"]["containers"]],
             ["caddy", "dash"],
@@ -527,7 +527,7 @@ class PushTokenTest(ApiTestCase):
             body = app.stats()
 
         self.assertIsNone(body["topology"]["host_id"])
-        self.assertEqual(body["topology"]["docker_host_id"], "docker01")
+        self.assertEqual(body["topology"]["docker_host_id"], "docker")
         self.assertEqual(len(body["topology"]["containers"]), 2)
 
     def test_static_docker_containers_match_the_compose_services(self):
@@ -1706,7 +1706,7 @@ class MetricsHistoryTest(ApiTestCase):
     # Aligned to an hour so every 60 s sample lands in the intended bucket.
     BASE = int(NOW) - (int(NOW) % 3600)
 
-    def device(self, device_id="docker01", name=None, kind="lxc", online=True,
+    def device(self, device_id="docker", name=None, kind="lxc", online=True,
                cpu=10.0, mem=40.0, disk=50.0, uptime=1000, **extra):
         record = {
             "id": device_id,
@@ -1751,14 +1751,14 @@ class MetricsHistoryTest(ApiTestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][2], 22.0)
 
-        payload = app.metrics_series("docker01", "1h", 60, now=self.BASE + 60)
+        payload = app.metrics_series("docker", "1h", 60, now=self.BASE + 60)
         self.assertEqual(len(payload["points"]), 1)
         self.assertEqual(payload["points"][0][1], 22.0)
 
     def test_non_numeric_agent_values_are_stored_as_missing(self):
         self.sample([self.device(cpu="99", mem=True, disk=None)])
 
-        payload = app.metrics_series("docker01", "1h", 60, now=self.BASE + 60)
+        payload = app.metrics_series("docker", "1h", 60, now=self.BASE + 60)
         _ts, cpu, mem, disk, _online = payload["points"][0]
         self.assertIsNone(cpu)
         self.assertIsNone(mem)
@@ -1830,13 +1830,13 @@ class MetricsHistoryTest(ApiTestCase):
         for index in range(6):
             self.sample([self.device(cpu=float(index * 10))], now=self.BASE + index * 60)
 
-        payload = app.metrics_series("docker01", "1h", 180, now=self.BASE + 300)
+        payload = app.metrics_series("docker", "1h", 180, now=self.BASE + 300)
         self.assertEqual(payload["step"], 180)
         self.assertEqual(len(payload["points"]), 2)
         self.assertEqual(payload["points"][0][1], 10.0)  # 0, 10, 20
         self.assertEqual(payload["points"][1][1], 40.0)  # 30, 40, 50
 
-        tiny = app.metrics_series("docker01", "1h", 1, now=self.BASE + 300)
+        tiny = app.metrics_series("docker", "1h", 1, now=self.BASE + 300)
         self.assertEqual(tiny["step"], 60)
 
     def test_a_step_too_fine_for_the_window_is_raised_to_cap_the_point_count(self):
@@ -1848,27 +1848,27 @@ class MetricsHistoryTest(ApiTestCase):
         self.sample([self.device()], now=time.time())
 
         self.assertEqual(self.get_status("/api/metrics/summary?window=2h")[0], 400)
-        self.assertEqual(self.get_status("/api/metrics?device=docker01&window=2h")[0], 400)
+        self.assertEqual(self.get_status("/api/metrics?device=docker&window=2h")[0], 400)
         self.assertEqual(self.get_status("/api/metrics?window=1h")[0], 400)
-        self.assertEqual(self.get_status("/api/metrics?device=docker01&window=1h&step=x")[0], 400)
+        self.assertEqual(self.get_status("/api/metrics?device=docker&window=1h&step=x")[0], 400)
         self.assertEqual(self.get_status("/api/metrics?device=nope&window=1h")[0], 404)
 
-        status, body = self.get_status("/api/metrics?device=docker01&window=1h")
+        status, body = self.get_status("/api/metrics?device=docker&window=1h")
         payload = json.loads(body)
         self.assertEqual(status, 200)
-        self.assertEqual(payload["device"]["id"], "docker01")
+        self.assertEqual(payload["device"]["id"], "docker")
         self.assertEqual(payload["window"], "1h")
         self.assertTrue(payload["points"])
 
     def test_summary_returns_every_device_with_a_sparkline(self):
         self.sample([
-            self.device("docker01", cpu=10.0),
+            self.device("docker", cpu=10.0),
             self.device("agent:pve", "pve", "host", cpu=20.0),
         ])
 
         payload = app.metrics_summary("1h", now=self.BASE + 60)
         self.assertEqual({device["id"] for device in payload["devices"]},
-                         {"docker01", "agent:pve"})
+                         {"docker", "agent:pve"})
         for device in payload["devices"]:
             self.assertEqual(len(device["spark"]), 12)
 
@@ -1881,19 +1881,19 @@ class MetricsHistoryTest(ApiTestCase):
         with frozen_time(self.BASE + 180):
             payload = app.stats()
 
-        docker = next(device for device in payload["devices"] if device["id"] == "docker01")
+        docker = next(device for device in payload["devices"] if device["id"] == "docker")
         self.assertEqual(docker["availability_24h"], 66.7)
 
     def test_summary_carries_the_same_stack_topology_as_stats(self):
         self.sample([
-            self.device(device_id="docker01", kind="lxc"),
+            self.device(device_id="docker", kind="lxc"),
             self.device(device_id="agent:pve", name="pve", kind="host"),
         ])
 
         payload = app.metrics_summary("1h", now=self.BASE + 60)
 
         self.assertEqual(payload["topology"]["host_id"], "agent:pve")
-        self.assertEqual(payload["topology"]["docker_host_id"], "docker01")
+        self.assertEqual(payload["topology"]["docker_host_id"], "docker")
         self.assertEqual(
             [container["name"] for container in payload["topology"]["containers"]],
             ["caddy", "dash"],
@@ -1918,7 +1918,7 @@ class MetricsHistoryTest(ApiTestCase):
             payload["topology"],
             {"host_id": None, "docker_host_id": None, "containers": []},
         )
-        self.assertEqual(app.metrics_series("docker01", "24h", None, now=self.BASE), None)
+        self.assertEqual(app.metrics_series("docker", "24h", None, now=self.BASE), None)
 
     # ---------- per-volume history ----------
 
@@ -2021,7 +2021,7 @@ class MetricsHistoryTest(ApiTestCase):
                 self.volume("/mnt/data", 80.0, "Data", 2000, 1600),
             ])], now=self.BASE + offset)
 
-        payload = app.metrics_series("docker01", "24h", 3600, now=self.BASE + 7200)
+        payload = app.metrics_series("docker", "24h", 3600, now=self.BASE + 7200)
 
         # The existing aggregate payload keeps its shape.
         self.assertIsInstance(payload["points"], list)
@@ -2070,12 +2070,12 @@ class MetricsHistoryTest(ApiTestCase):
         self.sample([self.device()], now=self.BASE)
         summary = app.metrics_summary("1h", now=self.BASE + 60)["devices"][0]
         self.assertEqual(summary["volumes"], {"count": 0, "fullest": None})
-        series_payload = app.metrics_series("docker01", "1h", 60, now=self.BASE + 60)
+        series_payload = app.metrics_series("docker", "1h", 60, now=self.BASE + 60)
         self.assertEqual(series_payload["volumes"], [])
 
     # ---------- one window reader ----------
 
-    def window_view(self, since, until, step, device_id="docker01"):
+    def window_view(self, since, until, step, device_id="docker"):
         """Read one window through the module the endpoints use, not a table."""
         con = app._connect_metrics()
         try:
@@ -2168,10 +2168,10 @@ class MetricsHistoryTest(ApiTestCase):
     def test_the_series_endpoint_keeps_the_summary_shape_when_the_window_is_empty(self):
         self.sample([self.device()], now=self.BASE)
         populated = app.metrics_series(
-            "docker01", "1h", 60, now=self.BASE + 60
+            "docker", "1h", 60, now=self.BASE + 60
         )["summary"]
         empty = app.metrics_series(
-            "docker01", "1h", 60, now=self.BASE + 86400
+            "docker", "1h", 60, now=self.BASE + 86400
         )["summary"]
         self.assertEqual(empty["samples"], 0)
         self.assertEqual(set(empty), set(populated))
@@ -2197,7 +2197,7 @@ class MetricsHistoryTest(ApiTestCase):
             "device_id, ts, samples, online_samples, cpu_avg, cpu_min, cpu_max",
         )
         self.assertEqual(len(five), 1)
-        self.assertEqual(five[0][:4], ("docker01", self.BASE, 3, 3))
+        self.assertEqual(five[0][:4], ("docker", self.BASE, 3, 3))
         self.assertAlmostEqual(five[0][4], 50.0, places=1)
         self.assertEqual(five[0][5], 10.0)
         self.assertEqual(five[0][6], 90.0)
@@ -2213,7 +2213,7 @@ class MetricsHistoryTest(ApiTestCase):
         for index, cpu in enumerate((10.0, 90.0)):
             self.sample([self.device(cpu=cpu)], now=self.BASE + index * 60)
 
-        payload = app.metrics_series("docker01", "1h", 300, now=self.BASE + 120)
+        payload = app.metrics_series("docker", "1h", 300, now=self.BASE + 120)
 
         self.assertEqual(payload["source"], "raw")
         self.assertEqual(len(payload["points"]), 1)
@@ -2239,7 +2239,7 @@ class MetricsHistoryTest(ApiTestCase):
         finally:
             con.close()
 
-        payload = app.metrics_series("docker01", "7d", 3600, now=now)
+        payload = app.metrics_series("docker", "7d", 3600, now=now)
         self.assertEqual(payload["source"], "5m")
         self.assertEqual([point[1] for point in payload["points"]], [10.0, 20.0])
         self.assertGreaterEqual(payload["summary"]["samples"], 2)
@@ -2258,7 +2258,7 @@ class MetricsHistoryTest(ApiTestCase):
         finally:
             con.close()
 
-        payload = app.metrics_series("docker01", "90d", 21600, now=now)
+        payload = app.metrics_series("docker", "90d", 21600, now=now)
         self.assertEqual(payload["source"], "1h")
         self.assertEqual([point[1] for point in payload["points"]], [42.0])
 
@@ -2340,7 +2340,7 @@ class MetricsHistoryTest(ApiTestCase):
                 self.get_status("/api/metrics/summary?window=" + window)[0], 200
             )
             status, body = self.get_status(
-                "/api/metrics?device=docker01&window=" + window
+                "/api/metrics?device=docker&window=" + window
             )
             self.assertEqual(status, 200)
             self.assertEqual(json.loads(body)["window"], window)
@@ -2404,7 +2404,7 @@ class MetricsHistoryTest(ApiTestCase):
     def test_an_old_agent_without_signals_still_works(self):
         self.sample([self.device()], now=self.BASE)
         self.assertEqual(self.stored_metric_samples(), [])
-        payload = app.metrics_series("docker01", "1h", 60, now=self.BASE + 60)
+        payload = app.metrics_series("docker", "1h", 60, now=self.BASE + 60)
         self.assertEqual(payload["signals"], {})
 
     def test_metrics_series_exposes_signal_points_and_a_derived_swap_pct(self):
@@ -2417,7 +2417,7 @@ class MetricsHistoryTest(ApiTestCase):
             )], now=self.BASE + offset)
 
         signals = app.metrics_series(
-            "docker01", "1h", 300, now=self.BASE + 600
+            "docker", "1h", 300, now=self.BASE + 600
         )["signals"]
         self.assertEqual([point[1] for point in signals["load_1"]["points"]],
                          [0.5, 1.5, 1.0])
@@ -2435,7 +2435,7 @@ class MetricsHistoryTest(ApiTestCase):
         self.sample([self.device(load_1=1.0)], now=self.BASE)
 
         signals = app.metrics_series(
-            "docker01", "30d", None, now=self.BASE
+            "docker", "30d", None, now=self.BASE
         )["signals"]
         # Raw signal rows are kept for 30 d, but the strip only asks for 24 h.
         self.assertEqual([point[1] for point in signals["load_1"]["points"]],
@@ -2482,13 +2482,13 @@ class MetricsHistoryTest(ApiTestCase):
 
     def test_annotation_endpoint_stores_a_note_and_validates_input(self):
         status, body = self.post_annotation({
-            "device": "docker01", "kind": "deploy", "text": "v1.2",
+            "device": "docker", "kind": "deploy", "text": "v1.2",
             "ts": self.BASE,
         })
         self.assertEqual(status, 201)
         self.assertTrue(json.loads(body)["id"])
         self.assertEqual(self.stored_annotations(),
-                         [("docker01", self.BASE, "deploy", "v1.2")])
+                         [("docker", self.BASE, "deploy", "v1.2")])
 
         self.assertEqual(self.post_annotation({"kind": "party", "text": "x"})[0], 400)
         self.assertEqual(self.post_annotation({"kind": "deploy", "text": "  "})[0], 400)
@@ -2505,17 +2505,17 @@ class MetricsHistoryTest(ApiTestCase):
 
     def test_annotations_appear_in_the_window_events_and_as_markers(self):
         self.sample([self.device()], now=self.BASE + 60)
-        self.post_annotation({"device": "docker01", "kind": "deploy",
+        self.post_annotation({"device": "docker", "kind": "deploy",
                               "text": "rolled out", "ts": self.BASE})
         self.post_annotation({"kind": "backup", "text": "nightly backup",
                               "ts": self.BASE + 30})
         self.post_annotation({"device": "agent:other", "kind": "note",
                               "text": "other device", "ts": self.BASE + 40})
-        self.post_annotation({"device": "docker01", "kind": "note",
+        self.post_annotation({"device": "docker", "kind": "note",
                               "text": "too old", "ts": self.BASE - 7200})
 
         payload = app.metrics_series(
-            "docker01", "1h", 60, now=self.BASE + 60
+            "docker", "1h", 60, now=self.BASE + 60
         )
         self.assertEqual(
             [(a["kind"], a["text"], a["auto"]) for a in payload["annotations"]],
@@ -2532,7 +2532,7 @@ class MetricsHistoryTest(ApiTestCase):
         self.sample([self.device(uptime=40)], now=self.BASE + 60)
 
         payload = app.metrics_series(
-            "docker01", "1h", 60, now=self.BASE + 60
+            "docker", "1h", 60, now=self.BASE + 60
         )
         auto = [a for a in payload["annotations"] if a["auto"]]
         self.assertEqual(len(auto), 1)
@@ -2545,7 +2545,7 @@ class MetricsHistoryTest(ApiTestCase):
             self.sample([self.device(uptime=1000 if index % 2 == 0 else 10)],
                         now=self.BASE + index * 60)
         payload = app.metrics_series(
-            "docker01", "1h", 60, now=self.BASE + 3000
+            "docker", "1h", 60, now=self.BASE + 3000
         )
         auto = [a for a in payload["annotations"] if a["auto"]]
         self.assertGreater(len(auto), 0)
@@ -2623,7 +2623,7 @@ class BriefTest(ApiTestCase):
 
     BASE = int(NOW) - (int(NOW) % 3600)
 
-    def device(self, device_id="docker01", name=None, kind="lxc", online=True,
+    def device(self, device_id="docker", name=None, kind="lxc", online=True,
                cpu=10.0, mem=40.0, disk=50.0, uptime=1000, **extra):
         record = {
             "id": device_id,
@@ -2704,9 +2704,9 @@ class BriefTest(ApiTestCase):
 
         self.assertEqual(len(warnings), 1)
         self.assertEqual(warnings[0]["level"], "warning")
-        self.assertEqual(warnings[0]["device_name"], "docker01")
-        self.assertEqual(warnings[0]["text"], "docker01: Disk 86% full")
-        self.assertEqual(warnings[0]["href"], "metrics.html?device=docker01")
+        self.assertEqual(warnings[0]["device_name"], "docker")
+        self.assertEqual(warnings[0]["text"], "docker: Disk 86% full")
+        self.assertEqual(warnings[0]["href"], "metrics.html?device=docker")
         self.assertEqual(payload["counts"]["warning"], 1)
         self.assertEqual(payload["counts"]["critical"], 0)
         self.assertFalse(payload["quiet"])
@@ -2717,10 +2717,10 @@ class BriefTest(ApiTestCase):
         }).encode(), path="/api/annotations")
 
     def test_manual_and_fleet_wide_annotations_appear_once_each(self):
-        self.sample([self.device("docker01"),
+        self.sample([self.device("docker"),
                      self.device("agent:pve", "pve", "host")], now=self.BASE)
         self.assertEqual(self.post_annotation(
-            "docker01", "root volume resized", self.BASE + 30)[0], 201)
+            "docker", "root volume resized", self.BASE + 30)[0], 201)
         self.assertEqual(self.post_annotation(
             "", "cluster reboot", self.BASE + 60, kind="deploy")[0], 201)
 
@@ -2731,12 +2731,12 @@ class BriefTest(ApiTestCase):
         self.assertEqual(
             [(note["device_id"], note["text"]) for note in notes],
             [("", "fleet: cluster reboot"),
-             ("docker01", "docker01: root volume resized")],
+             ("docker", "docker: root volume resized")],
         )
         fleet = notes[0]
         self.assertEqual(fleet["device_name"], "fleet")
         self.assertNotIn("href", fleet)
-        self.assertEqual(notes[1]["href"], "metrics.html?device=docker01")
+        self.assertEqual(notes[1]["href"], "metrics.html?device=docker")
         self.assertIn("deploy", fleet["detail"])
         self.assertFalse(payload["quiet"])
 
@@ -2754,7 +2754,7 @@ class BriefTest(ApiTestCase):
 
         self.assertEqual(len(disks), 1)
         self.assertEqual(disks[0]["text"],
-                         "docker01 root grew 1.5 GB (78% → 79.5%)")
+                         "docker root grew 1.5 GB (78% → 79.5%)")
         self.assertEqual(disks[0]["level"], "warning")
         self.assertIn("7d to 90%", disks[0]["detail"])
         # The aggregate disk/days/growth warnings would repeat this line.
@@ -2800,7 +2800,7 @@ class BriefTest(ApiTestCase):
         self.assertEqual(len(drops), 1)
         self.assertEqual(drops[0]["level"], "warning")
         self.assertEqual(drops[0]["text"],
-                         "docker01 availability fell to 50% (was 100%)")
+                         "docker availability fell to 50% (was 100%)")
 
     def test_a_recovery_from_before_the_window_is_still_reported(self):
         pve = "agent:pve"
@@ -2833,7 +2833,7 @@ class BriefTest(ApiTestCase):
         # 6%/day is above WARN_GROWTH * 5, so evaluate_warnings calls it critical.
         self.assertEqual(disks[0]["level"], "critical")
         self.assertEqual(disks[0]["text"],
-                         "docker01 root grew 6.0 GB (58% → 64%)")
+                         "docker root grew 6.0 GB (58% → 64%)")
 
     def test_a_seven_day_brief_reads_volume_growth_from_rollups(self):
         total = 107374182400
@@ -2984,11 +2984,11 @@ class BriefTest(ApiTestCase):
         with frozen_time(self.BASE + 60):
             first = app.brief("1h")
             self.assertEqual(self.post_annotation(
-                "docker01", "patching", self.BASE + 30)[0], 201)
+                "docker", "patching", self.BASE + 30)[0], 201)
             refreshed = app.brief("1h")
 
         self.assertNotEqual(first["items"], refreshed["items"])
-        self.assertIn("docker01: patching",
+        self.assertIn("docker: patching",
                       {item["text"] for item in refreshed["items"]})
 
 
@@ -3981,7 +3981,7 @@ class ServiceChecksPayloadTest(ApiTestCase):
     def test_the_endpoint_serves_the_documented_shape(self):
         self.write_checks([{
             "id": "web", "name": "Web", "url": "https://web.example/health",
-            "device_id": "docker01",
+            "device_id": "docker",
         }])
         now = time.time()
         app.record_check_samples(
@@ -3999,7 +3999,7 @@ class ServiceChecksPayloadTest(ApiTestCase):
         self.assertEqual(entry["id"], "web")
         self.assertEqual(entry["name"], "Web")
         self.assertEqual(entry["url"], "https://web.example/health")
-        self.assertEqual(entry["device_id"], "docker01")
+        self.assertEqual(entry["device_id"], "docker")
         self.assertIs(entry["ok"], True)
         self.assertEqual(entry["status"], 200)
         self.assertEqual(entry["uptime_24h"], 100.0)
@@ -4082,7 +4082,7 @@ class ServiceChecksPayloadTest(ApiTestCase):
     def test_a_tied_online_host_failing_is_service_down(self):
         entry = self.payload(
             {"id": "web", "url": "https://web.example/",
-             "device_id": "docker01"},
+             "device_id": "docker"},
             [(self.sample("web", False, status=503,
                           error="HTTP 503"), NOW)],
         )

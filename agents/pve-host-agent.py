@@ -24,7 +24,7 @@ if _HERE not in sys.path:
 import dash_common as common  # noqa: E402
 
 URL = os.environ.get("DASH_URL", "http://10.10.10.20:8448").rstrip("/")
-SKIP = {n.strip() for n in os.environ.get("DASH_SKIP", "docker01").split(",") if n.strip()}
+SKIP = {n.strip() for n in os.environ.get("DASH_SKIP", "docker").split(",") if n.strip()}
 HOST = common.LinuxHost()
 
 

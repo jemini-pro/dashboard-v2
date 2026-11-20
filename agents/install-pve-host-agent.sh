@@ -35,7 +35,7 @@ echo "== 2. token, read from the container (never printed) =="
 TOKEN=$(pct exec "${CTID}" -- sed -n 's/^DASH_TOKEN=//p' "${ENVF}")
 if [ -z "${TOKEN}" ]; then echo "no DASH_TOKEN in ${ENVF}"; exit 1; fi
 umask 077
-printf 'DASH_URL=http://10.10.10.20:8448\nDASH_TOKEN=%s\nDASH_SKIP=docker01\n' "${TOKEN}" > /etc/dash-pve-agent.env
+printf 'DASH_URL=http://10.10.10.20:8448\nDASH_TOKEN=%s\nDASH_SKIP=docker\n' "${TOKEN}" > /etc/dash-pve-agent.env
 chmod 600 /etc/dash-pve-agent.env
 echo "wrote /etc/dash-pve-agent.env"
 

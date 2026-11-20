@@ -216,8 +216,8 @@ def local_device():
             "pct": round(100.0 * du.used / du.total, 1),
         })
     return {
-        "id": "docker01",
-        "name": "docker01",
+        "id": "docker",
+        "name": "docker",
         "kind": "lxc",
         "source": "local",
         "cpu_pct": _local_cpu_pct(),
@@ -257,6 +257,9 @@ MAX_GUEST_INT = 100_000
 # even when the installed host agent is older than the dashboard. A `role` an
 # agent does report wins over this table.
 LXC_ROLES = {
+    # CT 210 was renamed agent -> t3. Both keys name the same guest so the
+    # label survives the cutover; "agent" can go once the rename has landed.
+    "t3": "T3 Code",
     "agent": "T3 Code",
     "hermes": "Hermes",
 }
@@ -278,7 +281,7 @@ def clean_text(value, limit=MAX_CONTAINER_TEXT):
 
 
 def stack_topology(devices):
-    """Describe where this dashboard runs: pve -> docker01 LXC -> Docker.
+    """Describe where this dashboard runs: pve -> docker LXC -> Docker.
 
     The page itself is served by the dash container through caddy, so both are
     running whenever this payload can be read. Their names and roles are
@@ -292,7 +295,7 @@ def stack_topology(devices):
     )
     if host is None:
         host = next((d for d in devices if d.get("kind") == "host"), None)
-    docker_host = next((d for d in devices if d.get("id") == "docker01"), None)
+    docker_host = next((d for d in devices if d.get("id") == "docker"), None)
 
     containers = [dict(c) for c in DOCKER_CONTAINERS]
     known = {c["name"] for c in containers}
@@ -1825,7 +1828,7 @@ def _live_state(now):
         d["id"]: {"online": bool(d["online"]), "last_seen": int(d["last_seen"])}
         for d in agent_devices()
     }
-    state["docker01"] = {"online": True, "last_seen": int(now)}
+    state["docker"] = {"online": True, "last_seen": int(now)}
     return state
 
 

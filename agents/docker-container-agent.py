@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Push Docker container stats from docker01 to the homelab dashboard.
+"""Push Docker container stats from docker to the homelab dashboard.
 
 Runs on the Docker host as root, once a minute, from cron. Reads `docker stats`
 and `docker inspect`, then POSTs one device per **running** container with
@@ -11,7 +11,7 @@ which is the direction that already works. A container that stops simply stops
 reporting, and the dashboard marks it exited once the heartbeat goes stale.
 
 There is no installer and no deploy entry for this file: it is run by hand.
-Put it and a copy of dash_common.py in the same directory on docker01
+Put it and a copy of dash_common.py in the same directory on docker
 (dash_common.py is served at /agents/dash_common.py), then run:
 
     DASH_TOKEN=... python3 docker-container-agent.py
