@@ -1899,6 +1899,18 @@ class MetricsHistoryTest(ApiTestCase):
             ["caddy", "dash"],
         )
 
+    def test_a_guest_keeps_its_role_on_the_metrics_rail_too(self):
+        self.sample([
+            self.device(device_id="agent:agent", name="agent", kind="lxc-guest"),
+            self.device(device_id="agent:mystery", name="mystery", kind="lxc-guest"),
+        ])
+
+        payload = app.metrics_summary("1h", now=self.BASE + 60)
+        by_id = {device["id"]: device for device in payload["devices"]}
+
+        self.assertEqual(by_id["agent:agent"]["role"], "T3 Code")
+        self.assertNotIn("role", by_id["agent:mystery"])
+
     def test_a_fresh_install_returns_an_empty_summary_without_creating_a_database(self):
         payload = app.metrics_summary("24h", now=self.BASE)
         self.assertEqual(payload["devices"], [])

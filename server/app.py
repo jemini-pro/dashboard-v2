@@ -262,6 +262,13 @@ LXC_ROLES = {
 }
 
 
+def guest_role(kind, name):
+    """What a pve guest runs, when it is one this dashboard knows."""
+    if kind != "lxc-guest":
+        return None
+    return LXC_ROLES.get(name or "")
+
+
 def clean_text(value, limit=MAX_CONTAINER_TEXT):
     """Trim an agent string into something safe to re-serve to every browser."""
     if not isinstance(value, str):
@@ -600,8 +607,8 @@ def agent_devices():
         disks = disks if isinstance(disks, list) else []
         health = clean_health(rec.get("health"))
         role = rec.get("role")
-        if not role and rec.get("kind") == "lxc-guest":
-            role = LXC_ROLES.get(rec.get("name") or name)
+        if not role:
+            role = guest_role(rec.get("kind"), rec.get("name") or name)
         out.append({
             "id": f"agent:{name}",
             "name": rec.get("name", name),
@@ -2824,10 +2831,14 @@ def metrics_summary(window=DEFAULT_WINDOW, now=None):
             payload["source"] = view["source"]
             state = live.get(device_id, {})
             health = _latest_health(con, device_id)
+            role = guest_role(kind, name)
             entry = {
                 "id": device_id,
                 "name": name,
                 "kind": kind,
+                # The metrics page draws the same rail, so a guest needs the same
+                # role label here; this store only keeps id, name and kind.
+                **({"role": role} if role else {}),
                 "online": state.get("online", view["online"]),
                 "last_seen": state.get("last_seen", int(last_seen)),
                 "spark": spark,
