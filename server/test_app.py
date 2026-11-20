@@ -439,7 +439,6 @@ class PushTokenTest(ApiTestCase):
                 "kind": "lxc-guest",
                 "name": "agent",
                 "state": "running",
-                "role": "T3 Code",
                 "vmid": 210,
                 "vcpu": 4,
                 "cpu_pct": 0.1,
@@ -457,12 +456,37 @@ class PushTokenTest(ApiTestCase):
 
         device = next(d for d in body["devices"] if d["id"] == "agent:agent")
         self.assertEqual(device["kind"], "lxc-guest")
-        self.assertEqual(device["role"], "T3 Code")
         self.assertEqual(device["vmid"], 210)
         self.assertEqual(device["vcpu"], 4)
+        # The dashboard owns what a guest runs, so an installed agent older than
+        # the deploy still gets a role on the page.
+        self.assertEqual(device["role"], "T3 Code")
         # A guest is a device of its own, never a row in the Docker block.
         names = [c["name"] for c in body["topology"]["containers"]]
         self.assertNotIn("agent", names)
+
+    def test_a_guest_role_reported_by_its_agent_wins_over_the_table(self):
+        self.push_payload(
+            {"kind": "lxc-guest", "name": "hermes", "role": "Hermes agent"},
+            name="hermes",
+        )
+        app._cache.update(at=0.0, body=None)
+
+        with frozen_time():
+            body = app.stats()
+
+        device = next(d for d in body["devices"] if d["id"] == "agent:hermes")
+        self.assertEqual(device["role"], "Hermes agent")
+
+    def test_a_guest_with_no_known_role_is_not_given_one(self):
+        self.push_payload({"kind": "lxc-guest", "name": "mystery"}, name="mystery")
+        app._cache.update(at=0.0, body=None)
+
+        with frozen_time():
+            body = app.stats()
+
+        device = next(d for d in body["devices"] if d["id"] == "agent:mystery")
+        self.assertNotIn("role", device)
 
     def test_a_nonsense_guest_identity_is_not_stored(self):
         self.push_payload(

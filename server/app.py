@@ -251,6 +251,17 @@ GUEST_INT_FIELDS = ("vmid", "vcpu")
 MAX_GUEST_INT = 100_000
 
 
+# What each pve guest runs. This is a deployment fact like DOCKER_CONTAINERS,
+# not a sample: pve reports CPU, RAM and disk, but nothing about the job a
+# container does. It lives here rather than on the host so the page is right
+# even when the installed host agent is older than the dashboard. A `role` an
+# agent does report wins over this table.
+LXC_ROLES = {
+    "agent": "T3 Code",
+    "hermes": "Hermes",
+}
+
+
 def clean_text(value, limit=MAX_CONTAINER_TEXT):
     """Trim an agent string into something safe to re-serve to every browser."""
     if not isinstance(value, str):
@@ -588,6 +599,9 @@ def agent_devices():
         disks = rec.get("disks")
         disks = disks if isinstance(disks, list) else []
         health = clean_health(rec.get("health"))
+        role = rec.get("role")
+        if not role and rec.get("kind") == "lxc-guest":
+            role = LXC_ROLES.get(rec.get("name") or name)
         out.append({
             "id": f"agent:{name}",
             "name": rec.get("name", name),
@@ -602,7 +616,9 @@ def agent_devices():
             "uptime_s": rec.get("uptime_s"),
             **{metric: rec.get(metric) for metric in EXTRA_METRICS
                if metric in rec},
-            **{key: rec[key] for key in CONTAINER_FIELDS if key in rec},
+            **{key: rec[key] for key in CONTAINER_FIELDS
+               if key in rec and key != "role"},
+            **({"role": role} if role else {}),
             **{key: rec[key] for key in GUEST_INT_FIELDS if key in rec},
             **({"health": health} if health else {}),
             "online": age < 150,  # agents push every 60 s; allow two misses
