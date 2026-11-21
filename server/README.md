@@ -453,9 +453,10 @@ overflow. At the target desktop sizes every core section fits in one screen.
 
 A device that reports more than one volume gets a compact breakdown under its row
 (label, size, bar, percentage). The `DSK` cell stays a single gauge and shows the
-**fullest** volume, so a nearly full data or external drive cannot hide behind a roomy
-system disk. Single-volume devices render no extra line, keeping the rail at its old
-height.
+**machine total** — used space over total space across every volume. A drive that is
+nearly full is still visible in its own row (and named in the device's disk warning),
+while the gauge answers "how full is this box". Single-volume devices render no extra
+line, keeping the rail at its old height.
 
 - Search filters title, description and category case-insensitively, shows `x of N tools`
   and names the query when nothing matches. `/` focuses the field; `Esc` clears and blurs.
@@ -484,13 +485,16 @@ Responsive rules:
 ]
 ```
 
-`dash-agent.ps1` reports every fixed and removable Windows volume, not just `C:`.
-`dash-agent.py` reports every real local Linux/macOS filesystem, root first, skipping
-pseudo filesystems, snap loops and duplicate mounts. `pve-host-agent.py` reports the
-Proxmox host's root filesystem; LXC guests have no volume data and send none. The server
-drops malformed entries, caps the list at 16 and recomputes `disk_pct` as the fullest
-volume. Agents that have not been updated keep working: they send only `disk_pct`, so they
-get no breakdown and their single gauge stays as it was.
+`dash-agent.ps1` reports every fixed and removable Windows volume, not just `C:`, and
+skips volumes with no partition behind them: Google Drive for desktop mounts each account
+as a virtual fixed drive whose size and free space are the cloud account's quota, not
+storage attached to the machine. `dash-agent.py` reports every real local Linux/macOS
+filesystem, root first, skipping pseudo filesystems, snap loops and duplicate mounts.
+`pve-host-agent.py` reports the Proxmox host's root filesystem; LXC guests have no volume
+data and send none. The server drops malformed entries, caps the list at 16 and recomputes
+`disk_pct` as used space over total space across all volumes. Agents that have not been
+updated keep working: they send only `disk_pct`, so they get no breakdown and their single
+gauge stays as it was.
 
 Every accepted `disks` entry is also written to `disk_samples`, so per-volume growth and
 days-to-90 survive the live payload and are available after a restart. The local

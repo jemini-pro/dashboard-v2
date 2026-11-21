@@ -66,10 +66,26 @@ $memUsed  = $memTotal - $memFree
 # Every fixed or removable volume, not just C:. DriveType 3 is a local fixed
 # disk and 2 is removable (USB enclosure); 4 is a mapped network drive, which
 # is not storage on this machine and would report another box's free space.
+#
+# DriveType alone is not enough. Google Drive for desktop mounts each account
+# as a virtual fixed drive whose size and free space are the cloud account's
+# quota, so it must not count as a disk attached to this machine. A real volume
+# has a partition on a disk behind it; a virtual one has no
+# Win32_LogicalDiskToPartition entry. If that query fails entirely, fall back
+# to DriveType alone rather than dropping every drive.
+$backed = @{}
+foreach ($link in @(Get-CimInstance Win32_LogicalDiskToPartition -ErrorAction SilentlyContinue)) {
+    if ($link.Dependent -match 'Win32_LogicalDisk\.DeviceID="([A-Za-z]:)"') {
+        $backed[$matches[1].ToUpperInvariant()] = $true
+    }
+}
+$hasDiskBehind = { param($id) $backed.Count -eq 0 -or $backed.ContainsKey(([string]$id).ToUpperInvariant()) }
+
 $disks = @(Get-CimInstance Win32_LogicalDisk -ErrorAction SilentlyContinue |
     Where-Object {
         ($_.DriveType -eq 2 -or $_.DriveType -eq 3) -and
-        $_.Size -gt 0 -and $null -ne $_.FreeSpace
+        $_.Size -gt 0 -and $null -ne $_.FreeSpace -and
+        (& $hasDiskBehind $_.DeviceID)
     } |
     Sort-Object DeviceID |
     ForEach-Object {
@@ -85,10 +101,13 @@ $disks = @(Get-CimInstance Win32_LogicalDisk -ErrorAction SilentlyContinue |
         }
     })
 
-# The summary gauge follows the fullest volume, so a nearly full data or USB
-# drive is not hidden behind a roomy system drive.
-$diskPct = if ($disks.Count -gt 0) {
-    ($disks | Measure-Object -Property pct -Maximum).Maximum
+# The summary gauge is the whole machine: used over total across every volume.
+# Per-volume rows above still show which drive is the full one, and the server
+# names it in the disk warning.
+$diskTotalBytes = ($disks | Measure-Object -Property total -Sum).Sum
+$diskUsedBytes  = ($disks | Measure-Object -Property used -Sum).Sum
+$diskPct = if ($disks.Count -gt 0 -and $diskTotalBytes -gt 0) {
+    [math]::Round(100.0 * $diskUsedBytes / $diskTotalBytes, 1)
 } else {
     $null
 }

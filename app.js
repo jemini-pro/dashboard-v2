@@ -614,8 +614,9 @@ function diskRow(disk) {
         '</div>';
 }
 
-// One volume is already summarised by the DSK cell; only a multi-volume device
-// needs the breakdown, so single-disk rows stay exactly as compact as before.
+// The DSK cell is the machine total; only a multi-volume device needs the
+// breakdown that shows which drive is the full one, so single-disk rows stay
+// exactly as compact as before.
 function deviceDisks(d) {
     const disks = Array.isArray(d.disks) ? d.disks : [];
     if (disks.length < 2) return '';

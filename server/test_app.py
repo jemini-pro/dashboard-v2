@@ -553,7 +553,7 @@ class PushTokenTest(ApiTestCase):
                       headers={"X-Dash-Token": self.TOKEN})[0], 201
         )
 
-    def test_every_volume_is_stored_and_the_fullest_drives_the_summary(self):
+    def test_every_volume_is_stored_and_the_summary_totals_them(self):
         status, _ = self.push_payload({
             "kind": "pc",
             "disk_pct": 12.0,
@@ -567,10 +567,32 @@ class PushTokenTest(ApiTestCase):
         device = self.stored_device("JEM-PC")
         self.assertEqual([d["mount"] for d in device["disks"]], ["C:\\", "D:\\", "E:\\"])
         self.assertEqual([d["label"] for d in device["disks"]], ["Windows", "Data", "External"])
-        # The single DSK gauge must not stay pinned to C: when D: is nearly full.
-        self.assertEqual(device["disk_pct"], 98.7)
+        # The DSK gauge is the whole machine: 1507 GB used of 4000 GB, not the
+        # agent's own number and not the fullest single volume.
+        self.assertEqual(device["disk_pct"], 37.7)
         stored = json.loads((self.data / "agents.json").read_text())["JEM-PC"]
         self.assertEqual(len(stored["disks"]), 3)
+
+    def test_a_nearly_full_drive_is_named_over_the_machine_average(self):
+        status, _ = self.push_payload({
+            "kind": "pc",
+            "disks": [
+                {"mount": "C:\\", "label": "C:", "total": 1000, "used": 990, "pct": 99.0},
+                {"mount": "D:\\", "label": "Backup", "total": 9000, "used": 900, "pct": 10.0},
+            ],
+        })
+        self.assertEqual(status, 200)
+        device = self.stored_device("JEM-PC")
+
+        # The gauge averages the machine, but the warning still names C:, so a
+        # nearly full system drive cannot hide behind a roomy backup disk.
+        self.assertEqual(device["disk_pct"], 18.9)
+        self.assertEqual(device["warning_count"], 1)
+        self.assertEqual(device["warning_level"], "critical")
+        disk = [w for w in app.live_warnings(device, time.time())
+                if w["code"] == "disk"][0]
+        self.assertEqual(disk["text"], "C: 99% full")
+        self.assertEqual(disk["value"], 99.0)
 
     def test_malformed_disk_entries_are_dropped_and_values_clamped(self):
         status, _ = self.push_payload({
@@ -2616,6 +2638,21 @@ class MetricsHistoryTest(ApiTestCase):
         agent = next(d for d in payload["devices"] if d["id"] == "agent:warnpc")
         self.assertEqual(agent["warning_count"], 2)
         self.assertEqual(agent["warning_level"], "critical")
+
+    def test_only_a_multi_volume_device_names_its_fullest_volume(self):
+        disks = [
+            {"mount": "C:\\", "label": "C:", "pct": 99.0},
+            {"mount": "D:\\", "label": "Data", "pct": 30.0},
+        ]
+        self.assertEqual(app.fullest_volume({"disks": disks}), (99.0, "C:"))
+        # One volume is the machine, so the generic wording is right.
+        self.assertIsNone(app.fullest_volume({"disks": disks[:1]}))
+        # The fleet summary ships only the fullest plus a count.
+        self.assertEqual(
+            app.fullest_volume({"volumes": {"count": 2, "fullest": disks[0]}}),
+            (99.0, "C:"))
+        self.assertIsNone(app.fullest_volume(
+            {"volumes": {"count": 1, "fullest": disks[0]}}))
 
 
 class BriefTest(ApiTestCase):

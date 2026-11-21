@@ -413,16 +413,24 @@ class CollectHostTest(unittest.TestCase):
         for key in ("load_1", "swap_used", "net_rx_bps", "cpu_iowait"):
             self.assertNotIn(key, empty)
 
-    def test_summary_uses_the_fullest_volume(self):
+    def test_summary_totals_every_volume(self):
         host = StubHost(volumes=[
             {"mount": "/", "label": "System", "total": 100, "used": 10, "pct": 10.0},
             {"mount": "/mnt/data", "label": "Data", "total": 100, "used": 99, "pct": 99.0},
+            {"mount": "/mnt/roomy", "label": "Roomy", "total": 800, "used": 0, "pct": 0.0},
         ])
 
         payload = dash_common.collect_host("pc", "pc", host=host)
 
-        self.assertEqual(payload["disk_pct"], 99.0)
-        self.assertEqual(len(payload["disks"]), 2)
+        # 109 used of 1000 total, not the fullest volume.
+        self.assertEqual(payload["disk_pct"], 10.9)
+        self.assertEqual(len(payload["disks"]), 3)
+
+    def test_an_unsized_volume_does_not_divide_by_zero(self):
+        self.assertIsNone(dash_common.aggregate_disk_pct([]))
+        self.assertIsNone(dash_common.aggregate_disk_pct([
+            {"mount": "/", "label": "System", "total": 0, "used": 0, "pct": 0.0},
+        ]))
 
     def test_an_explicit_volume_source_replaces_the_platform_one(self):
         host = StubHost(volumes=[
@@ -778,6 +786,24 @@ class WindowsDiskReportingTest(unittest.TestCase):
         self.assertRegex(src, r"disks\s*=\s*\$disks")
         self.assertRegex(src, r"disk_pct\s*=\s*\$diskPct")
         self.assertIn("-Depth 4", src)
+
+    def test_only_drives_with_a_disk_behind_them_count(self):
+        # Google Drive for desktop mounts accounts as virtual fixed drives whose
+        # size and free space are the cloud quota. They have no partition, so
+        # the partition association is the filter. If that query fails, the
+        # DriveType rule alone still reports the machine's real disks.
+        src = (AGENTS / "dash-agent.ps1").read_text()
+
+        self.assertIn("Win32_LogicalDiskToPartition", src)
+        self.assertIn("$hasDiskBehind", src)
+        self.assertRegex(src, r"\$backed\.Count -eq 0 -or \$backed\.ContainsKey")
+
+    def test_the_summary_gauge_totals_the_volumes(self):
+        src = (AGENTS / "dash-agent.ps1").read_text()
+
+        self.assertRegex(src, r"Measure-Object -Property total -Sum")
+        self.assertRegex(src, r"Measure-Object -Property used -Sum")
+        self.assertRegex(src, r"100\.0 \* \$diskUsedBytes / \$diskTotalBytes")
 
 
 class WindowsSignalReportingTest(unittest.TestCase):
