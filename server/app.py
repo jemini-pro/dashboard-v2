@@ -443,11 +443,54 @@ def clean_disks(raw):
     return out
 
 
-def worst_disk_pct(disks, fallback):
-    """The DSK cell summarises the fullest volume, so a nearly full data or
-    external drive cannot hide behind a roomy root filesystem."""
-    values = [value for d in disks if (value := _finite(d.get("pct"))) is not None]
-    return max(values) if values else fallback
+def aggregate_disk_pct(disks, fallback):
+    """The DSK cell summarises the whole machine: used over total across every
+    volume, not the fullest one. An agent that reports no readable volume keeps
+    its own single number."""
+    total = used = 0.0
+    for disk in disks if isinstance(disks, list) else []:
+        if not isinstance(disk, dict):
+            continue
+        size = _finite(disk.get("total"))
+        if size is None or size <= 0:
+            continue
+        total += size
+        used += _finite(disk.get("used")) or 0.0
+    if total > 0:
+        return round(100.0 * min(used, total) / total, 1)
+    return fallback
+
+
+def fullest_volume(device):
+    """(pct, label) for the volume a disk warning should name, or None.
+
+    Only a multi-volume device names one: with a single drive the machine
+    gauge is that drive, so the generic "Disk n% full" wording stays. With
+    several, averaging can hide a full drive, and that drive is what a person
+    has to clear. Callers carry the list in different shapes: the rail has the
+    full `disks`, the fleet summary a compact `{count, fullest}`, and the
+    single-device view the full `volumes` series.
+    """
+    entries = device.get("disks")
+    count = len(entries) if isinstance(entries, list) else 0
+    if not count:
+        volumes = device.get("volumes")
+        if isinstance(volumes, list):
+            entries, count = volumes, len(volumes)
+        elif isinstance(volumes, dict) and isinstance(volumes.get("fullest"), dict):
+            entries = [volumes["fullest"]]
+            count = int(_finite(volumes.get("count")) or len(entries))
+        else:
+            entries = []
+    if count < 2:
+        return None
+    sized = [entry for entry in entries
+             if isinstance(entry, dict) and _finite(entry.get("pct")) is not None]
+    if not sized:
+        return None
+    best = max(sized, key=lambda entry: entry["pct"])
+    name = best.get("label") or best.get("mount") or ""
+    return _finite(best.get("pct")), name
 
 
 # ---------- failure-mode health ----------
@@ -621,7 +664,7 @@ def agent_devices():
             "mem_pct": rec.get("mem_pct"),
             "mem_used": rec.get("mem_used"),
             "mem_total": rec.get("mem_total"),
-            "disk_pct": worst_disk_pct(disks, rec.get("disk_pct")),
+            "disk_pct": aggregate_disk_pct(disks, rec.get("disk_pct")),
             "disks": disks,
             "uptime_s": rec.get("uptime_s"),
             **{metric: rec.get(metric) for metric in EXTRA_METRICS
@@ -2181,13 +2224,21 @@ def evaluate_warnings(device, now):
     """
     warnings = []
 
+    # The gauge is the machine total, but the warning names the fullest volume
+    # on a multi-volume device: a 99%-full C: must not hide in a 60% average.
     disk = _finite(device.get("disk_pct"))
-    level = _high_warning(disk, WARN_DISK_PCT,
+    fullest = fullest_volume(device)
+    if fullest and fullest[1] and (disk is None or fullest[0] > disk):
+        value, text = fullest[0], f"{fullest[1]} {fullest[0]:.0f}% full"
+    else:
+        value = disk
+        text = f"Disk {disk:.0f}% full" if disk is not None else ""
+    level = _high_warning(value, WARN_DISK_PCT,
                           min(99.0, WARN_DISK_PCT + 10))
     if level:
         warnings.append({
-            "code": "disk", "level": level, "value": round(disk, 1),
-            "threshold": WARN_DISK_PCT, "text": f"Disk {disk:.0f}% full",
+            "code": "disk", "level": level, "value": round(value, 1),
+            "threshold": WARN_DISK_PCT, "text": text,
         })
 
     days = _finite(device.get("days_to_90"))
@@ -2247,6 +2298,7 @@ def live_warnings(device, now):
     """
     return evaluate_warnings({
         "disk_pct": device.get("disk_pct"),
+        "disks": device.get("disks"),
         "mem_pct": device.get("mem_pct"),
         "online": device.get("online", True),
         "last_seen": device.get("last_seen"),
@@ -2609,9 +2661,9 @@ def _volume_series(con, device_id, since, until, step, source):
 def _volume_summary(volumes):
     """The compact per-device volume summary: count and the fullest volume.
 
-    The fullest volume is the one the aggregate DSK gauge already reports, so
-    this is the mount worth projecting days-to-90 for without shipping every
-    series in the fleet summary.
+    The fullest volume is the one the disk warning names on a multi-volume
+    device, so it is the mount worth projecting days-to-90 for without
+    shipping every series in the fleet summary.
     """
     if not volumes:
         return {"count": 0, "fullest": None}
@@ -2936,6 +2988,7 @@ def metrics_series(device_id, window=DEFAULT_WINDOW, requested_step=None, now=No
     payload["health_history"] = health_history
     payload["warnings"] = evaluate_warnings({
         **view["summary"],
+        "volumes": view["volumes"],
         "online": payload["device"]["online"],
         "last_seen": payload["device"]["last_seen"],
         "health": health,
@@ -3000,9 +3053,9 @@ def _brief_volume_item(name, device_id, volumes, now):
         delta = pct - first if first is not None else None
         days = _finite(volume.get("days_to_90"))
         growth = _finite(volume.get("growth_per_day"))
-        # The same warning rules as evaluate_warnings, so a volume cannot be
-        # called a warning while the aggregate gauge calls it critical. A move
-        # that crosses no configured line is still worth a line, but only info.
+        # The same thresholds as evaluate_warnings, so a volume and the device
+        # warning never disagree about what counts as critical. A move that
+        # crosses no configured line is still worth a line, but only info.
         levels = (
             _high_warning(pct, WARN_DISK_PCT, min(99.0, WARN_DISK_PCT + 10)),
             _low_warning(days, WARN_DAYS_TO_90, max(1.0, WARN_DAYS_TO_90 / 4)),

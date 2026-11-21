@@ -287,6 +287,18 @@ def volumes(system=None):
     return found[:MAX_DISKS]
 
 
+def aggregate_disk_pct(found):
+    """The share of every reported volume that is in use.
+
+    One number for the whole machine: sum(used) / sum(total), not the fullest
+    single volume. A volume that cannot be sized contributes nothing, and no
+    sized volumes means no reading rather than a fabricated 0%.
+    """
+    total = sum(d["total"] for d in found if d.get("total"))
+    used = sum(d["used"] for d in found if d.get("total") and d.get("used"))
+    return round(100.0 * used / total, 1) if total else None
+
+
 # ---------- platform seam ----------
 
 class BaseHost:
@@ -515,9 +527,9 @@ def collect_host(name, kind, host=None, volumes_from=None):
         "mem_pct": round(100.0 * used / total, 1) if total else None,
         "mem_used": used,
         "mem_total": total,
-        # One number for the whole device: the fullest volume, so a nearly
-        # full data or external drive cannot hide behind a roomy system disk.
-        "disk_pct": max((d["pct"] for d in found), default=None),
+        # One number for the whole device: used over total across every
+        # volume. Per-volume rows still show which drive is the full one.
+        "disk_pct": aggregate_disk_pct(found),
         "disks": found,
         "uptime_s": host.uptime_s(),
     }
