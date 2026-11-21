@@ -1511,6 +1511,230 @@ input:focus-visible {
     }
 }
 
+/* Tall half-page window (e.g. 1280x1440, half of a 2560x1440 monitor).
+   The Workbench above is tuned for short, wide laptop screens; in a tall
+   window it leaves the main column half empty. Use the status-split layout
+   chosen by the 2026-11-21 prototype instead: a full-height fleet/services
+   column on the left and a workspace ordered Launchpad -> Jump back in ->
+   What changed -> All tools. Only the portrait desktop shape changes; the
+   1280x800 and 1440x900 layouts above stay exactly as they were. */
+@media (min-width: 1181px) and (orientation: portrait) {
+    .dashboard-workbench {
+        padding: 18px;
+        gap: 14px;
+    }
+
+    .dashboard-workbench .body-grid {
+        grid-template-columns: 470px minmax(0, 1fr);
+        gap: 14px;
+    }
+
+    /* The rail becomes the status column. It is placed first visually while
+       the main column stays first in the DOM, so the landscape Workbench and
+       its reading order are unchanged. */
+    .dashboard-workbench .rail {
+        order: 1;
+        display: flex;
+        flex-direction: column;
+        gap: 0;
+        padding: 16px 18px;
+        background: var(--card-bg);
+        border: 1px solid var(--card-border);
+        border-radius: var(--radius);
+        box-shadow: var(--card-shadow);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+        overflow-y: auto;
+        scrollbar-width: thin;
+    }
+
+    /* One continuous status surface: the two rail cards stop being cards. */
+    .dashboard-workbench .rail > .card {
+        background: none;
+        border: 0;
+        border-radius: 0;
+        box-shadow: none;
+        backdrop-filter: none;
+        -webkit-backdrop-filter: none;
+    }
+
+    .dashboard-workbench .network-panel {
+        padding: 0;
+    }
+
+    /* Services sit at the foot of the status column, separated by a rule. */
+    .dashboard-workbench .services-panel {
+        margin-top: auto;
+        padding: 14px 0 0;
+        border-top: 1px solid color-mix(in srgb, var(--text-color) 16%, transparent);
+    }
+
+    .dashboard-workbench .main-column {
+        order: 2;
+        gap: 14px;
+    }
+
+    /* Flatten the paired row so its two cards can lead the workspace in the
+       order the prototype chose. */
+    .dashboard-workbench .top-row {
+        display: contents;
+    }
+
+    .dashboard-workbench .launchpad-card {
+        order: 1;
+        flex: none;
+    }
+
+    .dashboard-workbench .usage-card {
+        order: 2;
+        flex: none;
+    }
+
+    .dashboard-workbench .brief-card {
+        order: 3;
+        flex: none;
+    }
+
+    .dashboard-workbench .all-tools-card {
+        order: 4;
+    }
+
+    /* Tall windows buy readable type and roomier rows instead of a longer
+       scroll: the short-screen density above is restored for landscape. */
+    .dashboard-workbench .network-panel .card-heading {
+        font-size: 1.1rem;
+    }
+
+    .dashboard-workbench .network-panel .card-head {
+        margin-bottom: 12px;
+    }
+
+    .dashboard-workbench .network-branch-head {
+        padding: 10px 0 4px;
+        font-size: 0.54rem;
+    }
+
+    .dashboard-workbench .device-row {
+        grid-template-columns: minmax(0, 1fr) repeat(3, 64px);
+        gap: 10px;
+        padding: 24px 0 25px;
+    }
+
+    .dashboard-workbench .device-name {
+        font-size: 0.92rem;
+    }
+
+    .dashboard-workbench .device-sub {
+        font-size: 0.6rem;
+    }
+
+    .dashboard-workbench .device-avail {
+        margin-left: auto;
+    }
+
+    .dashboard-workbench .metric-label {
+        font-size: 0.56rem;
+    }
+
+    .dashboard-workbench .metric-value {
+        font-size: 0.74rem;
+    }
+
+    .dashboard-workbench .service-row {
+        padding: 10px 0;
+    }
+
+    .dashboard-workbench .service-row + .service-row {
+        border-top: 1px solid var(--sidebar-border);
+    }
+
+    .dashboard-workbench .service-name {
+        font-size: 0.78rem;
+    }
+
+    .dashboard-workbench .service-meta,
+    .dashboard-workbench .service-verdict {
+        font-size: 0.6rem;
+    }
+
+    .dashboard-workbench .launchpad-grid {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 10px;
+        align-content: start;
+    }
+
+    .dashboard-workbench .launchpad-tile {
+        min-height: 92px;
+        padding: 12px 8px 11px;
+        justify-content: center;
+    }
+
+    .dashboard-workbench .launchpad-icon {
+        width: 34px;
+        height: 34px;
+    }
+
+    .dashboard-workbench .launchpad-tile-label {
+        font-size: 0.68rem;
+    }
+
+    /* Six recent tools read better as two short columns than one scrolling
+       list when there is height to spend. */
+    .dashboard-workbench .usage-list {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        column-gap: 22px;
+        row-gap: 1px;
+        max-height: none;
+        overflow: visible;
+    }
+
+    .dashboard-workbench .usage-row {
+        padding: 8px 5px;
+    }
+
+    /* Cap the brief so a busy 24 h cannot push All tools off screen; six
+       rows fit, more scroll inside the card as before. */
+    .dashboard-workbench .brief-list {
+        max-height: 240px;
+    }
+
+    .dashboard-workbench .brief-row-link {
+        padding: 12px 5px;
+    }
+
+    .dashboard-workbench .brief-time {
+        font-size: 0.64rem;
+    }
+
+    .dashboard-workbench .brief-device,
+    .dashboard-workbench .brief-text {
+        font-size: 0.74rem;
+    }
+
+    /* The narrower workspace gets two tool columns, not three. */
+    .dashboard-workbench .bookmarks-grid {
+        columns: 2;
+        column-gap: 24px;
+    }
+
+    .dashboard-workbench .tool-category {
+        margin-bottom: 14px;
+    }
+
+    .dashboard-workbench .tool-link {
+        padding: 5px 4px;
+    }
+
+    .dashboard-workbench .tool-link-title {
+        font-size: 0.8rem;
+    }
+
+    .dashboard-workbench .tool-link-desc {
+        font-size: 0.64rem;
+    }
+}
+
 @media (max-width: 900px) {
     .toolbar {
         grid-template-columns: 1fr;

@@ -4,8 +4,10 @@ The front end in the repo root is static. This directory is the runtime that ser
 a stdlib Python API, a Caddy entry point, and one-shot agents that push device metrics.
 
 The UI is the **Workbench** layout: a dense one-screen command centre made of a toolbar,
-a main column (Jump back in, Launchpad, All tools) and a Network rail. There is no
-`prototype/` directory and no `?variant=` switcher — the Workbench is the only layout.
+a main column (Jump back in, Launchpad, All tools) and a Fleet rail. A tall, narrow
+desktop window (e.g. 1280×1440, half of a 1440p monitor) switches to a status-split
+arrangement of the same cards; there is still no `prototype/` directory and no
+`?variant=` switcher.
 
 ## Layout
 
@@ -61,7 +63,7 @@ revalidate with 304s, `/api/stats` is `no-store`, and the versioned font is immu
 
 ## Metrics history
 
-The dashboard stores a little history so the Network rail and the Metrics page
+The dashboard stores a little history so the Fleet rail and the Metrics page
 can answer "is this normal, and since when?" rather than only "what is it now?".
 
 - **Server-side sampler.** `app.py` starts a daemon thread that calls
@@ -200,7 +202,7 @@ The Metrics page (`/metrics.html`) uses the same data:
   blocks. State is always text in a badge or cell, never colour alone;
 - a warning banner (device, text, warning/critical mark) above the chart, plus
   a compact `nw` chip on each device row in the page rail. A critical SMART,
-  ZFS or UPS reading turns that chip critical. The dashboard's Network rail
+  ZFS or UPS reading turns that chip critical. The dashboard's Fleet rail
   shows the same live-only chip from `/api/stats`;
 - dashed chart markers for every annotation in the window, with the note on
   the SVG `<title>`, and an Events row for each manual annotation;
@@ -211,7 +213,7 @@ The Metrics page (`/metrics.html`) uses the same data:
   both pages skip `kind="container"`, so one stopped container cannot turn the
   fleet amber.
 
-The dashboard's Network rail links to it and shows a compact `24h <n>%` chip
+The dashboard's Fleet rail links to it and shows a compact `24h <n>%` chip
 on each device row once the first samples exist. The page and its CSS/JS are served from
 `static/` like the other front-end files; `server/deploy.sh` installs all three.
 
@@ -380,7 +382,7 @@ assistive tech.
 - **All tools** rows and **Launchpad** tiles show a check badge when their
   bookmark names a check; an id the store does not answer reads "no data"
   rather than disappearing.
-- **Services** is a compact card in the rail below Network. Each row shows the
+- **Services** is a compact card in the rail below Fleet. Each row shows the
   dot + verdict, latency, 24 h uptime and certificate days (when the probe is
   HTTPS). The header counts `n/m up`. The rail keeps its own scroll, so the
   page still fits one screen at 1280×800 and the existing breakpoints are
@@ -438,7 +440,7 @@ change the device page already shows.
 
 ## Workbench UI
 
-The page never scrolls; the body grid, All tools list and Network rail own their own
+The page never scrolls; the body grid, All tools list and Fleet rail own their own
 overflow. At the target desktop sizes every core section fits in one screen.
 
 | Region | Contents |
@@ -448,8 +450,8 @@ overflow. At the target desktop sizes every core section fits in one screen.
 | Jump back in | most-used rows from the scored API payload, with a normalised bar |
 | Launchpad | pinned tool tiles (monogram + two-line label) |
 | All tools | every category in store order, numbered rows, live search count |
-| Network | `n/m online · x% avg CPU`, kind-average chips, compact device rows with 24 h availability, and a **Metrics →** link |
-| Services | compact check rows below Network: verdict, latency, 24 h uptime and certificate days |
+| Fleet | `n/m online · x% avg CPU`, kind-average chips, compact device rows with 24 h availability, and a **Metrics →** link |
+| Services | compact check rows below Fleet: verdict, latency, 24 h uptime and certificate days |
 
 A device that reports more than one volume gets a compact breakdown under its row
 (label, size, bar, percentage). The `DSK` cell stays a single gauge and shows the
@@ -469,7 +471,10 @@ line, keeping the rail at its old height.
 Responsive rules:
 
 - `≥1181px`: two-column body; the rail is `clamp(320px, 25vw, 390px)` wide.
-- `901–1180px`: one-column body; Network sits below the main column in one rail column.
+- `≥1181px` and a portrait window (e.g. 1280×1440, half of a 2560×1440 monitor): the
+  status-split layout — a 470 px full-height fleet/services column, with Launchpad,
+  Jump back in, What changed and All tools in the workspace.
+- `901–1180px`: one-column body; Fleet sits below the main column in one rail column.
 - `≤900px`: Launchpad stacks under Jump back in; All tools uses two columns.
 - `≤600px`: All tools uses one column; the Launchpad auto-fits four tiles per row.
 - `≤850px` height: tighter shell/card padding, a shorter usage list and tighter device rows
@@ -768,7 +773,7 @@ Then verify in a browser:
   — every core section and device row visible without page scroll.
 - `390×844`: usable phone layout; the body grid scrolls internally, Launchpad shows four
   tiles per row and All tools is one column.
-- Breakpoints: two body columns at `≥1181px`; one column with Network below main at
+- Breakpoints: two body columns at `≥1181px`; one column with Fleet below main at
   `901–1180px`; stacked Launchpad and two list columns at `≤900px`; one list column at
   `≤600px`; tighter shell/card padding and device rows at `≤850px` height.
 - Click a bookmark, a Launchpad tile and a Jump back in row; each sends `POST /api/hit`
